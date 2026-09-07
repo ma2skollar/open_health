@@ -1,57 +1,31 @@
-# open_health
+# Open Health
 
-Local-first health applications built on top of
-[`open_oura`](https://github.com/Th0rgal/open_oura).
+Your health data, on your own devices.
 
-This repository owns the product surfaces: the web dashboard, the iOS app, the
-shared summary layer they render, and the non-ring health integrations such as
-DNA VCF scoring and local blood report PDF import. The low-level Oura protocol,
-BLE client, storage, and portable metric algorithms live in `open_oura` and are
-consumed here as Git dependencies.
+A native iOS app and local web dashboard for Oura: sleep, activity, heart rate,
+HRV and long-term trends. Built with SwiftUI and Rust, with direct Bluetooth sync
+and on-device analysis.
 
-## What lives here
+<p align="center">
+  <img src="docs/screenshots/overview.png" width="32%" alt="Daily overview with sleep, activity and vital trends" />
+  <img src="docs/screenshots/sleep.png" width="32%" alt="Sleep report with sleep stages and overnight signals" />
+  <img src="docs/screenshots/activity.png" width="32%" alt="Activity report with movement, steps and workouts" />
+</p>
 
-- **`dashboard/web/`**: vanilla HTML/CSS/JS health dashboard served locally.
-- **`apps/ios/`**: SwiftUI iOS client and generated Rust FFI bindings.
-- **`crates/oura-cli`**: app-oriented CLI entrypoint, including `oura dashboard`,
-  DNA explorer routes, blood PDF import, model runners, and local dashboard APIs.
-- **`crates/oura-summary`**: shared dashboard summary JSON consumed by web and iOS.
-- **`crates/oura-core` / `crates/oura-ffi`**: native/iOS FFI surfaces.
-- **`crates/oura-dna` + `dna/`**: local VCF trait/PGS scoring catalog and helpers.
-- **`tools/`**: model runners and app-oriented analysis utilities.
+<p align="center"><sub>iOS · Overview, sleep and activity · Demo data</sub></p>
 
-## Boundary with open_oura
+The web dashboard also brings together local blood reports and DNA analysis.
+Ring communication and portable algorithms are powered by
+[open_oura](https://github.com/Th0rgal/open_oura).
 
-`open_health` depends on `open_oura` for:
+## Get started
 
-- `oura-protocol`: packet framing, request builders, auth crypto, event decoders.
-- `oura-link`: BLE transport/client and sync/live stream orchestration.
-- `oura-store`: SQLite event/readings store.
-- `oura-analysis`: portable metric algorithms.
+**iOS** — [Build with Xcode](apps/ios/TESTFLIGHT.md) or [Xcode Cloud](apps/ios/XCODE_CLOUD.md).
 
-Keep reusable protocol/library work in `open_oura`. Keep app UX, dashboard APIs,
-iOS presentation, DNA, blood, and model orchestration here.
+**Web** — Run locally, then open [localhost:8090](http://127.0.0.1:8090):
 
-## Quick start
-
-```bash
-cargo build --release
-cargo run -p oura-cli -- dashboard \
-  --tz-offset 1 \
-  --dna-files ~/Documents/official/health/dna/files \
-  --blood-files ~/Documents/official/health
+```sh
+cargo run --release -p oura-cli -- dashboard
 ```
 
-Open `http://127.0.0.1:8090`.
-
-The dashboard reads local files only. Genome files, blood PDFs, generated
-`blood.db`, Oura auth keys, and raw captures should stay outside Git.
-
-## Validation
-
-```bash
-cargo test --workspace
-```
-
-For the iOS app, use the scripts under `apps/ios/` after rebuilding the Rust FFI
-artifacts.
+[Dashboard guide](dashboard/README.md) · [Algorithms](docs/algorithms/README.md) · [Architecture](docs/clients-web-and-ios.md)
