@@ -15,6 +15,13 @@ for t in aarch64-apple-ios aarch64-apple-ios-sim; do
   rustup target list --installed | grep -qx "$t" || rustup target add "$t"
 done
 
+echo "==> regenerate matching Swift bindings and headers"
+cargo build -p oura-core
+cargo run -p oura-core --bin uniffi-bindgen -- generate \
+  --library "$REPO/target/debug/liboura_core.dylib" --language swift \
+  --out-dir "$REPO/apps/ios/generated"
+cp "$REPO/apps/ios/generated/oura_coreFFI.h" "$HEADERS/oura_coreFFI.h"
+
 echo "==> build oura-core (release) for device + simulator"
 cargo build -p oura-core --release --target aarch64-apple-ios
 cargo build -p oura-core --release --target aarch64-apple-ios-sim

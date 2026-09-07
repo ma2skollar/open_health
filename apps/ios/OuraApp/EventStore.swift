@@ -28,57 +28,82 @@ enum EventStore {
         let body: Data?
     }
 
-    /// All events with decoded JSON, ordered by sync order. Throws on any failure —
-    /// callers must distinguish "no data" (empty array) from "couldn't read".
-    static func decodedEvents(dbPath: String) throws -> [Ev] {
-        var db: OpaquePointer?
-        // Read-only: the sync writer may hold the file; the busy timeout rides out
-        // its lock windows instead of surfacing a partial row set.
-        guard sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
-            let msg = db.map { String(cString: sqlite3_errmsg($0)) } ?? "open failed"
-            sqlite3_close(db)
-            throw ReadError.open(msg)
+    /// Re-iterable SQLite stream: only the current row is decoded, never the archive.
+    /// A shared error latch makes a truncated iteration fail the entire model pass.
+    final class Events: Sequence {
+        let path: String
+        var error: Error?
+        let predicate: String
+        let metadata: Bool
+        private let parent: Events?
+        init(path: String, predicate: String = "1", metadata: Bool = false, parent: Events? = nil) {
+            self.path = path; self.predicate = predicate; self.metadata = metadata; self.parent = parent
         }
-        defer { sqlite3_close(db) }
-        sqlite3_busy_timeout(db, 5000)
+        func fail(_ error: Error) { self.error = error; parent?.fail(error) }
+        func validate() throws { try AnalysisRun.check(); if let error { throw error } }
+        func restricted(_ predicate: String, metadata: Bool = false) -> Events {
+            Events(path: path, predicate: "(\(self.predicate)) AND (\(predicate))", metadata: metadata, parent: self)
+        }
+        var isEmpty: Bool { makeIterator().next() == nil }
+        var last: Ev? {
+            restricted("id=(SELECT id FROM events WHERE decoded_json IS NOT NULL ORDER BY captured_unix DESC,id DESC LIMIT 1)").makeIterator().next()
+        }
+        func makeIterator() -> Iterator { Iterator(self) }
+        final class Iterator: IteratorProtocol {
+            private let source: Events
+            private var db: OpaquePointer?
+            private var statement: OpaquePointer?
+            private var finished = false
+            init(_ source: Events) {
+                self.source = source
+                guard sqlite3_open_v2(source.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else {
+                    source.fail(ReadError.open(message())); finished = true; return
+                }
+                sqlite3_busy_timeout(db, 5000)
+                let json = source.metadata ? "CASE WHEN tag=66 THEN decoded_json ELSE '{}' END" : "decoded_json"
+                let body = source.metadata ? "NULL" : "CASE WHEN tag IN (126,127) THEN body ELSE NULL END"
+                let sql = "SELECT ring_timestamp,tag,\(json),captured_unix,\(body) FROM events WHERE decoded_json IS NOT NULL AND \(source.predicate) ORDER BY captured_unix,id"
+                guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                    source.fail(ReadError.prepare(message())); finished = true; return
+                }
+            }
+            deinit { sqlite3_finalize(statement); sqlite3_close(db) }
+            private func message() -> String {
+                guard let db else { return "open failed" }
+                return "sqlite=\(sqlite3_errcode(db)) extended=\(sqlite3_extended_errcode(db)): \(String(cString: sqlite3_errmsg(db)))"
+            }
+            func next() -> Ev? {
+                guard !finished, source.error == nil else { return nil }
+                if AnalysisRun.cancelled { source.fail(CancellationError()); finished = true; return nil }
+                let rc = sqlite3_step(statement)
+                guard rc == SQLITE_ROW else {
+                    finished = true
+                    if rc != SQLITE_DONE { source.fail(ReadError.step(message())) }
+                    return nil
+                }
+                return autoreleasepool {
+                    let tag = Int(sqlite3_column_int(statement, 1))
+                    var json: [String: Any] = [:]
+                    if tag != 0x7e && tag != 0x7f && (!source.metadata || tag == 66) {
+                        guard let text = sqlite3_column_text(statement, 2),
+                              let data = String(cString: text).data(using: .utf8),
+                              let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                            source.fail(ReadError.step("malformed event JSON; refusing partial analysis")); finished = true; return nil
+                        }
+                        json = parsed
+                    }
+                    let body = sqlite3_column_blob(statement, 4).map { Data(bytes: $0, count: Int(sqlite3_column_bytes(statement, 4))) }
+                    return Ev(ds: sqlite3_column_int64(statement, 0), tag: tag, json: json,
+                              cu: sqlite3_column_int64(statement, 3), body: body)
+                }
+            }
+        }
+    }
 
-        var events: [Ev] = []
-        var stmt: OpaquePointer?
-        let sql = "SELECT ring_timestamp, tag, decoded_json, captured_unix, body FROM events WHERE decoded_json IS NOT NULL ORDER BY captured_unix, id"
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            throw ReadError.prepare(String(cString: sqlite3_errmsg(db)))
-        }
-        defer { sqlite3_finalize(stmt) }
-        var rc = sqlite3_step(stmt)
-        while rc == SQLITE_ROW {
-            defer { rc = sqlite3_step(stmt) }  // runs on continue too
-            let tag = Int(sqlite3_column_int(stmt, 1))
-            let body: Data?
-            if let bytes = sqlite3_column_blob(stmt, 4) {
-                body = Data(bytes: bytes, count: Int(sqlite3_column_bytes(stmt, 4)))
-            } else {
-                body = nil
-            }
-            // real_step packets (0x7E/0x7F) are 14-byte bodies. Parsing their JSON
-            // on hiking-heavy histories is a large share of the analysis RAM spike
-            // and the models never read that JSON.
-            var obj: [String: Any] = [:]
-            if tag != 0x7E, tag != 0x7F {
-                guard let cText = sqlite3_column_text(stmt, 2),
-                      let data = String(cString: cText).data(using: .utf8),
-                      let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-                else { continue }
-                obj = parsed
-            }
-            events.append(Ev(ds: sqlite3_column_int64(stmt, 0),
-                             tag: tag,
-                             json: obj,
-                             cu: sqlite3_column_int64(stmt, 3),
-                             body: body))
-        }
-        guard rc == SQLITE_DONE else {
-            throw ReadError.step(String(cString: sqlite3_errmsg(db)))
-        }
+    static func decodedEvents(dbPath: String) throws -> Events {
+        let events = Events(path: dbPath)
+        _ = events.isEmpty
+        try events.validate()
         return events
     }
 
@@ -106,10 +131,10 @@ enum EventStore {
         private let epochs: [Epoch]
         private let anchorOffsetsDs: [Int64]
 
-        init(events: [Ev]) {
+        init(events: Events) {
             precondition(!events.isEmpty)
             var built: [Epoch] = []
-            for event in events {
+            for event in events.restricted("1", metadata: true) {
                 if var epoch = built.last,
                    event.ds >= epoch.maxDs - Self.epochResetSlackDs {
                     if event.ds >= epoch.maxDs {

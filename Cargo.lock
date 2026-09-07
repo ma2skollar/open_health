@@ -1365,7 +1365,6 @@ dependencies = [
 [[package]]
 name = "oura-store"
 version = "0.1.0"
-source = "git+https://github.com/Th0rgal/open_oura?rev=b1b52a0da36a592d5fe8967b0024dcc40d5c746f#b1b52a0da36a592d5fe8967b0024dcc40d5c746f"
 dependencies = [
  "oura-protocol",
  "rusqlite",

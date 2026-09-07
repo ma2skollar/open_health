@@ -37,7 +37,7 @@ enum ActivityModel {
         let hr: (flat: [Float], count: Int)
     }
 
-    static func run(profile: Profile?, events: [EventStore.Ev], clock: EventStore.RingClock,
+    static func run(profile: Profile?, events: EventStore.Events, clock: EventStore.RingClock,
                     progress: @escaping @Sendable (String) -> Void = { _ in }) -> (sessions: [WorkoutSession], error: String?) {
         guard let aadPath = Bundle.main.path(forResource: "automatic_activity_detection_3_1_11", ofType: "ptl")
         else { return ([], "activity model file missing from the app bundle") }
@@ -50,7 +50,7 @@ enum ActivityModel {
         var motion: [TimedRow] = []
         var temperature: [TimedRow] = []
         var heartRate: [TimedRow] = []
-        for event in events {
+        for event in events.restricted("tag IN (80,71,70,128)") {
             // These are minute buckets; remove the few-second epoch-anchor jitter.
             let unixMinute = (clock.unixSeconds(event.ds, capturedUnix: event.cu) / 60).rounded()
             switch event.tag {
@@ -79,6 +79,7 @@ enum ActivityModel {
                 break
             }
         }
+        guard events.error == nil, !AnalysisRun.cancelled else { return ([], "analysis interrupted") }
         guard !met.isEmpty else { return ([], nil) }
 
         let stepPackets = collectStepPackets(events: events, clock: clock)
@@ -144,29 +145,25 @@ enum ActivityModel {
         dayKeyFmt.dateFormat = "yyyy-MM-dd"
 
         var sessions: [WorkoutSession] = []
-        var dirty: [(key: String, inputs: DayInputs, fp: String)] = []
         var currentKeys = Set<String>()
-        for dayStart in dayStarts {
+        var recomputed = 0
+        for (index, dayStart) in dayStarts.enumerated() {
+            guard !AnalysisRun.cancelled, events.error == nil else { return ([], "analysis interrupted") }
             guard let inputs = dayInputs(dayStart) else { continue }
-            let key = dayKeyFmt.string(from: dayStart)
-            let fp = fingerprint(inputs)
+            let key = dayKeyFmt.string(from: dayStart), fp = fingerprint(inputs)
             currentKeys.insert(key)
-            if let entry = cache[key], entry.fp == fp {
-                sessions.append(contentsOf: entry.sessions)
-            } else {
-                dirty.append((key, inputs, fp))
+            if let entry = cache[key], entry.fp == fp { sessions.append(contentsOf: entry.sessions) }
+            else {
+                progress("detecting activity · day \(index + 1)/\(dayStarts.count)")
+                guard let daySessions = runDay(inputs, user: user, aadPath: aadPath, nan: nan) else { return (sessions, "activity inference failed") }
+                sessions.append(contentsOf: daySessions)
+                cache[key] = ActivityDayEntry(fp: fp, sessions: daySessions)
+                ModelCacheStore.save(ModelCacheStore.activityFile, globalKey: globalKey, entries: cache)
+                recomputed += 1
             }
         }
-        dlog("models", "activity: \(dirty.count)/\(currentKeys.count) days to recompute")
-        for (index, day) in dirty.enumerated() {
-            progress("detecting activity · day \(index + 1)/\(dirty.count)")
-            let daySessions = runDay(day.inputs, user: user, aadPath: aadPath, nan: nan)
-            sessions.append(contentsOf: daySessions)
-            cache[day.key] = ActivityDayEntry(fp: day.fp, sessions: daySessions)
-            // Save after every completed day: a mid-run kill resumes here instead
-            // of restarting the whole history.
-            ModelCacheStore.save(ModelCacheStore.activityFile, globalKey: globalKey, entries: cache)
-        }
+        guard !AnalysisRun.cancelled, events.error == nil else { return ([], "analysis interrupted") }
+        dlog("models", "activity recomputed=\(recomputed) total=\(currentKeys.count)")
         // Drop days the current data no longer produces (e.g. re-dated by a clock
         // re-anchor) so the file tracks the DB instead of growing stale keys.
         let pruned = cache.filter { currentKeys.contains($0.key) }
@@ -177,8 +174,8 @@ enum ActivityModel {
     }
 
     /// One AAD inference over one local day's inputs.
-    private static func runDay(_ inputs: DayInputs, user: [Float], aadPath: String, nan: Float) -> [WorkoutSession] {
-        let decoded = decodeStepPackets(inputs.rawStep)
+    private static func runDay(_ inputs: DayInputs, user: [Float], aadPath: String, nan: Float) -> [WorkoutSession]? {
+        guard let decoded = decodeStepPackets(inputs.rawStep) else { return nil }
         let lo = inputs.dayStart.timeIntervalSince1970 / 60
         let firstMet = inputs.met.flat[0]
         let lastMet = inputs.met.flat[(inputs.met.count - 1) * 2]
@@ -199,7 +196,8 @@ enum ActivityModel {
                                   &metFlat, Int32(inputs.met.count), &step, Int32(stepCount),
                                   &motionFlat, Int32(inputs.motion.count), &tempFlat, Int32(inputs.temp.count),
                                   &hrFlat, Int32(inputs.hr.count), 0.5, 10.0, &output, 512)
-        guard count > 0 else { return [] }
+        guard count >= 0 else { return nil }
+        if count == 0 { return [] }
         let stamp = DateFormatter(); stamp.timeZone = .current; stamp.dateFormat = "yyyy-MM-dd HH:mm"
         let time = DateFormatter(); time.timeZone = .current; time.dateFormat = "HH:mm"
         var sessions: [WorkoutSession] = []
@@ -216,15 +214,15 @@ enum ActivityModel {
         return sessions
     }
 
-    private static func collectStepPackets(events: [EventStore.Ev], clock: EventStore.RingClock) -> [TimedRow] {
+    private static func collectStepPackets(events: EventStore.Events, clock: EventStore.RingClock) -> [TimedRow] {
         var secondPackets: [Int64: Data] = [:]
-        for event in events where event.tag == 0x7F {
+        for event in events.restricted("tag=127") {
             guard let body = event.body, body.count == 14 else { continue }
             let wallDecisecond = Int64((clock.unixSeconds(event.ds, capturedUnix: event.cu) * 10).rounded())
             secondPackets[wallDecisecond] = body
         }
         var rows: [TimedRow] = []
-        for event in events where event.tag == 0x7E {
+        for event in events.restricted("tag=126") {
             guard let first = event.body, first.count == 14 else { continue }
             let wallDecisecond = Int64((clock.unixSeconds(event.ds, capturedUnix: event.cu) * 10).rounded())
             guard let second = secondPackets[wallDecisecond + 1] else { continue }
@@ -237,10 +235,10 @@ enum ActivityModel {
     /// Decode one day's (or a chunked slice of a day's) 27-col gait packets.
     /// Hiking days can be thousands of pairs; the old path fed the whole history
     /// as one tensor and jetsam-killed the app.
-    private static func decodeStepPackets(_ packets: [TimedRow]) -> [TimedRow] {
-        guard !packets.isEmpty,
-              let modelPath = Bundle.main.path(forResource: "steps_motion_decoder_2_0_0", ofType: "ptl")
-        else { return [] }
+    private static func decodeStepPackets(_ packets: [TimedRow]) -> [TimedRow]? {
+        guard !packets.isEmpty else { return [] }
+        guard let modelPath = Bundle.main.path(forResource: "steps_motion_decoder_2_0_0", ofType: "ptl")
+        else { return nil }
         let chunk = 4096
         let overlap = 24
         if packets.count <= chunk {
@@ -251,7 +249,8 @@ enum ActivityModel {
         var i = 0
         while i < packets.count {
             let end = min(packets.count, i + chunk)
-            for row in runStepDecoder(Array(packets[i..<end]), modelPath: modelPath) {
+            guard !AnalysisRun.cancelled, let decoded = runStepDecoder(Array(packets[i..<end]), modelPath: modelPath) else { return nil }
+            for row in decoded {
                 let key = Int64((row.unixMinute * 60_000).rounded())
                 if seen.insert(key).inserted { out.append(row) }
             }
@@ -261,7 +260,7 @@ enum ActivityModel {
         return out
     }
 
-    private static func runStepDecoder(_ packets: [TimedRow], modelPath: String) -> [TimedRow] {
+    private static func runStepDecoder(_ packets: [TimedRow], modelPath: String) -> [TimedRow]? {
         var timestamps = packets.map { Int64(($0.unixMinute * 60_000).rounded()) }
         var raw = packets.flatMap(\.values)
         let capacity = packets.count * 3
@@ -269,7 +268,8 @@ enum ActivityModel {
         var outputFeatures = [Float](repeating: 0, count: capacity * 11)
         let count = oura_stepmotion(modelPath, &timestamps, &raw, Int32(packets.count),
                                     &outputTimestamps, &outputFeatures, Int32(capacity))
-        guard count > 0 else { return [] }
+        guard count >= 0 else { return nil }
+        if count == 0 { return [] }
         let order = [6, 7, 9, 10, 8, 5, 4, 0, 3, 1, 2]
         return (0..<Int(count)).map { row in
             let decoded = Array(outputFeatures[row * 11..<row * 11 + 11])

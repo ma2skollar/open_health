@@ -296,6 +296,11 @@ void uniffi_oura_core_fn_free_ringsession(void*_Nonnull ptr, RustCallStatus *_No
 void*_Nonnull uniffi_oura_core_fn_constructor_ringsession_new(uint64_t writer, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_CANCEL
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_CANCEL
+void uniffi_oura_core_fn_method_ringsession_cancel(void*_Nonnull ptr, RustBuffer reason, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PUSH_FRAME
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PUSH_FRAME
 void uniffi_oura_core_fn_method_ringsession_push_frame(void*_Nonnull ptr, RustBuffer data, RustCallStatus *_Nonnull out_status
@@ -320,6 +325,11 @@ void uniffi_oura_core_fn_init_callback_vtable_syncprogresslistener(UniffiVTableC
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_CORE_VERSION
 RustBuffer uniffi_oura_core_fn_func_core_version(RustCallStatus *_Nonnull out_status
     
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_DATABASE_INTEGRITY
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_DATABASE_INTEGRITY
+RustBuffer uniffi_oura_core_fn_func_database_integrity(RustBuffer db_path, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_QUICK_SUMMARY_JSON
@@ -623,6 +633,12 @@ uint16_t uniffi_oura_core_checksum_func_core_version(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_DATABASE_INTEGRITY
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_DATABASE_INTEGRITY
+uint16_t uniffi_oura_core_checksum_func_database_integrity(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_QUICK_SUMMARY_JSON
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_QUICK_SUMMARY_JSON
 uint16_t uniffi_oura_core_checksum_func_quick_summary_json(void
@@ -639,6 +655,12 @@ uint16_t uniffi_oura_core_checksum_func_rmssd(void
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_SUMMARY_JSON
 uint16_t uniffi_oura_core_checksum_func_summary_json(void
     
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_CANCEL
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_CANCEL
+uint16_t uniffi_oura_core_checksum_method_ringsession_cancel(void
+
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_PUSH_FRAME

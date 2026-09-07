@@ -11,17 +11,26 @@ enum SummaryCache {
         return dir.appendingPathComponent("summary-cache.json")
     }
 
+    private struct CachedSummary: Codable {
+        var summary: Summary
+        var workouts: [WorkoutSession]
+        var illness: IllnessResult?
+    }
     static func load() -> Summary? {
-        guard let data = try? Data(contentsOf: url),
-              let summary = try? JSONDecoder().decode(Summary.self, from: data),
-              summary.error == nil else { return nil }
-        return summary
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        if let cached = try? JSONDecoder().decode(CachedSummary.self, from: data), cached.summary.error == nil {
+            var result = cached.summary
+            result.workouts = cached.workouts; result.illness = cached.illness
+            return result
+        }
+        guard let legacy = try? JSONDecoder().decode(Summary.self, from: data), legacy.error == nil else { return nil }
+        return legacy
     }
 
     static func save(_ summary: Summary) {
         guard summary.error == nil else { return }
         queue.async {
-            guard let data = try? JSONEncoder().encode(summary) else { return }
+            guard let data = try? JSONEncoder().encode(CachedSummary(summary: summary, workouts: summary.workouts, illness: summary.illness)) else { return }
             try? data.write(to: url, options: .atomic)
         }
     }
@@ -72,43 +81,53 @@ enum Core {
         // One shared read: one failure point, one lock-contention window, and the
         // RingClock epoch recovery is paid once instead of once per model.
         progress("reading ring data…")
-        var events: [EventStore.Ev] = []
+        var events = EventStore.Events(path: DB.readPath())
         var readErr: String?
         do {
             events = try EventStore.decodedEvents(dbPath: DB.readPath())
         } catch {
             readErr = "\(error)"
         }
-        memLog("read \(events.count) events")
+        memLog("streaming events")
+        var stageStarted = ProcessInfo.processInfo.systemUptime
+        func stageFinished(_ stage: String) {
+            dlog("models", "stage=\(stage) duration=\(String(format: "%.2f", ProcessInfo.processInfo.systemUptime - stageStarted))s")
+            stageStarted = ProcessInfo.processInfo.systemUptime
+            memLog(stage)
+        }
 
         if readErr == nil, !events.isEmpty {
             let clock = EventStore.RingClock(events: events)
+            if events.error != nil || AnalysisRun.cancelled { return previous ?? base }
             let rSleep = SleepStaging.run(nights: base.nights, events: events, clock: clock, progress: progress)
             staged = rSleep.staged
             sleepErr = rSleep.error
-            memLog("after sleep")
+            stageFinished("sleep")
+            if AnalysisRun.cancelled { return previous ?? base }
             let rAct = ActivityModel.run(profile: profile, events: events, clock: clock, progress: progress)
             workouts = rAct.sessions; actErr = rAct.error
-            memLog("after activity")
+            stageFinished("activity")
+            if AnalysisRun.cancelled { return previous ?? base }
             let rIll = IllnessModel.run(profile: profile, events: events, clock: clock)
             illness = rIll.result; illErr = rIll.error
-            memLog("after illness")
+            stageFinished("illness")
         } else if let readErr {
             // The shared read failed: every event-fed model is unavailable this
             // pass. Surface one error; the publish below falls back to `previous`.
             sleepErr = readErr; actErr = readErr; illErr = readErr
         }
+        if AnalysisRun.cancelled { return previous ?? base }
         let rCva = CvaModel.run(sex: profile?.sex ?? "M", age: profile?.age ?? 30,
                                 heightM: profile?.height_m ?? 1.78, weightKg: profile?.weight_kg ?? 75,
                                 ringSize: profile?.ring_size ?? 10)
         cva = rCva.result; cvaErr = rCva.error
-        memLog("after cva")
+        stageFinished("cva")
 
         // If staging failed outright, refill from the last published summary so a
         // transient read failure can't strip hypnograms that were already on screen.
-        if sleepErr != nil, staged.isEmpty, let previous {
+        if sleepErr != nil, let previous {
             for night in previous.nights {
-                if let sds = night.start_ds, let stages = night.stages, !stages.isEmpty {
+                if let sds = night.start_ds, staged[String(sds)] == nil, let stages = night.stages, !stages.isEmpty {
                     staged[String(sds)] = stages
                 }
             }
@@ -140,12 +159,13 @@ enum Core {
         }
         // Never let a failed run replace real results with emptiness (the same
         // principle as the staged-sleep-debt coverage guard above).
-        s.workouts = (actErr == nil || !workouts.isEmpty) ? workouts : (previous?.workouts ?? [])
+        s.workouts = actErr == nil ? workouts : (previous?.workouts ?? workouts)
         s.illness = (illErr == nil || illness != nil) ? illness : previous?.illness
         // Deduplicated: a failed shared read sets the same message on three models.
         var seen = Set<String>()
         s.modelErrors = [sleepErr, cvaErr, actErr, illErr].compactMap { $0 }
             .filter { seen.insert($0).inserted }
+        for error in s.modelErrors { dlog("models", "failed: \(error)") }
         return s
     }
     #endif

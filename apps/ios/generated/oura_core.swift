@@ -431,6 +431,22 @@ fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterInt32: FfiConverterPrimitive {
+    typealias FfiType = Int32
+    typealias SwiftType = Int32
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Int32 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Int32, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
     typealias FfiType = UInt64
     typealias SwiftType = UInt64
@@ -473,6 +489,30 @@ fileprivate struct FfiConverterDouble: FfiConverterPrimitive {
 
     public static func write(_ value: Double, into buf: inout [UInt8]) {
         writeDouble(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
+
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
     }
 }
 
@@ -544,6 +584,11 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
  */
 public protocol RingSessionProtocol : AnyObject {
     
+    /**
+     * Interrupts even an idle Rust receive; a finished Swift AsyncStream cannot do this.
+     */
+    func cancel(reason: String)
+
     /**
      * Swift pushes each inbound BLE notification frame here.
      */
@@ -623,6 +668,16 @@ public convenience init(writer: BleWriter) {
     
 
     
+    /**
+     * Interrupts even an idle Rust receive; a finished Swift AsyncStream cannot do this.
+     */
+open func cancel(reason: String) {try! rustCall() {
+    uniffi_oura_core_fn_method_ringsession_cancel(self.uniffiClonePointer(),
+        FfiConverterString.lower(reason),$0
+    )
+}
+}
+
     /**
      * Swift pushes each inbound BLE notification frame here.
      */
@@ -801,6 +856,10 @@ public enum SyncError {
     
     case Failed(String
     )
+    case Storage(operation: String, code: Int32, extendedCode: Int32, message: String, retryable: Bool, checkpoint: UInt32
+    )
+    case Interrupted(reason: String
+    )
 }
 
 
@@ -820,6 +879,17 @@ public struct FfiConverterTypeSyncError: FfiConverterRustBuffer {
         case 1: return .Failed(
             try FfiConverterString.read(from: &buf)
             )
+        case 2: return .Storage(
+            operation: try FfiConverterString.read(from: &buf),
+            code: try FfiConverterInt32.read(from: &buf),
+            extendedCode: try FfiConverterInt32.read(from: &buf),
+            message: try FfiConverterString.read(from: &buf),
+            retryable: try FfiConverterBool.read(from: &buf),
+            checkpoint: try FfiConverterUInt32.read(from: &buf)
+            )
+        case 3: return .Interrupted(
+            reason: try FfiConverterString.read(from: &buf)
+            )
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -836,6 +906,21 @@ public struct FfiConverterTypeSyncError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
             FfiConverterString.write(v1, into: &buf)
             
+
+        case let .Storage(operation,code,extendedCode,message,retryable,checkpoint):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(operation, into: &buf)
+            FfiConverterInt32.write(code, into: &buf)
+            FfiConverterInt32.write(extendedCode, into: &buf)
+            FfiConverterString.write(message, into: &buf)
+            FfiConverterBool.write(retryable, into: &buf)
+            FfiConverterUInt32.write(checkpoint, into: &buf)
+
+
+        case let .Interrupted(reason):
+            writeInt(&buf, Int32(3))
+            FfiConverterString.write(reason, into: &buf)
+
         }
     }
 }
@@ -1146,6 +1231,13 @@ public func coreVersion() -> String {
     )
 })
 }
+public func databaseIntegrity(dbPath: String)throws  -> String {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_oura_core_fn_func_database_integrity(
+        FfiConverterString.lower(dbPath),$0
+    )
+})
+}
 /**
  * A lightweight, model-free summary (device + data-health only) — kept as a fast
  * path / fallback. Returns `{ serials, device, event_counts, decoded_events }`.
@@ -1207,6 +1299,9 @@ private var initializationResult: InitializationResult = {
     if (uniffi_oura_core_checksum_func_core_version() != 24695) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_oura_core_checksum_func_database_integrity() != 19533) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_oura_core_checksum_func_quick_summary_json() != 19199) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1214,6 +1309,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_summary_json() != 27782) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_method_ringsession_cancel() != 11635) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_method_ringsession_push_frame() != 19557) {

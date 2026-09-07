@@ -124,10 +124,12 @@ struct SyncView: View {
     @ObservedObject private var diag = RingDiag.shared
     @ObservedObject private var store = DiagStore.shared
     @State private var copied = false
+    @State private var diagnosticFile: URL?
     var body: some View {
         NavigationStack {
             ZStack {
                 Obs.canvas.ignoresSafeArea()
+                ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     Text("Pair your ring").font(Obs.serif(24)).foregroundStyle(Obs.ink)
                     // the ring advertises reliably only ON its charger, and its single
@@ -154,8 +156,7 @@ struct SyncView: View {
                     }
                     .disabled(ring.busy)
                     Button(role: .destructive) {
-                        ring.resetLocalDatabase()
-                        onReset()
+                        Task { if await ring.resetLocalDatabase() { onReset() } }
                     } label: {
                         HStack(spacing: 8) {
                             Image(systemName: "trash")
@@ -170,21 +171,32 @@ struct SyncView: View {
                             .foregroundStyle(ring.lastReport != nil ? Obs.good : Obs.ink2)
                             .fixedSize(horizontal: false, vertical: true)
                     }
+                    if ring.busy { Button("Pause sync") { ring.pause() } }
+                    Button("Check database") { Task { await ring.checkDatabase() } }.disabled(ring.busy)
+                    Button("Share detailed diagnostics") {
+                        Task {
+                            let url = await Task.detached { DiagStore.shared.exportFile() }.value
+                            if let url { diagnosticFile = url }
+                        }
+                    }
                     // live transcript + leftover logs from previous crashes / kills.
                     VStack(alignment: .leading, spacing: 10) {
                         HStack {
                             Text("diagnostics")
                                 .font(Obs.mono(11)).foregroundStyle(Obs.ink2)
                             Spacer()
-                            Button(copied ? "copied ✓" : "copy all") {
-                                UIPasteboard.general.string = DiagStore.shared.exportAll()
-                                copied = true
-                                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
+                            Button(copied ? "copied ✓" : "Copy summary") {
+                                Task {
+                                    let text = await Task.detached { DiagStore.shared.exportSummary() }.value
+                                    UIPasteboard.general.string = text
+                                    copied = true
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
+                                }
                             }
                             .font(Obs.mono(11, .medium)).foregroundStyle(Obs.ink)
                         }
                         if !store.incidents.isEmpty {
-                            Text("previous crashes · \(store.incidents.count)")
+                            Text("diagnostic reports · \(store.incidents.count)")
                                 .font(Obs.mono(10, .medium)).foregroundStyle(Obs.bad)
                             ForEach(store.incidents.prefix(8)) { item in
                                 VStack(alignment: .leading, spacing: 4) {
@@ -201,7 +213,7 @@ struct SyncView: View {
                                 .overlay(RoundedRectangle(cornerRadius: 8).stroke(Obs.trace, lineWidth: 0.8))
                             }
                         } else {
-                            Text("No leftover crash logs. If the app dies mid-sync or mid-analysis, the next launch will keep that session here.")
+                            Text("No recorded incidents. Interrupted sessions are retained without assuming a crash.")
                                 .font(Obs.mono(10)).foregroundStyle(Obs.muted)
                                 .fixedSize(horizontal: false, vertical: true)
                         }
@@ -238,39 +250,32 @@ struct SyncView: View {
                     Spacer()
                 }
                 .padding(24)
+                }
             }
             .navigationTitle("sync").navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
-                        .disabled(ring.busy)
                 }
             }
         }
         // The sync belongs to RingSync, not to this presentation. Let the panel be
         // tucked away while BLE keeps running; the top-bar indicator remains live
         // and can reopen these diagnostics at any time.
+        .sheet(isPresented: Binding(get: { diagnosticFile != nil }, set: { if !$0 { diagnosticFile = nil } })) {
+            if let diagnosticFile { DiagnosticsShare(url: diagnosticFile) }
+        }
         .presentationDragIndicator(.visible)
-        .onAppear {
-            if ring.busy { IdleTimerLock.acquire("pair-screen") }
-        }
-        .onDisappear {
-            IdleTimerLock.release("pair-screen")
-        }
-        .onChange(of: ring.busy) { _, busy in
-            if busy {
-                IdleTimerLock.acquire("pair-screen")
-            } else {
-                IdleTimerLock.release("pair-screen")
-            }
-        }
-        .onChange(of: scenePhase) { _, phase in
-            if phase == .active, ring.busy {
-                IdleTimerLock.refreshIfHeld("ring-sync")
-                IdleTimerLock.refreshIfHeld("pair-screen")
-            }
-        }
+
     }
+}
+
+private struct DiagnosticsShare: UIViewControllerRepresentable {
+    let url: URL
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
 /// The top-bar sync affordance doubles as a live status light and the entry point
@@ -375,13 +380,16 @@ struct RootView: View {
         .onAppear {
             // A cached summary makes launch immediate; this forced load replaces it
             // with SQLite + model output without blanking the existing Today card.
-            load(force: true, clearCurrent: false)
+            requestAutomaticSync()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.protectedDataDidBecomeAvailableNotification)) { _ in
             requestAutomaticSync()
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
-                IdleTimerLock.refreshIfHeld("models")
                 requestAutomaticSync()
+            } else if phase == .background {
+                WorkCoordinator.shared.invalidateAnalysis()
             }
         }
     }
@@ -415,69 +423,64 @@ struct RootView: View {
     }
 
     private func requestAutomaticSync() {
+        guard ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil else { return }
         Task {
-            if let report = await ring.syncAutomaticallyIfNeeded() {
-                refreshAfterSync(report)
-            }
+            _ = await ring.syncAutomaticallyIfNeeded()
+            if WorkCoordinator.shared.available { load(force: true, clearCurrent: false) }
         }
     }
 
-    // The heavy on-device models run off the main thread (load): show the fast
-    // model-free summary first, then fold in the hypnogram / CVA / activity results.
-    // Keep the screen awake for the whole pass so auto-lock cannot kill a long
-    // analysis (same IdleTimerLock the BLE sync already uses).
     private func load(force: Bool = false, clearCurrent: Bool = false) {
         guard force || s == nil else { return }
-        isRefreshingSummary = true
+        let run = WorkCoordinator.shared.newAnalysis()
         loadGeneration += 1
         let generation = loadGeneration
-        IdleTimerLock.acquire("models")
-        #if TORCH
-        let publishBase = s == nil || clearCurrent
-        #else
-        let publishBase = true
-        #endif
-        // Captured before the background hop: the last published summary is the
-        // fallback if a model read fails mid-sync (withModels never replaces real
-        // results with emptiness).
-        let previous = s
+        let previous = clearCurrent ? nil : s
         if clearCurrent { s = nil }
+        isRefreshingSummary = true
         modelProgress.begin(generation)
         let progress = modelProgress.sink(generation)
-        DispatchQueue.global(qos: .userInitiated).async {
-            let base = Core.base()
-            if publishBase {
-                DispatchQueue.main.async {
-                    guard generation == loadGeneration else { return }
-                    s = base
-                    SummaryCache.save(base)
-                    HealthExport.shared.push(base)
+        Task {
+            await WorkGate.shared.acquire()
+            guard !run.isCancelled, WorkCoordinator.shared.available else {
+                await WorkGate.shared.release()
+                WorkCoordinator.shared.finishAnalysis(run)
+                if generation == loadGeneration { isRefreshingSummary = false; modelProgress.report(generation, "paused") }
+                return
+            }
+            IdleTimerLock.acquire("models")
+            dlog("models", "start run=\(run.id)")
+            let started = ProcessInfo.processInfo.systemUptime
+            let full: Summary = await withCheckedContinuation { completion in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let summary = run.perform {
+                        let base = Core.base()
+                        #if TORCH
+                        return base.error == nil && !run.isCancelled
+                            ? Core.withModels(base, previous: previous, progress: progress) : base
+                        #else
+                        return base
+                        #endif
+                    }
+                    completion.resume(returning: summary)
                 }
             }
-            #if TORCH
-            if base.error == nil {
-                let full = Core.withModels(base, previous: previous, progress: progress)
-                DispatchQueue.main.async { finishLoad(generation, summary: full) }
-            } else {
-                DispatchQueue.main.async { finishLoad(generation, summary: nil) }
+            if generation == loadGeneration {
+                if !run.isCancelled, WorkCoordinator.shared.available {
+                    if full.error == nil {
+                        s = full
+                        SummaryCache.save(full)
+                        HealthExport.shared.push(full)
+                    } else if s == nil { s = full }
+                    modelProgress.report(generation, full.error == nil ? nil : "refresh failed")
+                } else { modelProgress.report(generation, "paused") }
+                isRefreshingSummary = false
             }
-            #else
-            DispatchQueue.main.async { finishLoad(generation, summary: nil) }
-            #endif
+            dlog("models", "end run=\(run.id) cancelled=\(run.isCancelled) duration=\(Int(ProcessInfo.processInfo.systemUptime - started))s")
+            IdleTimerLock.release("models")
+            WorkCoordinator.shared.finishAnalysis(run)
+            await WorkGate.shared.release()
         }
-    }
-
-    private func finishLoad(_ generation: Int, summary: Summary?) {
-        if generation == loadGeneration {
-            if let summary {
-                s = summary
-                SummaryCache.save(summary)
-                HealthExport.shared.push(summary)
-            }
-            isRefreshingSummary = false
-            modelProgress.report(generation, nil)
-        }
-        IdleTimerLock.release("models")
     }
 
     @ViewBuilder private func content(_ s: Summary) -> some View {

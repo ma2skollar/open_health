@@ -45,7 +45,9 @@ private struct ModelCacheFile<Entry: Codable>: Codable {
 
 /// Mirrors SummaryCache: Application Support, serial queue, atomic writes.
 enum ModelCacheStore {
-    static let version = 2
+    static let version = 3
+    static let cvaFile = "cva-model-cache.json"
+    static let illnessFile = "illness-model-cache.json"
     static let activityFile = "activity-model-cache.json"
     static let stagingFile = "sleep-staging-cache.json"
     private static let queue = DispatchQueue(label: "md.thomas.openoura.model-cache", qos: .utility)
@@ -67,8 +69,11 @@ enum ModelCacheStore {
     }
 
     static func save<E: Codable>(_ file: String, globalKey: String, entries: [String: E]) {
+        guard !AnalysisRun.cancelled else { return }
+        let run = AnalysisRun.current
         let payload = ModelCacheFile(version: version, globalKey: globalKey, entries: entries)
         queue.async {
+            guard run?.isCancelled != true else { return }
             guard let data = try? JSONEncoder().encode(payload) else { return }
             try? data.write(to: url(file), options: .atomic)
         }
@@ -76,6 +81,8 @@ enum ModelCacheStore {
 
     static func clearAll() {
         queue.sync {
+            try? FileManager.default.removeItem(at: url(cvaFile))
+            try? FileManager.default.removeItem(at: url(illnessFile))
             try? FileManager.default.removeItem(at: url(activityFile))
             try? FileManager.default.removeItem(at: url(stagingFile))
         }

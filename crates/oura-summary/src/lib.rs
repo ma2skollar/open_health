@@ -873,7 +873,7 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
     });
     let db = db_abs.as_path();
     let demo = read_profile(db);
-    let store = Store::open(db).context("opening DB")?;
+    let store = Store::open_read_only(db).context("opening DB")?;
     let events = store.decoded_events().context("reading events")?;
     if events.is_empty() {
         return Err(anyhow!(

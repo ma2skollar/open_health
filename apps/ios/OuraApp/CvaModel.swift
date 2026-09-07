@@ -10,7 +10,7 @@ enum CvaModel {
     private static let SEG_LEN = 1500
     private static let GAP_DS: Int64 = 20  // >2 s splits two PPG measurements
 
-    struct Result { let vascularAge: Double; let pwv: Double; let segments: Int }
+    struct Result: Codable { let vascularAge: Double; let pwv: Double; let segments: Int }
 
     // Returns the CVA result (nil when there's simply no usable PPG), plus a non-nil
     // `error` only for genuine failures (model missing / inference failed despite data).
@@ -19,6 +19,29 @@ enum CvaModel {
         guard let modelPath = Bundle.main.path(forResource: "cva_2_1_0", ofType: "ptl")
         else { return (nil, "cardiovascular model file missing from the app bundle") }
 
+        let read = selectedSegments(dbPath: dbPath)
+        guard var segments = read.segments else { return (nil, read.error) }
+        let nSegs = segments.count / SEG_LEN
+        guard nSegs > 0 else { return (nil, nil) }
+
+        let sexVal: Float = sex.uppercased() == "F" ? -1 : (sex.uppercased() == "O" ? 0 : 1)
+        var demo: [Float] = [sexVal, Float(heightM), Float(age), Float(ringSize), Float(weightKg)]
+        guard !AnalysisRun.cancelled else { return (nil, "analysis paused") }
+        var fingerprint = FNV64(); fingerprint.combine(segments); fingerprint.combine(demo)
+        let key = ModelCacheStore.globalKey(profile: nil) + fingerprint.hex
+        let cached: [String: Result] = ModelCacheStore.load(ModelCacheStore.cvaFile, globalKey: key)
+        if let result = cached["result"] { dlog("models", "cva cache=hit segments=\(nSegs)"); return (result, nil) }
+        var vage = 0.0, pwv = 0.0
+        let rc = oura_cva(modelPath, &segments, Int32(nSegs), &demo, &vage, &pwv)
+        guard rc == 0 else { return (nil, "cardiovascular model failed on \(nSegs) PPG segments") }
+        let result = Result(vascularAge: (vage * 10).rounded() / 10, pwv: (pwv * 100).rounded() / 100, segments: nSegs)
+        ModelCacheStore.save(ModelCacheStore.cvaFile, globalKey: key, entries: ["result": result])
+        dlog("models", "cva cache=miss segments=\(nSegs)")
+        return (result, nil)
+    }
+
+    /// Separately testable decoding/selection; closes SQLite before inference.
+    static func selectedSegments(dbPath: String) -> (segments: [Float]?, error: String?) {
         var db: OpaquePointer?
         // Read-only + busy timeout: a partial PPG read during a sync must fail
         // loudly, never feed the model a truncated waveform.
@@ -30,57 +53,58 @@ enum CvaModel {
         defer { sqlite3_close(db) }
         sqlite3_busy_timeout(db, 5000)
 
-        // raw PPG bodies in time order (tag 129)
-        var tss: [Int64] = [], bodies: [[UInt8]] = []
+        // Decode incrementally. Preserve the existing timestamp order and last-4000
+        // selection, including delta state across packet boundaries within each run.
+        let maxSegs = 4000
+        var segments: [Float] = []
+        segments.reserveCapacity(maxSegs * SEG_LEN)
+        var pending: [Float] = []
+        var accumulator: Int32 = 0
+        var previousTs: Int64?
+        var nextSegment = 0
+        var totalSegments = 0
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, "SELECT ring_timestamp, body FROM events WHERE tag=129 AND body IS NOT NULL ORDER BY ring_timestamp", -1, &stmt, nil) == SQLITE_OK else {
-            return (nil, "couldn't read the database for CVA: \(String(cString: sqlite3_errmsg(db)))")
+            return (nil, "CVA query failed: \(String(cString: sqlite3_errmsg(db)))")
         }
-        var stepRc = sqlite3_step(stmt)
-        while stepRc == SQLITE_ROW {
-            defer { stepRc = sqlite3_step(stmt) }  // runs on continue too
+        defer { sqlite3_finalize(stmt) }
+        var rcStep = sqlite3_step(stmt)
+        while rcStep == SQLITE_ROW {
+            guard !AnalysisRun.cancelled else { return (nil, "analysis paused") }
             let ts = sqlite3_column_int64(stmt, 0)
             let n = Int(sqlite3_column_bytes(stmt, 1))
-            guard n > 0, let p = sqlite3_column_blob(stmt, 1) else { continue }
-            tss.append(ts)
-            bodies.append([UInt8](UnsafeBufferPointer(start: p.assumingMemoryBound(to: UInt8.self), count: n)))
+            if n > 0, let raw = sqlite3_column_blob(stmt, 1) {
+                if let previousTs, ts - previousTs > GAP_DS { pending.removeAll(keepingCapacity: true); accumulator = 0 }
+                previousTs = ts
+                let bytes = raw.assumingMemoryBound(to: UInt8.self)
+                var i = 0
+                while i < n {
+                    let b = bytes[i]
+                    if b == 0x80 && i + 3 < n {
+                        var absolute = Int32(bytes[i+1]) | (Int32(bytes[i+2]) << 8) | (Int32(bytes[i+3]) << 16)
+                        if absolute & 0x800000 != 0 { absolute -= 0x1000000 }
+                        accumulator = absolute; i += 4
+                    } else { accumulator &+= Int32(Int8(bitPattern: b)); i += 1 }
+                    pending.append(Float(accumulator))
+                    if pending.count == SEG_LEN {
+                        if totalSegments < maxSegs { segments.append(contentsOf: pending) }
+                        else { segments.replaceSubrange(nextSegment * SEG_LEN..<(nextSegment + 1) * SEG_LEN, with: pending) }
+                        totalSegments += 1
+                        nextSegment = totalSegments % maxSegs
+                        pending.removeAll(keepingCapacity: true)
+                    }
+                }
+            }
+            rcStep = sqlite3_step(stmt)
         }
-        sqlite3_finalize(stmt)
-        guard stepRc == SQLITE_DONE else {
-            return (nil, "database read for CVA was interrupted: \(String(cString: sqlite3_errmsg(db)))")
-        }
-        guard !bodies.isEmpty else { return (nil, nil) }  // no PPG captured — benign
-
-        // split into contiguous measurement runs, decode + chunk into 1500-sample segments
-        var segments: [Float] = []   // flattened n_segs × 1500
-        var nSegs = 0
-        var run: [[UInt8]] = [bodies[0]]
-        func flush(_ r: [[UInt8]]) {
-            let wave = decode(r)
-            var s = 0
-            while s + SEG_LEN <= wave.count { segments.append(contentsOf: wave[s..<s + SEG_LEN]); nSegs += 1; s += SEG_LEN }
-        }
-        for i in 1..<bodies.count {
-            if tss[i] - tss[i - 1] > GAP_DS { flush(run); run = [] }
-            run.append(bodies[i])
-        }
-        flush(run)
-        guard nSegs > 0 else { return (nil, nil) }  // PPG present but no full segment — benign
-        // A long PPG archive can be tens of thousands of 1500-sample windows.
-        // Keep the most recent 4000 (~enough for the daily CVA estimate) so a
-        // hiking-heavy history does not feed a 60 MB tensor into LibTorch.
-        let maxSegs = 4000
-        if nSegs > maxSegs {
-            segments = Array(segments.suffix(maxSegs * SEG_LEN))
-            nSegs = maxSegs
+        guard rcStep == SQLITE_DONE else { return (nil, "CVA read failed: sqlite=\(rcStep) extended=\(sqlite3_extended_errcode(db))") }
+        let nSegs = min(totalSegments, maxSegs)
+        guard nSegs > 0 else { return ([], nil) }
+        if totalSegments > maxSegs, nextSegment > 0 {
+            segments = Array(segments[(nextSegment * SEG_LEN)...]) + segments[..<(nextSegment * SEG_LEN)]
         }
 
-        let sexVal: Float = sex.uppercased() == "F" ? -1 : (sex.uppercased() == "O" ? 0 : 1)
-        var demo: [Float] = [sexVal, Float(heightM), Float(age), Float(ringSize), Float(weightKg)]
-        var vage = 0.0, pwv = 0.0
-        let rc = oura_cva(modelPath, &segments, Int32(nSegs), &demo, &vage, &pwv)
-        guard rc == 0 else { return (nil, "cardiovascular model failed on \(nSegs) PPG segments") }
-        return (Result(vascularAge: (vage * 10).rounded() / 10, pwv: (pwv * 100).rounded() / 100, segments: nSegs), nil)
+        return (segments, nil)
     }
 
     // PPG delta stream: 0x80 marks the next 3 bytes as an absolute 24-bit sample;

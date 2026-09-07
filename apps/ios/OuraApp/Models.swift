@@ -83,7 +83,7 @@ struct Device: Codable {
 }
 // Symptom Radar (on-device illness detection). Mirrors the web summary's `illness`
 // block; computed on-device by IllnessModel so it isn't part of the FFI JSON.
-struct IllnessBiomarker: Identifiable {
+struct IllnessBiomarker: Identifiable, Codable {
     let type: String        // AverageBreath | LowestHeartRate | AverageHrv | TemperatureDeviation
     let value: Double
     let lower: Double
@@ -92,7 +92,7 @@ struct IllnessBiomarker: Identifiable {
     let reason: String?     // "ELEVATED" | "DECREASED" | nil
     var id: String { type }
 }
-struct IllnessResult {
+struct IllnessResult: Codable {
     var available: Bool
     var status: String          // NO_SIGNS | MINOR_SIGNS | MAJOR_SIGNS | MISSING_LAST_NIGHT_SLEEP | MISSING_SLEEP_DATA
     var trafficLight: String     // NO_SIGNS | MINOR_SIGNS | MAJOR_SIGNS

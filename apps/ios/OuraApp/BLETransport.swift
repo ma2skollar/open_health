@@ -56,6 +56,9 @@ enum BLEError: Error, CustomStringConvertible {
 // @unchecked Sendable: continuations are taken/resumed under `lock`, and the rest of
 // the mutable CB state is only touched on the central manager's callback queue.
 final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBPeripheralDelegate, @unchecked Sendable {
+    private let bleQueue = DispatchQueue(label: "md.thomas.openoura.ble", qos: .userInitiated)
+    private var closed = false
+    private var writeTimeout: DispatchWorkItem?
     private var central: CBCentralManager!
     private var peripheral: CBPeripheral?
     private var writeChar: CBCharacteristic?
@@ -103,7 +106,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
         // racing service discovery).
         central = CBCentralManager(
             delegate: self,
-            queue: DispatchQueue(label: "md.thomas.openoura.ble", qos: .userInitiated))
+            queue: bleQueue)
     }
 
     /// Scan → connect → discover. Resolves once the write characteristic is ready
@@ -113,63 +116,30 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
     /// plus 30 s for connect + discovery: a worn ring advertises in low-power mode
     /// only intermittently, so 20 s of scan alone was routinely not enough.
     func connect(timeout: TimeInterval = 50) async throws {
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            lock.lock()
-            // reject (rather than strand) a second connect while one is in flight OR
-            // already connected — a re-entrant connect would swap the notifications
-            // stream and silently strand whoever is still draining the current one.
-            if connectCont != nil || writeChar != nil {
-                lock.unlock()
-                c.resume(throwing: BLEError.busy)
-                return
-            }
-            connectCont = c
-            stage = "waiting for Bluetooth to power on"
-            // fail rather than hang forever if the ring never advertises (off the
-            // charger / not worn) or Bluetooth stays off. The work item is stored so
-            // finishConnect() can cancel it — a stale timer from a prior/finished
-            // attempt must not fire and abort a newer connection.
-            let work = DispatchWorkItem { [weak self] in
-                guard let self else { return }
-                self.central.stopScan()
-                self.lock.lock()
-                var at = self.stage
-                let others = self.otherDevices.count
-                self.lock.unlock()
-                // Distinguish "the ring isn't advertising" from "Bluetooth is dead":
-                // the unfiltered scan tells us whether ANY advertisements arrived.
-                if at.hasPrefix("scanning") {
-                    at = others > 0
-                        ? "scanning — saw \(others) other BLE device(s) but no Oura ring: "
-                            + "the ring is connected to another device (phone with the "
-                            + "official app? Mac?), off its charger and asleep, or out of battery"
-                        : "scanning — saw NO BLE advertisements at all: Bluetooth may be "
-                            + "off, restricted, or the permission was revoked"
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                bleQueue.async { [self] in
+                    guard !closed else { c.resume(throwing: BLEError.disconnected); return }
+                    guard connectCont == nil, writeChar == nil else { c.resume(throwing: BLEError.busy); return }
+                    connectCont = c
+                    stage = "initializing Bluetooth"
+                    notifications = AsyncStream(bufferingPolicy: .bufferingOldest(256)) { self.notifyContinuation = $0 }
+                    let work = DispatchWorkItem { [weak self] in
+                        guard let self, self.connectCont != nil else { return }
+                        dlog("ble", "timeout stage=\(self.stage) budget=\(timeout)s otherDevices=\(self.otherDevices.count)")
+                        self.finishConnect(.failure(BLEError.timedOut(stage: self.stage)))
+                        self.closeOnQueue()
+                    }
+                    connectTimeout = work
+                    bleQueue.asyncAfter(deadline: .now() + timeout, execute: work)
+                    if central.state == .poweredOn { startScan() }
+                    else if [.poweredOff, .unauthorized, .unsupported].contains(central.state) {
+                        finishConnect(.failure(BLEError.poweredOff))
+                    }
                 }
-                dlog("ble", "TIMEOUT while \(at)")
-                self.finishConnect(.failure(BLEError.timedOut(stage: at)))
             }
-            connectTimeout = work
-            lock.unlock()
-            // fresh notification stream for this connection (a reconnect must not hand
-            // back the previous, already-finished stream).
-            historyBuffer.removeAll(keepingCapacity: true)
-            historyFrames = 0
-            historyBytes = 0
-            notifications = AsyncStream { self.notifyContinuation = $0 }
-            DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: work)
-            dlog("ble", "connect(timeout: \(Int(timeout))s) — central.state=\(Self.name(of: central.state))")
-            switch central.state {
-            case .poweredOn:
-                startScan()
-            case .poweredOff, .unauthorized, .unsupported:
-                // fail NOW instead of burning the whole timeout: the one-shot state
-                // callback fired before this connect registered, so it won't recur.
-                finishConnect(.failure(BLEError.poweredOff))
-            default:
-                break // .unknown/.resetting — wait for centralManagerDidUpdateState
-            }
-        }
+        } onCancel: { self.abort() }
     }
 
     private static func name(of state: CBManagerState) -> String {
@@ -203,49 +173,45 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
     /// Finish the inbound frame stream so a Rust drain blocked on `recv` returns at once
     /// (instead of waiting out the quiet-window) — used when a write fails so the sync
     /// surfaces the error promptly rather than proceeding as if the frame was sent.
-    func abort() { notifyContinuation?.finish() }
-
-    /// Release the ring: cancel the GATT connection (and any scan) and finish the
-    /// stream. The ring has a SINGLE BLE link and only advertises when nothing holds
-    /// it — an app that keeps the connection after a sync blocks the official app,
-    /// the Mac, and its own next scan.
-    func disconnect() {
-        lock.lock()
-        let p = peripheral
-        peripheral = nil
-        writeChar = nil
-        lock.unlock()
+    func abort() { bleQueue.async { self.closeOnQueue() } }
+    func disconnect() { abort() }
+    private func closeOnQueue() {
+        guard !closed else { return }
+        closed = true
         central.stopScan()
+        finishWrite(.failure(BLEError.disconnected))
+        finishConnect(.failure(BLEError.disconnected))
         notifyContinuation?.finish()
-        if let p {
-            central.cancelPeripheralConnection(p)
-            dlog("ble", "disconnected — ring link released")
-        }
+        historyBuffer.removeAll()
+        if let p = peripheral { central.cancelPeripheralConnection(p) }
+        peripheral = nil; writeChar = nil
     }
 
-    /// Write a request frame and await the ring's GATT acknowledgement, so the caller
-    /// (Rust `OuraClient`, which drives requests sequentially) knows the frame landed
-    /// before sending the next. Resolved in `didWriteValueFor`.
     func write(_ data: Data) async throws {
-        guard let p = peripheral, let wc = writeChar else { throw BLEError.noWriteCharacteristic }
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
-            lock.lock()
-            // reject (don't strand) an overlapping write — the caller drives writes
-            // sequentially, so a second in-flight write is a misuse, not a queue.
-            if writeCont != nil {
-                lock.unlock()
-                c.resume(throwing: BLEError.busy)
-                return
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                bleQueue.async { [self] in
+                    guard !closed, let p = peripheral, let wc = writeChar else {
+                        c.resume(throwing: BLEError.disconnected); return
+                    }
+                    guard writeCont == nil else { c.resume(throwing: BLEError.busy); return }
+                    writeCont = c
+                    let work = DispatchWorkItem { [weak self] in
+                        guard let self, self.writeCont != nil else { return }
+                        dlog("ble", "write failed: GATT acknowledgement timeout budget=10s")
+                        self.closeOnQueue()
+                    }
+                    writeTimeout = work
+                    bleQueue.asyncAfter(deadline: .now() + 10, execute: work)
+                    p.writeValue(data, for: wc, type: .withResponse)
+                }
             }
-            writeCont = c
-            lock.unlock()
-            dlog("send", "\(data.count)B \(data.hexString)")
-            p.writeValue(data, for: wc, type: .withResponse)
-        }
+        } onCancel: { self.abort() }
     }
-
     // ── CBCentralManagerDelegate ──
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        guard !closed else { return }
         dlog("ble", "central state → \(Self.name(of: central.state))")
         switch central.state {
         case .poweredOn:
@@ -253,6 +219,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
             if connectCont != nil { startScan() }
         case .poweredOff, .unauthorized, .unsupported:
             finishConnect(.failure(BLEError.poweredOff))
+            closeOnQueue()
         default: break
         }
     }
@@ -262,7 +229,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
         // ignore a discovery that arrives after the attempt already resolved (e.g. a
         // callback queued just past the timeout) — don't start a stray connection.
         lock.lock(); let active = connectCont != nil; lock.unlock()
-        guard active else { central.stopScan(); return }
+        guard active, !closed, self.peripheral == nil else { return }
         let advName = (advertisementData[CBAdvertisementDataLocalNameKey] as? String)
             ?? peripheral.name ?? ""
         let advServices = advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID] ?? []
@@ -310,7 +277,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
             dlog("scan", "saw '\(advName.isEmpty ? "<no name>" : advName)' id=\(peripheral.identifier.uuidString.suffix(12)) rssi=\(RSSI) services=[\(svc)] mfr=\(mfr) connectable=\(conn.map(String.init) ?? "?")")
         }
         central.stopScan()
-        dlog("ble", "matched '\(advName.isEmpty ? "<no name yet>" : advName)' rssi=\(RSSI) — GATT connect…")
+        dlog("ble", "ring matched rssi=\(RSSI) otherDevices=\(otherDevices.count) — connecting")
         lock.lock(); stage = "GATT-connecting to the discovered ring"; lock.unlock()
         self.peripheral = peripheral
         peripheral.delegate = self
@@ -318,6 +285,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard !closed, self.peripheral === peripheral else { return }
         let mtu = peripheral.maximumWriteValueLength(for: .withResponse)
         dlog("ble", "GATT connected (maxWrite=\(mtu)B) — discovering the Oura service")
         lock.lock(); stage = "discovering services/characteristics"; lock.unlock()
@@ -326,14 +294,17 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
 
     func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral,
                         error: Error?) {
+        guard !closed, self.peripheral === peripheral else { return }
         dlog("ble", "GATT connect FAILED: \(error.map { String(describing: $0) } ?? "no error info")")
         finishConnect(.failure(error ?? BLEError.notFound))
     }
 
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral,
                         error: Error?) {
+        guard !closed, self.peripheral === peripheral else { return }
         dlog("ble", "peripheral disconnected: \(error.map { String(describing: $0) } ?? "clean")")
         notifyContinuation?.finish()
+        closed = true
         // don't strand a caller awaiting a connect or write when the link drops.
         finishWrite(.failure(BLEError.disconnected))
         finishConnect(.failure(BLEError.disconnected))
@@ -341,6 +312,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
 
     // ── CBPeripheralDelegate ──
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        guard !closed, self.peripheral === peripheral else { return }
         if let error {
             dlog("ble", "service discovery FAILED: \(error)")
             return finishConnect(.failure(error))
@@ -366,13 +338,14 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
 
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
+        guard !closed, self.peripheral === peripheral else { return }
         if let error {
             dlog("ble", "characteristic discovery FAILED: \(error)")
             return finishConnect(.failure(error))
         }
         var notifyChars: [CBCharacteristic] = []
         for c in service.characteristics ?? [] {
-            dlog("ble", "char …\(c.uuid.uuidString.suffix(4).lowercased()) [\(Self.props(c))]")
+            dlog("ble", "char …\(c.uuid.uuidString.prefix(8).lowercased()) [\(Self.props(c))]")
             if c.uuid == RingUUID.write { writeChar = c }
             if RingUUID.notify.contains(c.uuid.uuidString.uppercased()) { notifyChars.append(c) }
         }
@@ -397,13 +370,14 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic,
                     error: Error?) {
+        guard !closed, self.peripheral === peripheral else { return }
         if let error {
             // a pairing/encryption demand surfaces here (e.g. "Authentication is
             // insufficient") — the single most diagnostic error on a keyed ring.
-            dlog("ble", "subscribe FAILED on …\(characteristic.uuid.uuidString.suffix(4).lowercased()): \(error)")
+            dlog("ble", "subscribe FAILED on …\(characteristic.uuid.uuidString.prefix(8).lowercased()): \(error)")
             return finishConnect(.failure(error))
         }
-        dlog("ble", "subscribed …\(characteristic.uuid.uuidString.suffix(4).lowercased())")
+        dlog("ble", "subscribed …\(characteristic.uuid.uuidString.prefix(8).lowercased())")
         lock.lock(); pendingNotify -= 1; let ready = pendingNotify <= 0; lock.unlock()
         if ready {
             dlog("ble", "all notify subscriptions confirmed — BLE link ready, handing to Rust auth")
@@ -413,10 +387,11 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
 
     func peripheral(_ peripheral: CBPeripheral, didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
+        guard !closed, self.peripheral === peripheral else { return }
         // drop the callback on a read/notify error — a stale payload must not be fed
         // into the frame stream Rust drains as protocol responses.
         guard error == nil, let v = characteristic.value else {
-            if let error { dlog("ble", "notify ERROR on \(characteristic.uuid): \(error)") }
+            if let error { dlog("ble", "notify ERROR on \(characteristic.uuid): \(error)"); closeOnQueue() }
             return
         }
         if Self.isHistoryPayload(v) {
@@ -438,8 +413,8 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
             historyFrames = 0
             historyBytes = 0
         }
-        dlog("recv", "\(v.count)B [\(characteristic.uuid.uuidString.suffix(4).lowercased())] \(v.hexString)")
-        notifyContinuation?.yield(v)
+        dlog("recv", "\(v.count)B [\(characteristic.uuid.uuidString.prefix(8).lowercased())] \(v.hexString)")
+        deliver(v)
     }
 
     /// Extended history data is `0x2f … 0x43`; legacy history packets use event
@@ -462,16 +437,24 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
         return offset > 0
     }
 
+    private func deliver(_ data: Data) {
+        if case .dropped = notifyContinuation?.yield(data) {
+            dlog("ble", "receive queue overflow — replay from committed checkpoint")
+            closeOnQueue()
+        }
+    }
+
     private func flushHistoryPayload() {
         guard !historyBuffer.isEmpty else { return }
         let payload = historyBuffer
         historyBuffer.removeAll(keepingCapacity: true)
-        notifyContinuation?.yield(payload)
+        deliver(payload)
     }
 
     /// GATT write-with-response acknowledgement (or error) for the in-flight `write`.
     func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic,
                     error: Error?) {
+        guard !closed, self.peripheral === peripheral else { return }
         if let error { dlog("ble", "write NAK: \(error)") }
         finishWrite(error.map { .failure($0) } ?? .success(()))
     }
@@ -495,6 +478,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
     }
 
     private func finishWrite(_ result: Result<Void, Error>) {
+        writeTimeout?.cancel(); writeTimeout = nil
         lock.lock(); let c = writeCont; writeCont = nil; lock.unlock()
         c?.resume(with: result)
     }

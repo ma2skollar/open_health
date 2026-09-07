@@ -8,13 +8,10 @@ import UIKit
 @_silgen_name("crashcatch_install")
 func crashcatch_install(_ fd: Int32)
 
-/// On-disk diagnostics that survive a crash: the live `dlog` transcript is
-/// appended to a session file, leftover files from a killed launch become
-/// crash reports, and uncaught exceptions / abort signals write a backtrace
-/// into that same file. The sync screen lists previous incidents.
+/// Bounded local diagnostics. An unfinished session is evidence of interruption,
+/// not evidence of a crash. MetricKit payloads retain their original reporting dates.
 final class DiagStore: NSObject, ObservableObject, @unchecked Sendable {
     static let shared = DiagStore()
-
     struct Incident: Identifiable {
         let id: URL
         let date: Date
@@ -23,218 +20,226 @@ final class DiagStore: NSObject, ObservableObject, @unchecked Sendable {
         let preview: String
         var body: String { (try? String(contentsOf: id, encoding: .utf8)) ?? "" }
     }
-
     @Published private(set) var incidents: [Incident] = []
     @Published private(set) var sessions: [Incident] = []
-
     private let queue = DispatchQueue(label: "md.thomas.openoura.diag", qos: .utility)
+    private let pendingLock = NSLock()
+    private var pending = 0
+    private var dropped = 0
     private var file: FileHandle?
-    private var sessionURL: URL?
-    private let maxSessionBytes = 2 * 1024 * 1024
-    private let keepCrashes = 16
-    private let keepSessions = 8
+    private var signalFile: FileHandle?
     private var bootstrapped = false
-
+    private var observers: [NSObjectProtocol] = []
+    let sessionID = UUID().uuidString
+    private var directoryOverride: URL?
+    private var lifecycle = "launching"
+    private var segmentLimit = 2 * 1024 * 1024
+    private var totalLimit = 32 * 1024 * 1024
+    private var size = 0
+    private var root: URL {
+        directoryOverride ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("diagnostics", isDirectory: true)
+    }
+    private var live: URL { root.appendingPathComponent("session.log") }
     private override init() { super.init() }
 
-    private var root: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("diagnostics", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        try? FileManager.default.createDirectory(at: dir.appendingPathComponent("crashes"), withIntermediateDirectories: true)
-        try? FileManager.default.createDirectory(at: dir.appendingPathComponent("sessions"), withIntermediateDirectories: true)
-        return dir
+    // Isolated diagnostics store for retention/export regression tests.
+    init(directory: URL, segmentLimit: Int, totalLimit: Int) {
+        super.init()
+        self.directoryOverride = directory
+        self.segmentLimit = segmentLimit
+        self.totalLimit = totalLimit
+        for name in ["", "crashes", "sessions"] {
+            try? FileManager.default.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true)
+        }
+        openLive()
     }
 
-    /// Call once at process start, before any `dlog`.
     func bootstrap() {
         queue.sync {
             guard !bootstrapped else { return }
             bootstrapped = true
             let fm = FileManager.default
-            let live = root.appendingPathComponent("session.log")
+            for name in ["", "crashes", "sessions"] {
+                try? fm.createDirectory(at: root.appendingPathComponent(name), withIntermediateDirectories: true)
+            }
+            let signal = root.appendingPathComponent("signal.log")
+            let marker = (try? String(contentsOf: signal, encoding: .utf8)) ?? ""
             if fm.fileExists(atPath: live.path) {
-                let dest = root.appendingPathComponent("crashes")
-                    .appendingPathComponent("abnormal-\(Self.stamp()).log")
+                let text = (try? String(contentsOf: live, encoding: .utf8)) ?? ""
+                let kind = !marker.isEmpty ? "confirmed-crash" : Self.classify(text)
+                let dest = root.appendingPathComponent(kind == "backgrounded-session" ? "sessions" : "crashes")
+                    .appendingPathComponent("\(kind)-\(UUID().uuidString).log")
                 try? fm.moveItem(at: live, to: dest)
-                let note = """
-                Previous Open Oura launch ended without a clean shutdown.
-                Typical causes: crash, jetsam (memory), force-quit, or the screen \
-                locking mid-sync / mid-analysis. The leftover log is attached below.
-
-                """
-                if let existing = try? String(contentsOf: dest, encoding: .utf8) {
-                    try? (note + existing).write(to: dest, atomically: true, encoding: .utf8)
+                if !marker.isEmpty, let handle = try? FileHandle(forWritingTo: dest) {
+                    _ = try? handle.seekToEnd(); try? handle.write(contentsOf: Data(marker.utf8)); try? handle.close()
                 }
             }
-            fm.createFile(atPath: live.path, contents: nil)
-            sessionURL = live
-            file = try? FileHandle(forWritingTo: live)
-            file?.seekToEndOfFile()
-            if let fd = file?.fileDescriptor {
-                crashcatch_install(fd)
-            }
-            let header = Self.environmentHeader()
-            file?.write(Data(header.utf8))
+            fm.createFile(atPath: signal.path, contents: nil)
+            signalFile = try? FileHandle(forWritingTo: signal)
+            crashcatch_install(signalFile?.fileDescriptor ?? -1)
+            openLive()
+            prune()
         }
-        NSSetUncaughtExceptionHandler { exception in
-            var lines = ["\n*** EXCEPTION ***",
-                         "name: \(exception.name.rawValue)",
-                         "reason: \(exception.reason ?? "")"]
-            lines.append(contentsOf: exception.callStackSymbols)
-            DiagStore.shared.writeCrash("exception", lines.joined(separator: "\n"))
+        // Avoid locks, allocation-heavy stack walking, or re-entering the logger in an exception handler.
+        NSSetUncaughtExceptionHandler { _ in
+            let marker = "\n*** EXCEPTION ***\n"
+            marker.withCString { p in
+                if let fd = DiagStore.shared.signalFile?.fileDescriptor { _ = Darwin.write(fd, p, strlen(p)) }
+            }
         }
         MXMetricManager.shared.add(self)
-        NotificationCenter.default.addObserver(forName: UIApplication.willTerminateNotification,
-                                               object: nil, queue: .main) { _ in
-            DiagStore.shared.markCleanExit()
+        let center = NotificationCenter.default
+        for (name, state) in [(UIApplication.didEnterBackgroundNotification, "background"),
+                              (UIApplication.didBecomeActiveNotification, "active"),
+                              (UIApplication.protectedDataWillBecomeUnavailableNotification, "protected-data-unavailable"),
+                              (UIApplication.protectedDataDidBecomeAvailableNotification, "protected-data-available"),
+                              (UIApplication.didReceiveMemoryWarningNotification, "memory-warning")] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { _ in
+                dlog("lifecycle", "state=\(state)")
+                memLog(state)
+                self.flush()
+            })
         }
         refreshLists()
-        dlog("diag", "session started — previous crashes \(incidents.count), older sessions \(sessions.count)")
+        dlog("diag", "session started id=\(sessionID)")
+    }
+
+    static func classify(_ text: String) -> String {
+        if text.contains("*** CRASH ***") || text.contains("*** EXCEPTION ***") { return "confirmed-crash" }
+        let states = text.split(separator: "\n").filter { $0.contains("[lifecycle]") }
+        if states.last(where: { $0.contains("state=background") || $0.contains("state=active") })?.contains("state=background") == true {
+            return "backgrounded-session"
+        }
+        return "interrupted-session-cause-unknown"
     }
 
     func append(_ line: String) {
-        queue.async { [weak self] in
-            guard let self, let file = self.file else { return }
-            file.write(Data((line + "\n").utf8))
-            if file.offsetInFile > UInt64(self.maxSessionBytes) {
-                file.write(Data("\n(session log truncated at 2 MB)\n".utf8))
-                try? file.synchronize()
+        pendingLock.lock()
+        guard pending < 256 else { dropped += 1; pendingLock.unlock(); return }
+        pending += 1
+        pendingLock.unlock()
+        queue.async {
+            defer { self.pendingLock.lock(); self.pending -= 1; self.pendingLock.unlock() }
+            self.pendingLock.lock(); let omitted = self.dropped; self.dropped = 0; self.pendingLock.unlock()
+            if line.contains("[lifecycle]") {
+                if line.contains("state=background") { self.lifecycle = "background" }
+                if line.contains("state=active") { self.lifecycle = "active" }
+            }
+            let bounded = String(line.prefix(8192))
+            let data = Data(((omitted > 0 ? "[diag] omitted \(omitted) queued records\n" : "") + bounded + "\n").utf8)
+            if self.size + data.count > self.segmentLimit { self.rotate() }
+            do { try self.file?.write(contentsOf: data); self.size += data.count }
+            catch { /* Diagnostics must not crash or recursively log disk failures. */ }
+            if line.contains(" error [sync]") || line.contains(" error [db]") || line.contains(" error [models]") {
+                let url = self.root.appendingPathComponent("crashes/operation-failure_\(UUID().uuidString).log")
+                try? data.write(to: url, options: .atomic)
+                self.prune(); self.refreshLists()
             }
         }
     }
 
-    func writeCrash(_ kind: String, _ body: String) {
-        queue.sync {
-            let header = "\(kind) \(Self.stamp())\n\(Self.environmentHeader())\n"
-            if let file {
-                file.write(Data("\n*** \(kind.uppercased()) ***\n\(body)\n".utf8))
-                try? file.synchronize()
-            }
-            let dest = root.appendingPathComponent("crashes")
-                .appendingPathComponent("\(kind)-\(Self.stamp()).log")
-            try? (header + body).write(to: dest, atomically: true, encoding: .utf8)
-            prune(root.appendingPathComponent("crashes"), keep: keepCrashes)
-        }
-        refreshLists()
-    }
+    func flush() { queue.sync { try? file?.synchronize() } }
 
-    func markCleanExit() {
-        queue.sync {
-            try? file?.synchronize()
-            try? file?.close()
-            file = nil
-            crashcatch_install(-1)
-            if let live = sessionURL {
-                let dest = root.appendingPathComponent("sessions")
-                    .appendingPathComponent("session-\(Self.stamp()).log")
-                try? FileManager.default.moveItem(at: live, to: dest)
-                prune(root.appendingPathComponent("sessions"), keep: keepSessions)
-            }
-            sessionURL = nil
-        }
-        refreshLists()
+    private func openLive() {
+        FileManager.default.createFile(atPath: live.path, contents: nil)
+        file = try? FileHandle(forWritingTo: live)
+        let header = "Open Oura \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] ?? "?") (\(Bundle.main.infoDictionary?["CFBundleVersion"] ?? "?"))\n\(ProcessInfo.processInfo.operatingSystemVersionString)\nsession=\(sessionID) started=\(ISO8601DateFormatter().string(from: Date())) core=\(coreVersion())\n[lifecycle] state=\(lifecycle)\n"
+        let data = Data(header.utf8)
+        try? file?.write(contentsOf: data); size = data.count
     }
-
-    func exportAll() -> String {
-        var parts = [RingDiag.shared.dump()]
-        let crashes = incidents
-        if !crashes.isEmpty {
-            parts.append("\n\n===== previous crashes / abnormal exits (\(crashes.count)) =====")
-            for item in crashes.prefix(8) {
-                parts.append("\n--- \(item.title) ---\n\(item.body)")
-            }
-        }
-        if !sessions.isEmpty {
-            parts.append("\n\n===== older sessions (\(sessions.count)) =====")
-            for item in sessions.prefix(3) {
-                parts.append("\n--- \(item.title) ---\n\(item.body)")
-            }
-        }
-        return parts.joined(separator: "\n")
+    private func rotate() {
+        try? file?.synchronize(); try? file?.close(); file = nil
+        let dest = root.appendingPathComponent("sessions/segment-\(UUID().uuidString).log")
+        try? FileManager.default.moveItem(at: live, to: dest)
+        openLive(); prune()
     }
-
+    private func prune() {
+        let fm = FileManager.default
+        let files = ["crashes", "sessions"].flatMap {
+            (try? fm.contentsOfDirectory(at: root.appendingPathComponent($0), includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey])) ?? []
+        }.sorted { date($0) > date($1) }
+        var bytes = segmentLimit
+        for (index, url) in files.enumerated() {
+            bytes += (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            if bytes > totalLimit || index >= 32 { try? fm.removeItem(at: url) }
+        }
+    }
+    private func date(_ url: URL) -> Date {
+        (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+    }
     private func refreshLists() {
-        let crashes = loadFolder(root.appendingPathComponent("crashes"), kind: "crash")
-        let older = loadFolder(root.appendingPathComponent("sessions"), kind: "session")
-        DispatchQueue.main.async {
-            self.incidents = crashes
-            self.sessions = older
+        queue.async {
+            let incidents = self.loadFolder("crashes")
+            let sessions = self.loadFolder("sessions")
+            DispatchQueue.main.async { self.incidents = incidents; self.sessions = sessions }
         }
     }
-
-    private func loadFolder(_ dir: URL, kind: String) -> [Incident] {
-        let fm = FileManager.default
-        let files = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
-                                                 options: .skipsHiddenFiles)) ?? []
-        return files.compactMap { url -> Incident? in
-            let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date()
-            let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-            let preview = text.split(separator: "\n").prefix(6).joined(separator: "\n")
-            let name = url.deletingPathExtension().lastPathComponent
-            return Incident(id: url, date: date, kind: kind, title: name, preview: preview)
-        }
-        .sorted { $0.date > $1.date }
+    private func loadFolder(_ folder: String) -> [Incident] {
+        let files = (try? FileManager.default.contentsOfDirectory(at: root.appendingPathComponent(folder), includingPropertiesForKeys: [.contentModificationDateKey])) ?? []
+        return files.map { url in
+            let body = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+            let name = url.lastPathComponent
+            let kind: String
+            if name.hasPrefix("operation-failure") { kind = "operation-failure" }
+            else if name.hasPrefix("metrickit") { kind = name.components(separatedBy: "_")[0] }
+            else { kind = Self.classify(body) }
+            return Incident(id: url, date: date(url), kind: kind, title: kind,
+                            preview: body.split(separator: "\n").suffix(4).joined(separator: "\n"))
+        }.sorted { $0.date > $1.date }
     }
-
-    private func prune(_ dir: URL, keep: Int) {
-        let fm = FileManager.default
-        let files = ((try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.contentModificationDateKey],
-                                                  options: .skipsHiddenFiles)) ?? [])
-            .sorted { a, b in
-                let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                return da > db
+    func exportSummary() -> String {
+        flush()
+        let reports = queue.sync { loadFolder("crashes") }
+        let recent = reports.prefix(5)
+        let groups = Dictionary(grouping: reports, by: { report in
+            if let match = report.preview.range(of: "sqlite=[0-9]+", options: .regularExpression) {
+                return "storage " + String(report.preview[match])
             }
-        for extra in files.dropFirst(keep) {
-            try? fm.removeItem(at: extra)
+            if report.preview.lowercased().contains("auth") { return "authentication failure" }
+            if report.preview.lowercased().contains("timeout") { return "transport timeout" }
+            return report.kind
+        }).map { "\($0.key): \($0.value.count)" }.sorted()
+        return RingDiag.shared.summary() + "\n\nRetained incidents: \(reports.count); included: \(recent.count)\n"
+            + groups.joined(separator: "\n") + "\n" + recent.map { "\($0.title): \($0.preview)" }.joined(separator: "\n")
+    }
+    func exportAll() -> String {
+        flush()
+        return queue.sync {
+            let current = (try? String(contentsOf: live, encoding: .utf8)) ?? ""
+            let retained = loadFolder("crashes") + loadFolder("sessions")
+            return current + "\nRetained reports included: \(retained.count)/\(retained.count)\n"
+                + retained.map { "\n--- \($0.kind) ---\n\($0.body)" }.joined()
         }
     }
-
-    private static func stamp() -> String {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd-HHmmss"
-        return f.string(from: Date())
+    func exportFile() -> URL? {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("oura-diagnostics.txt")
+        do { try exportAll().write(to: url, atomically: true, encoding: .utf8); return url }
+        catch { return nil }
     }
-
-    private static func environmentHeader() -> String {
-        let v = Bundle.main.infoDictionary
-        let app = "\(v?["CFBundleShortVersionString"] ?? "?") (\(v?["CFBundleVersion"] ?? "?"))"
-        let os = ProcessInfo.processInfo.operatingSystemVersionString
-        let mem = os_proc_available_memory() / 1_048_576
-        return """
-        Open Oura \(app)
-        iOS \(os)
-        launched \(Date())
-        available memory \(mem) MB
-
-        """
+    private func record(_ kind: String, data: Data, incident: Bool = true) {
+        queue.async {
+            // Retain original diagnostic payload; never append a delayed crash to the live session.
+            let folder = incident ? "crashes" : "sessions"
+            let dest = self.root.appendingPathComponent("\(folder)/\(kind)_\(UUID().uuidString).json")
+            if data.count <= self.totalLimit / 2 { try? data.write(to: dest, options: .atomic) }
+            else {
+                let note = Data("{\"omitted_payload_bytes\":\(data.count),\"reason\":\"local diagnostics size limit\"}".utf8)
+                try? note.write(to: dest, options: .atomic)
+            }
+            self.prune(); self.refreshLists()
+        }
     }
 }
-
 extension DiagStore: MXMetricManagerSubscriber {
-    func didReceive(_ payloads: [MXMetricPayload]) {}
-
+    func didReceive(_ payloads: [MXMetricPayload]) {
+        for payload in payloads { record("metrickit-metrics-reporting-period", data: payload.jsonRepresentation(), incident: false) }
+    }
     func didReceive(_ payloads: [MXDiagnosticPayload]) {
         for payload in payloads {
-            if let crashes = payload.crashDiagnostics {
-                for crash in crashes {
-                    let text = String(data: crash.jsonRepresentation(), encoding: .utf8) ?? crash.description
-                    writeCrash("metrickit-crash", text)
-                }
-            }
-            if let hangs = payload.hangDiagnostics {
-                for hang in hangs {
-                    let text = String(data: hang.jsonRepresentation(), encoding: .utf8) ?? hang.description
-                    writeCrash("metrickit-hang", text)
-                }
-            }
-            if let disks = payload.diskWriteExceptionDiagnostics {
-                for disk in disks {
-                    let text = String(data: disk.jsonRepresentation(), encoding: .utf8) ?? disk.description
-                    writeCrash("metrickit-disk", text)
-                }
-            }
+            let kind = !(payload.crashDiagnostics ?? []).isEmpty ? "metrickit-confirmed-crash"
+                : (!(payload.hangDiagnostics ?? []).isEmpty ? "metrickit-hang" : "metrickit-resource-diagnostic")
+            record(kind, data: payload.jsonRepresentation())
         }
     }
 }

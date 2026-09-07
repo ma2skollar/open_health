@@ -19,7 +19,7 @@ enum SleepStaging {
 
     // Returns date-key → stage codes, plus a non-nil `error` only for genuine failures
     // (bundled model missing). An empty map with `error == nil` just means no sleep data.
-    static func run(nights: [NightRow], events: [EventStore.Ev], clock: EventStore.RingClock,
+    static func run(nights: [NightRow], events: EventStore.Events, clock: EventStore.RingClock,
                     progress: @escaping @Sendable (String) -> Void = { _ in }) -> (staged: [String: [Int]], error: String?) {
         guard let modelPath = Bundle.main.path(forResource: "sleepnet_moonstone_1_2_0", ofType: "ptl")
         else { return ([:], "sleep model file missing from the app bundle") }
@@ -32,7 +32,7 @@ enum SleepStaging {
         // night the user is looking at stages first.
         let beds = nights.compactMap { night -> (start: Int64, end: Int64, cu: Int64)? in
             guard let start = night.start_ds, let end = night.end_ds else { return nil }
-            let captured = events.first { event in
+            let captured = events.restricted("tag=118").first { event in
                 event.tag == 0x76
                     && (event.json["bedtime_start_ds"] as? NSNumber)?.int64Value == start
             }?.cu
@@ -60,30 +60,29 @@ enum SleepStaging {
         // key by the exact bedtime start_ds (matches the summary's night.start_ds)
         // so two sleeps on one calendar day stay distinct.
         var result: [String: [Int]] = [:]
-        var dirty: [(key: String, inputs: NightInputs, fp: String)] = []
         var currentKeys = Set<String>()
-        for bed in beds {
+        var recomputed = 0
+        for (index, bed) in beds.enumerated() {
+            guard !AnalysisRun.cancelled, events.error == nil else { return ([:], "analysis interrupted") }
             guard let inputs = nightInputs(start: bed.start, end: bed.end, cu: bed.cu,
                                            events: events, clock: clock) else { continue }
-            let key = String(bed.start)
-            let fp = fingerprint(inputs)
+            guard events.error == nil else { return ([:], "event read failed") }
+            let key = String(bed.start), fp = fingerprint(inputs)
             currentKeys.insert(key)
             if let entry = cache[key], entry.fp == fp {
                 if !entry.stages.isEmpty { result[key] = entry.stages }
             } else {
-                dirty.append((key, inputs, fp))
+                progress("staging sleep · night \(index + 1)/\(beds.count)")
+                guard !AnalysisRun.cancelled else { return ([:], "analysis paused") }
+                guard let stages = stageNight(inputs, modelPath: modelPath) else { return (result, "sleep inference failed") }
+                result[key] = stages
+                cache[key] = StagedNightEntry(fp: fp, stages: stages)
+                ModelCacheStore.save(ModelCacheStore.stagingFile, globalKey: globalKey, entries: cache)
+                recomputed += 1
             }
         }
-        dlog("models", "staging: \(dirty.count)/\(currentKeys.count) nights to recompute")
-        for (index, night) in dirty.enumerated() {
-            progress("staging sleep · night \(index + 1)/\(dirty.count)")
-            // Empty stages are cached too: a night the model can't stage shouldn't
-            // be retried on every reload until its inputs change.
-            let stages = stageNight(night.inputs, modelPath: modelPath) ?? []
-            if !stages.isEmpty { result[night.key] = stages }
-            cache[night.key] = StagedNightEntry(fp: night.fp, stages: stages)
-            ModelCacheStore.save(ModelCacheStore.stagingFile, globalKey: globalKey, entries: cache)
-        }
+        guard events.error == nil, !AnalysisRun.cancelled else { return ([:], "analysis interrupted") }
+        dlog("models", "sleep recomputed=\(recomputed) total=\(currentKeys.count)")
         let pruned = cache.filter { currentKeys.contains($0.key) }
         if pruned.count != cache.count {
             ModelCacheStore.save(ModelCacheStore.stagingFile, globalKey: globalKey, entries: pruned)
@@ -93,7 +92,7 @@ enum SleepStaging {
 
     /// Gather one night's raw model inputs; nil when there's no usable beat data.
     static func nightInputs(start startDs: Int64, end endDs: Int64, cu bedCu: Int64,
-                            events: [EventStore.Ev], clock: EventStore.RingClock) -> NightInputs? {
+                            events: EventStore.Events, clock: EventStore.RingClock) -> NightInputs? {
         // ms(ds) → absolute epoch ms, epoch-aware (ds resets on ring reboot; see EventStore)
         func ms(_ ds: Int64, _ cu: Int64) -> Int64 {
             Int64(clock.unixSeconds(ds, capturedUnix: cu) * 1000)
@@ -101,7 +100,7 @@ enum SleepStaging {
         let lo = startDs - 6000, hi = endDs + 6000
         var beats: [(Int64, Float, Float, Float)] = []
         var acm: [(Int64, Float)] = [], temp: [(Int64, Float)] = []
-        for e in events where e.ds >= lo && e.ds <= hi {
+        for e in events.restricted("ring_timestamp BETWEEN \(lo) AND \(hi) AND tag IN (96,128,71,70)") {
             switch e.tag {
             case 0x60, 0x80:
                 guard let ibi = e.json["ibi_ms"] as? [NSNumber] else { continue }
@@ -140,7 +139,7 @@ enum SleepStaging {
                               &acmTs, &acmVal, Int32(inputs.acm.count),
                               &tempTs, &tempVal, Int32(inputs.temp.count),
                               inputs.startMs, inputs.endMs, &out, 8192)
-        guard n > 0 else { return nil }
+        guard n >= 0 else { return nil }
         return out.prefix(Int(n)).map(Int.init)
     }
 }

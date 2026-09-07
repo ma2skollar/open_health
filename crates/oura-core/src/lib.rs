@@ -55,7 +55,7 @@ pub fn quick_summary_json(db_path: String) -> String {
 }
 
 fn quick_summary(db_path: &str) -> Result<serde_json::Value, String> {
-    let store = oura_store::storage::Store::open(db_path).map_err(|e| e.to_string())?;
+    let store = oura_store::storage::Store::open_read_only(db_path).map_err(|e| e.to_string())?;
     let serials = store.device_serials().map_err(|e| e.to_string())?;
     let primary = serials.first().cloned().unwrap_or_default();
 
@@ -103,7 +103,7 @@ use std::sync::{Arc, Mutex};
 use oura_link::transport::Transport;
 use oura_link::OuraClient;
 use oura_store::storage::Store;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 /// Swift implements this to send one request frame over CoreBluetooth. Fire-and-
 /// forget: the ring's responses come back asynchronously via `push_frame`.
@@ -133,12 +133,50 @@ pub struct SyncReport {
 pub enum SyncError {
     #[error("{0}")]
     Failed(String),
+    #[error("storage operation {operation}: {message} (sqlite={code}, extended={extended_code}, checkpoint={checkpoint})")]
+    Storage {
+        operation: String,
+        code: i32,
+        extended_code: i32,
+        message: String,
+        retryable: bool,
+        checkpoint: u32,
+    },
+    #[error("sync interrupted: {reason}")]
+    Interrupted { reason: String },
+}
+
+fn storage_failure(operation: &str, error: oura_store::error::Error, checkpoint: u32) -> SyncError {
+    let (code, extended_code) = match &error {
+        oura_store::error::Error::Sqlite {
+            code,
+            extended_code,
+            ..
+        } => (*code, *extended_code),
+        _ => (0, 0),
+    };
+    SyncError::Storage {
+        operation: operation.into(),
+        code,
+        extended_code,
+        message: error.to_string(),
+        retryable: code == 5 || code == 6,
+        checkpoint,
+    }
+}
+
+#[uniffi::export]
+pub fn database_integrity(db_path: String) -> Result<String, SyncError> {
+    Store::open_read_only(db_path)
+        .and_then(|s| s.integrity_check())
+        .map_err(|e| storage_failure("quick_check", e, 0))
 }
 
 /// A live sync session bound to a connected ring: Swift creates it with a writer,
 /// feeds inbound BLE frames via `push_frame`, then awaits `sync`.
 #[derive(uniffi::Object)]
 pub struct RingSession {
+    stop: watch::Sender<Option<String>>,
     tx: broadcast::Sender<Vec<u8>>,
     writer: Arc<dyn BleWriter>,
 }
@@ -169,43 +207,49 @@ async fn drain_into_store(
     serial: &str,
     store: &Mutex<Store>,
     inserted: &AtomicU32,
-    db_err: &Mutex<Option<String>>,
+    db_err: &Mutex<Option<SyncError>>,
     progress: &dyn SyncProgressListener,
-) -> Result<oura_link::client::SyncOutcome, String> {
+) -> Result<oura_link::client::SyncOutcome, SyncError> {
+    let batch = Mutex::new(Vec::new());
+    let checkpoint = AtomicU32::new(cursor);
     let outcome = client
         .drain_events(
             cursor,
             |ev| {
-                if db_err.lock().unwrap().is_some() {
-                    return false;
-                }
-                match store.lock().unwrap().insert_event(serial, ev) {
-                    Ok(true) => {
-                        inserted.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Ok(false) => {}
-                    Err(e) => *db_err.lock().unwrap() = Some(e.to_string()),
-                }
-                db_err.lock().unwrap().is_none()
+                batch.lock().unwrap().push(ev.clone());
+                true
             },
             |p| {
-                progress.on_progress("sync".into(), p.bytes_left as u64, p.events_synced);
-                if db_err.lock().unwrap().is_some() {
-                    return false;
+                let mut events = batch.lock().unwrap();
+                match store
+                    .lock()
+                    .unwrap()
+                    .commit_batch(serial, &events, p.next_cursor)
+                {
+                    Ok(count) => {
+                        inserted.fetch_add(count, Ordering::Relaxed);
+                        checkpoint.store(p.next_cursor, Ordering::Relaxed);
+                        events.clear();
+                        progress.on_progress("sync".into(), p.bytes_left as u64, p.events_synced);
+                        true
+                    }
+                    Err(error) => {
+                        *db_err.lock().unwrap() = Some(storage_failure(
+                            "commit_batch",
+                            error,
+                            checkpoint.load(Ordering::Relaxed),
+                        ));
+                        false
+                    }
                 }
-                if let Err(e) = store.lock().unwrap().set_cursor(serial, p.next_cursor) {
-                    *db_err.lock().unwrap() = Some(e.to_string());
-                }
-                db_err.lock().unwrap().is_none()
             },
         )
-        .await
-        .map_err(|e| e.to_string())?;
-
-    if let Some(msg) = db_err.lock().unwrap().clone() {
-        return Err(msg);
+        .await;
+    // A callback failure is a protocol wrapper; the database cause takes precedence.
+    if let Some(error) = db_err.lock().unwrap().take() {
+        return Err(error);
     }
-    Ok(outcome)
+    outcome.map_err(|e| SyncError::Failed(e.to_string()))
 }
 
 /// An empty incremental fetch is normally legitimate. Verify it cheaply by asking
@@ -240,10 +284,17 @@ impl RingSession {
     #[uniffi::constructor]
     pub fn new(writer: Box<dyn BleWriter>) -> Arc<Self> {
         let (tx, _) = broadcast::channel(8192);
+        let (stop, _) = watch::channel(None);
         Arc::new(Self {
+            stop,
             tx,
             writer: Arc::from(writer),
         })
+    }
+
+    /// Interrupts even an idle Rust receive; a finished Swift AsyncStream cannot do this.
+    pub fn cancel(&self, reason: String) {
+        self.stop.send_replace(Some(reason));
     }
 
     /// Swift pushes each inbound BLE notification frame here.
@@ -258,6 +309,26 @@ impl RingSession {
     /// The drain checkpoints its cursor after every batch, so a failed call can be
     /// retried (reconnect + call again) and resumes where it left off.
     pub async fn sync(
+        &self,
+        db_path: String,
+        key_hex: String,
+        progress: Box<dyn SyncProgressListener>,
+    ) -> Result<SyncReport, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.sync_inner(db_path, key_hex, progress) => result,
+        }
+    }
+}
+
+impl RingSession {
+    async fn sync_inner(
         &self,
         db_path: String,
         key_hex: String,
@@ -287,20 +358,20 @@ impl RingSession {
 
         // Mutex<Store> keeps the future Send across the drain's awaits (rusqlite's
         // Connection is !Sync), while still writing incrementally (no buffering).
-        let store = Mutex::new(Store::open(&db_path).map_err(|e| fail(e.to_string()))?);
+        let store = Mutex::new(Store::open(&db_path).map_err(|e| storage_failure("open", e, 0))?);
         store
             .lock()
             .unwrap()
             .upsert_device(&serial, None, info.as_ref())
-            .map_err(|e| fail(e.to_string()))?;
+            .map_err(|e| storage_failure("upsert_device", e, 0))?;
         let cursor = store
             .lock()
             .unwrap()
             .cursor(&serial)
-            .map_err(|e| fail(e.to_string()))?;
+            .map_err(|e| storage_failure("read_cursor", e, 0))?;
 
         let inserted = AtomicU32::new(0);
-        let db_err: Mutex<Option<String>> = Mutex::new(None);
+        let db_err: Mutex<Option<SyncError>> = Mutex::new(None);
         progress.on_progress("sync".into(), 0, 0);
         let first_drain = drain_into_store(
             &client,
@@ -315,7 +386,7 @@ impl RingSession {
         let mut rejected_cursor_rebased = false;
         let mut outcome = match first_drain {
             Ok(outcome) => outcome,
-            Err(error) if cursor > 0 && is_rejected_history_cursor(&error) => {
+            Err(error) if cursor > 0 && is_rejected_history_cursor(&error.to_string()) => {
                 // Ring 5 rejects a stale/end cursor with ExtGetEvent result 0xff. Older
                 // builds incorrectly treated that as a successful empty terminal batch,
                 // leaving retained history unseen. Rebase transactionally; inserts are
@@ -324,7 +395,7 @@ impl RingSession {
                     .lock()
                     .unwrap()
                     .set_cursor(&serial, 0)
-                    .map_err(|e| fail(e.to_string()))?;
+                    .map_err(|e| storage_failure("rebase_cursor", e, cursor))?;
                 progress.on_progress("rebase".into(), 0, 0);
                 rejected_cursor_rebased = true;
                 drain_into_store(
@@ -336,10 +407,9 @@ impl RingSession {
                     &db_err,
                     progress.as_ref(),
                 )
-                .await
-                .map_err(&fail)?
+                .await?
             }
-            Err(error) => return Err(fail(error)),
+            Err(error) => return Err(error),
         };
 
         if outcome.events_synced == 0 && cursor > 0 && !rejected_cursor_rebased {
@@ -354,7 +424,7 @@ impl RingSession {
                     .lock()
                     .unwrap()
                     .set_cursor(&serial, 0)
-                    .map_err(|e| fail(e.to_string()))?;
+                    .map_err(|e| storage_failure("rebase_cursor", e, cursor))?;
                 progress.on_progress("rebase".into(), 0, 0);
                 outcome = drain_into_store(
                     &client,
@@ -365,8 +435,7 @@ impl RingSession {
                     &db_err,
                     progress.as_ref(),
                 )
-                .await
-                .map_err(&fail)?;
+                .await?;
             }
         }
         Ok(SyncReport {
@@ -393,6 +462,60 @@ fn parse_key(hex: &str) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SilentWriter;
+    impl BleWriter for SilentWriter {
+        fn write(&self, _: Vec<u8>) {}
+    }
+    struct IgnoreProgress;
+    impl SyncProgressListener for IgnoreProgress {
+        fn on_progress(&self, _: String, _: u64, _: u32) {}
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_rust_waiting_for_auth_reply() {
+        let session = RingSession::new(Box::new(SilentWriter));
+        let running = session.clone();
+        let task = tokio::spawn(async move {
+            running
+                .sync(
+                    "unused.db".into(),
+                    "0123456789abcdef0123456789abcdef".into(),
+                    Box::new(IgnoreProgress),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        session.cancel("background".into());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(result, Err(SyncError::Interrupted { reason }) if reason == "background"));
+    }
+
+    #[test]
+    fn sqlite_details_survive_ffi_classification() {
+        let error = storage_failure(
+            "commit_batch",
+            oura_store::error::Error::Sqlite {
+                code: 10,
+                extended_code: 778,
+                message: "disk I/O".into(),
+            },
+            42,
+        );
+        assert!(matches!(
+            error,
+            SyncError::Storage {
+                code: 10,
+                extended_code: 778,
+                checkpoint: 42,
+                retryable: false,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn rebases_empty_sync_when_saved_cursor_marker_is_missing() {

@@ -21,6 +21,8 @@ schemes:
     build:
       targets:
         OuraApp: all
+    test:
+      targets: [OuraAppTests]
     run:
       config: Debug
     archive:
@@ -29,7 +31,7 @@ schemes:
 settings:
   base:
     MARKETING_VERSION: "0.1.1"
-    CURRENT_PROJECT_VERSION: "22"
+    CURRENT_PROJECT_VERSION: "26"
     PRODUCT_BUNDLE_IDENTIFIER: md.thomas.openoura
     TARGETED_DEVICE_FAMILY: "1"   # iPhone only (no iPad multitasking orientation reqs)
     CODE_SIGN_STYLE: Automatic
@@ -72,6 +74,7 @@ targets:
       - path: OuraApp.swift
       - path: Models.swift
       - path: Core.swift
+      - path: WorkCoordinator.swift
       - path: Components.swift
       - path: Reports.swift
       - path: Theme.swift
@@ -127,3 +130,15 @@ targets:
       - framework: ../libtorch-xcframeworks/libtorch_global_deps.xcframework
         embed: true
         codeSign: true
+
+  OuraAppTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests
+    dependencies:
+      - target: OuraApp
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: TORCH

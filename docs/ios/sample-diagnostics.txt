@@ -1,0 +1,15 @@
+Illustrative storage-failure summary (synthetic fixture)
+
+Open Oura diagnostics · session=<session UUID>
+2026-09-07T09:00:00.000Z +0.000s info [sync] start run=<run UUID> source=automatic
+2026-09-07T09:00:00.001Z +0.001s info [sync] attempt=1 id=<attempt UUID> run=<run UUID>
+2026-09-07T09:00:02.500Z +2.500s info [progress] run=<run UUID> stage=setup bytesLeft=0 committedEvents=0
+2026-09-07T09:00:02.520Z +2.520s error [sync] attempt 1 FAILED: storage operation commit_batch: disk I/O (sqlite=10, extended=778, checkpoint=42)
+2026-09-07T09:00:02.521Z +2.521s info [mem] storage failure footprint=160MB avail=1800MB diskFree=12000MB thermal=0
+
+Retained incidents: 3; included: 3
+storage sqlite=10: 3
+
+The detailed export includes all retained session segments and original MetricKit
+payloads, with explicit inclusion counts. A leftover session without a signal or
+Apple crash diagnostic is labelled as interrupted with cause unknown.
