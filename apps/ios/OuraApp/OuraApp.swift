@@ -119,153 +119,322 @@ struct SyncView: View {
     let onSynced: (SyncReport) -> Void
     let onReset: () -> Void
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.scenePhase) private var scenePhase
     @State private var key = Keychain.loadKey() ?? ""
     @ObservedObject private var diag = RingDiag.shared
     @ObservedObject private var store = DiagStore.shared
     @State private var copied = false
     @State private var diagnosticFile: URL?
+    @State private var showKey = false
+    @State private var showDiagnostics = false
+    @State private var confirmReset = false
+    @FocusState private var keyFocused: Bool
+
+    private var validKey: Bool {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.utf8.count == 32 && trimmed.utf8.allSatisfy {
+            (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0)
+        }
+    }
+
     var body: some View {
         NavigationStack {
-            ZStack {
-                Obs.canvas.ignoresSafeArea()
-                ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    Text("Pair your ring").font(Obs.serif(24)).foregroundStyle(Obs.ink)
-                    // the ring advertises reliably only ON its charger, and its single
-                    // BLE link is usually held by any phone running the official app.
-                    Text("Put the ring on its charger next to this iPhone, turn off Bluetooth on any phone with the official Oura app, then paste the auth key you exported on your computer. The first sync pulls the ring's full history and can take a while — keep the app open; if the connection drops it reconnects and resumes automatically.")
-                        .font(Obs.mono(12)).foregroundStyle(Obs.ink2).fixedSize(horizontal: false, vertical: true)
-                    TextField("32-hex auth key", text: $key)
-                        .font(Obs.mono(13)).foregroundStyle(Obs.ink)
-                        .textInputAutocapitalization(.never).autocorrectionDisabled()
-                        .padding(12)
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Obs.trace, lineWidth: 0.8))
-                    Button {
-                        Task {
-                            if let report = await ring.run(keyHex: key) { onSynced(report) }
-                        }
-                    } label: {
-                        HStack(spacing: 8) {
-                            if ring.busy { ProgressView().tint(Obs.paper) }
-                            Text(ring.busy ? "syncing…" : "Connect & Sync").font(Obs.mono(13, .medium))
-                        }
-                        .frame(maxWidth: .infinity).padding(.vertical, 12)
-                        .background(Obs.ink).foregroundStyle(Obs.paper)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                    }
-                    .disabled(ring.busy)
-                    Button(role: .destructive) {
-                        Task { if await ring.resetLocalDatabase() { onReset() } }
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "trash")
-                            Text("Reset local sync data").font(Obs.mono(12, .medium))
-                        }
-                        .frame(maxWidth: .infinity).padding(.vertical, 10)
-                        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Obs.trace, lineWidth: 0.8))
-                    }
-                    .disabled(ring.busy)
-                    if !ring.status.isEmpty {
-                        Text(ring.status).font(Obs.mono(12))
-                            .foregroundStyle(ring.lastReport != nil ? Obs.good : Obs.ink2)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    if ring.busy { Button("Pause sync") { ring.pause() } }
-                    Button("Check database") { Task { await ring.checkDatabase() } }.disabled(ring.busy)
-                    Button("Share detailed diagnostics") {
-                        Task {
-                            let url = await Task.detached { DiagStore.shared.exportFile() }.value
-                            if let url { diagnosticFile = url }
-                        }
-                    }
-                    // live transcript + leftover logs from previous crashes / kills.
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Text("diagnostics")
-                                .font(Obs.mono(11)).foregroundStyle(Obs.ink2)
-                            Spacer()
-                            Button(copied ? "copied ✓" : "Copy summary") {
-                                Task {
-                                    let text = await Task.detached { DiagStore.shared.exportSummary() }.value
-                                    UIPasteboard.general.string = text
-                                    copied = true
-                                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
-                                }
-                            }
-                            .font(Obs.mono(11, .medium)).foregroundStyle(Obs.ink)
-                        }
-                        if !store.incidents.isEmpty {
-                            Text("diagnostic reports · \(store.incidents.count)")
-                                .font(Obs.mono(10, .medium)).foregroundStyle(Obs.bad)
-                            ForEach(store.incidents.prefix(8)) { item in
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text(item.title).font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink)
-                                    Text(item.preview).font(Obs.mono(9)).foregroundStyle(Obs.ink2)
-                                        .lineLimit(5)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                    Button("copy this") {
-                                        UIPasteboard.general.string = item.body
-                                    }
-                                    .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink)
-                                }
-                                .padding(8)
-                                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Obs.trace, lineWidth: 0.8))
-                            }
-                        } else {
-                            Text("No recorded incidents. Interrupted sessions are retained without assuming a crash.")
-                                .font(Obs.mono(10)).foregroundStyle(Obs.muted)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
-                        if !store.sessions.isEmpty {
-                            Text("older sessions · \(store.sessions.count)")
-                                .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink2)
-                            ForEach(store.sessions.prefix(4)) { item in
-                                HStack {
-                                    Text(item.title).font(Obs.mono(10)).foregroundStyle(Obs.ink2)
-                                    Spacer()
-                                    Button("copy") { UIPasteboard.general.string = item.body }
-                                        .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink)
-                                }
-                            }
-                        }
-                        if diag.totalLines > 0 {
-                            Text("this launch · \(diag.totalLines) lines")
-                                .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink2)
-                            ScrollView {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    ForEach(Array(diag.tail.enumerated()), id: \.offset) { _, line in
-                                        Text(line).font(Obs.mono(9)).foregroundStyle(Obs.ink2)
-                                            .lineLimit(3)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                    }
-                                }
-                                .padding(8)
-                            }
-                            .defaultScrollAnchor(.bottom)
-                            .frame(maxHeight: 220)
-                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(Obs.trace, lineWidth: 0.8))
-                        }
-                    }
-                    Spacer()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 28) {
+                    header
+                    if ring.connectionIssue != nil { syncStatus }
+                    else { preparation }
+                    if !ring.busy { pairingKey }
+                    connection
+                    support
                 }
-                .padding(24)
-                }
+                .frame(maxWidth: 520)
+                .padding(.horizontal, 24)
+                .padding(.top, 20)
+                .padding(.bottom, 32)
+                .frame(maxWidth: .infinity)
             }
-            .navigationTitle("sync").navigationBarTitleDisplayMode(.inline)
+            .scrollDismissesKeyboard(.interactively)
+            .background(Obs.paper)
+            .navigationTitle("Your ring")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
+                        .foregroundStyle(Obs.ink)
+                }
+                ToolbarItemGroup(placement: .keyboard) {
+                    Spacer()
+                    Button("Done") { keyFocused = false }
                 }
             }
+            .alert("Reset local sync data?", isPresented: $confirmReset) {
+                Button("Cancel", role: .cancel) {}
+                Button("Reset local data", role: .destructive) {
+                    Task { if await ring.resetLocalDatabase() { onReset() } }
+                }
+            } message: {
+                Text("This removes the synced data on this iPhone. Your next sync will download the history still available on your ring.")
+            }
         }
-        // The sync belongs to RingSync, not to this presentation. Let the panel be
-        // tucked away while BLE keeps running; the top-bar indicator remains live
-        // and can reopen these diagnostics at any time.
+        .tint(Obs.ink)
+        // Sync belongs to RingSync and continues when this panel is dismissed.
         .sheet(isPresented: Binding(get: { diagnosticFile != nil }, set: { if !$0 { diagnosticFile = nil } })) {
             if let diagnosticFile { DiagnosticsShare(url: diagnosticFile) }
         }
         .presentationDragIndicator(.visible)
+    }
+
+    private var header: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Image(systemName: "circle.circle")
+                .font(.system(size: 30, weight: .ultraLight))
+                .foregroundStyle(Obs.ink2)
+                .frame(width: 56, height: 56)
+                .background(Obs.rule.opacity(0.45), in: Circle())
+                .accessibilityHidden(true)
+                .padding(.bottom, 6)
+            Text("Pair your ring")
+                .font(.system(.largeTitle, design: .serif))
+                .foregroundStyle(Obs.ink)
+            Text("Bring your health history to this iPhone.")
+                .font(.subheadline)
+                .foregroundStyle(Obs.ink2)
+        }
+    }
+
+    private var preparation: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            setupRow(icon: "bolt", title: "Place your ring on its charger",
+                     detail: "Keep it close to this iPhone.")
+            setupRow(icon: "antenna.radiowaves.left.and.right", title: "Free up the Bluetooth connection",
+                     detail: "Turn off Bluetooth on other phones using the Oura app. Keep it on here.")
+        }
+    }
+
+    private func setupRow(icon: String, title: String, detail: String) -> some View {
+        HStack(alignment: .top, spacing: 14) {
+            Image(systemName: icon)
+                .font(.system(size: 18, weight: .regular))
+                .foregroundStyle(Obs.muted)
+                .frame(width: 24, height: 24)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title).font(.subheadline.weight(.medium)).foregroundStyle(Obs.ink)
+                Text(detail).font(.subheadline).foregroundStyle(Obs.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var pairingKey: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Pairing key").font(.subheadline.weight(.semibold)).foregroundStyle(Obs.ink)
+            HStack(spacing: 8) {
+                Group {
+                    if showKey { TextField("Paste your pairing key", text: $key) }
+                    else { SecureField("Paste your pairing key", text: $key) }
+                }
+                .font(.system(.subheadline, design: .monospaced))
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .focused($keyFocused)
+                .accessibilityLabel("Pairing key")
+                .disabled(ring.busy)
+                Button { showKey.toggle() } label: {
+                    Image(systemName: showKey ? "eye.slash" : "eye")
+                        .frame(width: 44, height: 44)
+                }
+                .accessibilityLabel(showKey ? "Hide pairing key" : "Show pairing key")
+            }
+            .foregroundStyle(Obs.ink)
+            .padding(.leading, 14)
+            .padding(.trailing, 4)
+            .padding(.vertical, 4)
+            .background(Obs.rule.opacity(0.25), in: RoundedRectangle(cornerRadius: 14))
+            .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(keyFocused ? Obs.muted : Obs.rule))
+            Text(!key.isEmpty && !validKey
+                 ? "Use all 32 characters: numbers 0–9 and letters A–F."
+                 : "Paste the 32-character key exported on your computer.")
+                .font(.footnote)
+                .foregroundStyle(Obs.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    @ViewBuilder
+    private var syncStatus: some View {
+        if ring.busy || !ring.status.isEmpty {
+            HStack(alignment: .top, spacing: 12) {
+                if ring.busy {
+                    ProgressView().tint(Obs.ink).frame(width: 24, height: 24)
+                } else {
+                    Image(systemName: ring.lastReport != nil ? "checkmark.circle" : "info.circle")
+                        .font(.title3)
+                        .foregroundStyle(ring.lastReport != nil ? Obs.good : Obs.ink2)
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(ring.busy ? "Sync in progress" : (ring.connectionIssue ?? (ring.lastReport != nil ? "Your ring is up to date" : "Sync status")))
+                        .font(.subheadline.weight(.semibold)).foregroundStyle(Obs.ink)
+                    Text(ring.status)
+                        .font(.subheadline).foregroundStyle(Obs.ink2)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if ring.busy {
+                        Text("Keep the app open. If the connection drops, sync resumes automatically.")
+                            .font(.footnote).foregroundStyle(Obs.ink2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(16)
+            .background(Obs.rule.opacity(0.3), in: RoundedRectangle(cornerRadius: 16))
+        }
+    }
+
+    private var connection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            if ring.connectionIssue == nil { syncStatus }
+            if ring.busy {
+                Button { ring.pause() } label: {
+                    Label("Pause sync", systemImage: "pause")
+                        .font(.body.weight(.medium))
+                        .frame(maxWidth: .infinity, minHeight: 52)
+                        .foregroundStyle(Obs.ink)
+                        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Obs.rule))
+                }
+                .buttonStyle(.plain)
+            } else {
+                Button {
+                    keyFocused = false
+                    Task {
+                        if let report = await ring.run(keyHex: key) { onSynced(report) }
+                    }
+                } label: {
+                    HStack(spacing: 10) {
+                        Text("Connect & sync")
+                        Image(systemName: "arrow.right")
+                    }
+                    .font(.body.weight(.semibold))
+                    .frame(maxWidth: .infinity, minHeight: 54)
+                    .foregroundStyle(validKey ? Obs.paper : Obs.muted)
+                    .background(validKey ? Obs.ink : Obs.rule, in: RoundedRectangle(cornerRadius: 14))
+                }
+                .buttonStyle(.plain)
+                .disabled(!validKey)
+                Text("The first sync downloads your ring’s available history and may take a few minutes.")
+                    .font(.footnote).foregroundStyle(Obs.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private var support: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Rectangle().fill(Obs.rule).frame(height: 1)
+            DisclosureGroup(isExpanded: $showDiagnostics) {
+                VStack(alignment: .leading, spacing: 18) {
+                    Button { Task { await ring.checkDatabase() } } label: {
+                        Label("Check database", systemImage: "externaldrive")
+                            .frame(minHeight: 44)
+                    }
+                    .disabled(ring.busy)
+                    Button {
+                        Task {
+                            let url = await Task.detached { DiagStore.shared.exportFile() }.value
+                            if let url { diagnosticFile = url }
+                        }
+                    } label: {
+                        Label("Share detailed diagnostics", systemImage: "square.and.arrow.up")
+                            .frame(minHeight: 44)
+                    }
+                    diagnosticHistory
+                    Button(role: .destructive) { confirmReset = true } label: {
+                        Label("Reset local sync data", systemImage: "trash")
+                            .foregroundStyle(Obs.alert)
+                            .frame(minHeight: 44)
+                    }
+                    .disabled(ring.busy)
+                }
+                .font(.subheadline)
+                .padding(.top, 16)
+            } label: {
+                Label("Troubleshooting & diagnostics", systemImage: "wrench.and.screwdriver")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(Obs.ink2)
+                    .frame(minHeight: 44)
+            }
+        }
+    }
+
+    private var diagnosticHistory: some View {
+        // live transcript + leftover logs from previous crashes / kills.
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("diagnostics")
+                    .font(Obs.mono(11)).foregroundStyle(Obs.ink2)
+                Spacer()
+                Button(copied ? "copied ✓" : "Copy summary") {
+                    Task {
+                        let text = await Task.detached { DiagStore.shared.exportSummary() }.value
+                        UIPasteboard.general.string = text
+                        copied = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
+                    }
+                }
+                .font(Obs.mono(11, .medium)).foregroundStyle(Obs.ink)
+            }
+            if !store.incidents.isEmpty {
+                Text("diagnostic reports · \(store.incidents.count)")
+                    .font(Obs.mono(10, .medium)).foregroundStyle(Obs.bad)
+                ForEach(store.incidents.prefix(8)) { item in
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(item.title).font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink)
+                        Text(item.preview).font(Obs.mono(9)).foregroundStyle(Obs.ink2)
+                            .lineLimit(5)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Button("copy this") {
+                            UIPasteboard.general.string = item.body
+                        }
+                        .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink)
+                    }
+                    .padding(8)
+                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Obs.trace, lineWidth: 0.8))
+                }
+            } else {
+                Text("No recorded incidents. Interrupted sessions are retained without assuming a crash.")
+                    .font(Obs.mono(10)).foregroundStyle(Obs.muted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !store.sessions.isEmpty {
+                Text("older sessions · \(store.sessions.count)")
+                    .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink2)
+                ForEach(store.sessions.prefix(4)) { item in
+                    HStack {
+                        Text(item.title).font(Obs.mono(10)).foregroundStyle(Obs.ink2)
+                        Spacer()
+                        Button("copy") { UIPasteboard.general.string = item.body }
+                            .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink)
+                    }
+                }
+            }
+            if diag.totalLines > 0 {
+                Text("this launch · \(diag.totalLines) lines")
+                    .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink2)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(Array(diag.tail.enumerated()), id: \.offset) { _, line in
+                            Text(line).font(Obs.mono(9)).foregroundStyle(Obs.ink2)
+                                .lineLimit(3)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(8)
+                }
+                .defaultScrollAnchor(.bottom)
+                .frame(maxHeight: 220)
+                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Obs.trace, lineWidth: 0.8))
+            }
+        }
 
     }
 }

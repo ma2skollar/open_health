@@ -117,12 +117,24 @@ static at::Tensor mat(const float *p, int rows, int cols) {
     return rows > 0 ? blobFloat2d(p, rows, cols) : at::empty({0, cols}, at::kFloat);
 }
 
+// Swift copies this immediately after a failed synchronous call. Thread-local
+// storage avoids another queued model run overwriting the diagnostic.
+static thread_local std::string activity_error;
+const char *oura_activity_last_error(void) { return activity_error.c_str(); }
+static int activityFailure(const std::string &message) {
+    activity_error = message;
+    NSLog(@"%s", message.c_str());
+    return -1;
+}
+
 int oura_activity(const char *model_path, const float *context, const float *user,
                   const float *met, int n_met, const float *step, int n_step,
                   const float *motion, int n_motion,
                   const float *temp, int n_temp, const float *hr, int n_hr,
                   float threshold, float min_duration, float *out_workouts, int max_rows) {
-    if (!model_path || !context || !user || !out_workouts || max_rows <= 0) return -1;
+    activity_error.clear();
+    if (!model_path || !context || !user || !out_workouts || max_rows <= 0)
+        return activityFailure("activity: invalid model inputs or output buffer");
     std::lock_guard<std::mutex> lock(g_torch);
     try {
         // ActivityModel calls once per retained local day. Loading the 15 MB module
@@ -148,8 +160,7 @@ int oura_activity(const char *model_path, const float *context, const float *use
         auto workouts = out->elements()[0].toTensor().to(at::kFloat).contiguous();
         if (!workouts.defined() || workouts.numel() == 0) return 0;
         if (workouts.dim() != 2 || workouts.size(1) != 9) {
-            NSLog(@"oura_activity: unexpected workouts shape dim=%d", (int)workouts.dim());
-            return -1;
+            return activityFailure("activity: expected a workouts tensor with 9 columns, got rank " + std::to_string(workouts.dim()));
         }
         int n = std::min<int>((int)workouts.size(0), max_rows);
         const float *wp = workouts.data_ptr<float>();
@@ -159,15 +170,16 @@ int oura_activity(const char *model_path, const float *context, const float *use
         }
         return n;
     } catch (const std::exception &e) {
-        NSLog(@"oura_activity: %s", e.what());
-        return -1;
+        return activityFailure(std::string("activity: ") + e.what());
     }
 }
 
 int oura_stepmotion(const char *model_path, const int64_t *timestamps_ms,
                     const float *raw, int n_raw, int64_t *out_timestamps_ms,
                     float *out_features, int max_rows) {
-    if (!model_path || !timestamps_ms || !raw || !out_timestamps_ms || !out_features) return -1;
+    activity_error.clear();
+    if (!model_path || !timestamps_ms || !raw || !out_timestamps_ms || !out_features)
+        return activityFailure("step decoder: invalid model inputs or output buffer");
     if (n_raw <= 0 || max_rows <= 0) return 0;
     std::lock_guard<std::mutex> lock(g_torch);
     try {
@@ -181,8 +193,7 @@ int oura_stepmotion(const char *model_path, const int64_t *timestamps_ms,
         auto out_data = result->elements()[1].toTensor().to(at::kFloat).contiguous();
         if (!out_data.defined() || out_data.numel() == 0) return 0;
         if (out_data.dim() != 2 || out_data.size(1) != 11) {
-            NSLog(@"oura_stepmotion: unexpected feature shape dim=%d", (int)out_data.dim());
-            return -1;
+            return activityFailure("step decoder: expected a feature tensor with 11 columns, got rank " + std::to_string(out_data.dim()));
         }
         int n = std::min<int>((int)out_data.size(0), max_rows);
         n = std::min<int>(n, (int)out_ts.numel());
@@ -195,8 +206,7 @@ int oura_stepmotion(const char *model_path, const int64_t *timestamps_ms,
         }
         return n;
     } catch (const std::exception &e) {
-        NSLog(@"oura_stepmotion: %s", e.what());
-        return -1;
+        return activityFailure(std::string("step decoder: ") + e.what());
     }
 }
 

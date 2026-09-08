@@ -59,6 +59,54 @@ final class StabilityTests: XCTestCase {
     }
 
     #if TORCH
+    func testActivitySparseDayReturnsNoWorkouts() throws {
+        let path = try XCTUnwrap(Bundle.main.path(forResource: "automatic_activity_detection_3_1_11", ofType: "ptl"))
+        let nan = Float.nan
+        var context: [Float] = [2026, 9, 8, 1]
+        var user: [Float] = [30, 1, 1.78, 75] + Array(repeating: nan, count: 10)
+        var step: [Float] = [0] + Array(repeating: nan, count: 11) + [719] + Array(repeating: nan, count: 11)
+        var motion: [Float] = [0] + Array(repeating: nan, count: 8)
+        var temp: [Float] = [0, nan]
+        var hr: [Float] = [0, nan]
+        for duplicate in [false, true] {
+            var met: [Float] = []
+            for minute in 0..<720 {
+                met += [Float(minute), 1.2]
+                if duplicate && minute < 60 { met += [Float(minute), 1.2] }
+            }
+            let rows = Int32(met.count / 2)
+            var output = [Float](repeating: 0, count: 512 * 9)
+            let result = oura_activity(path, &context, &user, &met, rows, &step, 2,
+                                       &motion, 1, &temp, 1, &hr, 1, 0.5, 10, &output, 512)
+            XCTAssertEqual(result, 0, "Sparse day should produce no workouts, not fail: \(String(cString: oura_activity_last_error()))")
+        }
+    }
+
+    func testActivityCompleteDayRunsInMobileRuntime() throws {
+        let path = try XCTUnwrap(Bundle.main.path(forResource: "automatic_activity_detection_3_1_11", ofType: "ptl"))
+        let nan = Float.nan
+        var context: [Float] = [2026, 9, 8, 1]
+        var user: [Float] = [30, 1, 1.78, 75] + Array(repeating: nan, count: 10)
+        var step: [Float] = [0] + Array(repeating: nan, count: 11) + [719] + Array(repeating: nan, count: 11)
+        var met: [Float] = [], motion: [Float] = [], temp: [Float] = [], hr: [Float] = []
+        for minute in 0..<720 {
+            let t = Float(minute)
+            met += [t, (300..<360).contains(minute) ? 5 : 1.2]
+            motion += [t, 0, 30, 0, 0, 0, nan, 10, 1]
+            temp += [t, 33]
+            hr += [t, 70]
+        }
+        var output = [Float](repeating: 0, count: 512 * 9)
+        let result = oura_activity(path, &context, &user, &met, 720, &step, 2,
+                                   &motion, 720, &temp, 720, &hr, 720, 0.5, 10, &output, 512)
+        // Golden result from the unmodified full TorchScript model on these inputs.
+        let expected: [Float] = [300, 360, 0.8837792, 14, 0.5082318, 6, 0.4652145, 21, 0.4478024]
+        XCTAssertEqual(result, 1, String(cString: oura_activity_last_error()))
+        for (actual, reference) in zip(output.prefix(9), expected) {
+            XCTAssertEqual(actual, reference, accuracy: 0.0001)
+        }
+    }
+
     private func fixture() throws -> URL {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".db")
         var db: OpaquePointer?

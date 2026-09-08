@@ -34,12 +34,14 @@ protocol RingTransport: AnyObject {
 
 enum BLEError: Error, CustomStringConvertible {
     case poweredOff, notFound, noWriteCharacteristic, disconnected, busy
+    case ringNotAdvertising(otherDevices: Int)
     /// carries the stage the attempt was in, so "timed out" says *what* never happened
     /// (no advertisement seen vs GATT connect stalled vs subscriptions pending).
     case timedOut(stage: String)
 
     var description: String {
         switch self {
+        case .ringNotAdvertising(let count): return "no ring advertisement found (\(count) other Bluetooth devices detected)"
         case .poweredOff: return "Bluetooth is off or not authorized"
         case .notFound: return "ring service/characteristics not found"
         case .noWriteCharacteristic: return "no write characteristic (98ED0002)"
@@ -128,7 +130,10 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
                     let work = DispatchWorkItem { [weak self] in
                         guard let self, self.connectCont != nil else { return }
                         dlog("ble", "timeout stage=\(self.stage) budget=\(timeout)s otherDevices=\(self.otherDevices.count)")
-                        self.finishConnect(.failure(BLEError.timedOut(stage: self.stage)))
+                        let error: BLEError = self.central.isScanning && self.peripheral == nil
+                            ? .ringNotAdvertising(otherDevices: self.otherDevices.count)
+                            : .timedOut(stage: self.stage)
+                        self.finishConnect(.failure(error))
                         self.closeOnQueue()
                     }
                     connectTimeout = work

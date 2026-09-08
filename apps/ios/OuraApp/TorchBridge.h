@@ -32,6 +32,9 @@ int oura_cva(const char *model_path, const float *ppg, int n_segs, const float *
 //   temp[n_temp×2], hr[n_hr×2], None, None, threshold, min_duration, 0.0). Writes
 // workouts row-major into out_workouts (max_rows × 9 =
 // [start_min, end_min, is_workout, id1,p1, id2,p2, id3,p3]); returns rows / -1.
+// Last activity/step-decoder error on this thread; copy before the next call.
+const char *oura_activity_last_error(void);
+
 int oura_activity(const char *model_path, const float *context, const float *user,
                   const float *met, int n_met, const float *step, int n_step,
                   const float *motion, int n_motion,

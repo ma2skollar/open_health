@@ -12,8 +12,10 @@ Outputs land in `notes/models/mobile/<name>.ptl` (gitignored, like the models).
 
 Usage:
     python tools/export_mobile.py            # export all
-    python tools/export_mobile.py --check    # also run a pt-vs-ptl parity check
+    python tools/export_mobile.py automatic_activity_detection_3_1_11
+    python -m unittest discover -s tools -p test_mobile_activity.py  # parity check
 """
+import argparse
 import sys
 import warnings
 from pathlib import Path
@@ -56,12 +58,48 @@ NEWEST = [
 ]
 
 
+def repair_activity_empty_peaks(model):
+    """Repair AAD 3.1.11's scripted find_peaks(<3 samples) empty-list type.
+
+    The source uses torch.tensor([], dtype=int64), serialized as List[Tensor].
+    Both full TorchScript and the lite runtime reject that list before applying
+    dtype. An empty List[int] produces the intended empty int64 tensor. Inline
+    helper calls so the repaired branch is part of the exported forward graph;
+    weights, thresholds, and nonempty peak detection remain unchanged.
+    """
+    torch._C._jit_pass_inline(model.forward.graph)
+    repaired = 0
+
+    def visit(block):
+        nonlocal repaired
+        for node in block.nodes():
+            for child in node.blocks():
+                visit(child)
+            if node.kind() != "aten::tensor":
+                continue
+            source = node.inputsAt(0).node()
+            if (source.kind() == "prim::ListConstruct"
+                    and not list(source.inputs())
+                    and str(source.output().type()) == "List[Tensor]"
+                    and node.inputsAt(1).toIValue() == 4):  # ScalarType::Long
+                source.output().setType(torch._C.ListType.ofInts())
+                repaired += 1
+
+    visit(model.forward.graph)
+    if repaired != 1:
+        raise RuntimeError(f"AAD empty-peak repair expected one branch, found {repaired}")
+    torch._C._jit_pass_lint(model.forward.graph)
+    return model
+
+
 def export_one(name):
     src = MODELS / f"{name}.pt"
     if not src.exists():
         return name, None, "file missing"
     try:
         m = torch.jit.load(str(src), map_location="cpu").eval()
+        if name == "automatic_activity_detection_3_1_11":
+            m = repair_activity_empty_peaks(m)
         dst = OUT / f"{name}.ptl"
         m._save_for_lite_interpreter(str(dst))
         return name, dst.stat().st_size, None
@@ -71,11 +109,18 @@ def export_one(name):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("models", nargs="*", metavar="MODEL", help="Model names; defaults to all newest versions")
+    args = parser.parse_args()
+    names = args.models or NEWEST
+    unknown = set(names) - set(NEWEST)
+    if unknown:
+        parser.error(f"unknown models: {', '.join(sorted(unknown))}")
     OUT.mkdir(parents=True, exist_ok=True)
     print(f"bytecode version: {torch._C._get_max_operator_version()} (torch {torch.__version__})")
     ok = fail = 0
     total = 0
-    for name in NEWEST:
+    for name in names:
         n, sz, err = export_one(name)
         if err or sz is None:
             print(f"  FAIL {n:42s}: {err or 'unknown'}")

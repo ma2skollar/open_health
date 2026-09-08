@@ -307,6 +307,7 @@ final class SyncProgressBridge: SyncProgressListener, @unchecked Sendable {
 final class RingSync: ObservableObject {
     @Published var status: String = ""
     @Published var busy = false
+    @Published var connectionIssue: String?
     @Published var lastReport: SyncReport?
     @Published private(set) var lastSuccessfulSyncAt: Date?
 
@@ -407,6 +408,7 @@ final class RingSync: ObservableObject {
             #if TORCH
             ModelCacheStore.clearAll()
             #endif
+            connectionIssue = nil
             status = "local sync data reset"
             dlog("db", status)
             return true
@@ -417,6 +419,7 @@ final class RingSync: ObservableObject {
         await WorkGate.shared.acquire()
         defer { Task { await WorkGate.shared.release() } }
         guard WorkCoordinator.shared.available else { return }
+        connectionIssue = nil
         let path = DB.readPath()
         status = await Task.detached {
             do { return "Database check: \(try databaseIntegrity(dbPath: path))" }
@@ -429,6 +432,7 @@ final class RingSync: ObservableObject {
     @discardableResult
     func run(keyHex: String, maxAttempts: Int = 6, source: String = "manual") async -> SyncReport? {
         guard !busy else { return nil }
+        connectionIssue = nil
         lastReport = nil   // clear any prior success so a failed retry isn't read as one
         lastProgressBytes = nil
         lastProgressAt = nil
@@ -468,6 +472,7 @@ final class RingSync: ObservableObject {
         // The drain checkpoints its cursor after every batch, so each retry RESUMES
         // where the link dropped rather than starting over — reconnect-and-retry is
         // safe and cheap. Retries cover both connect failures and mid-sync drops.
+        var connectedDuringRun = source == "resume"
         for attempt in 1...max(1, maxAttempts) {
             if paused || Task.isCancelled || !WorkCoordinator.shared.available { status = "paused — resumes on return"; return nil }
             attemptID = UUID().uuidString
@@ -479,7 +484,7 @@ final class RingSync: ObservableObject {
                 guard !paused, WorkCoordinator.shared.available else { return nil }
             }
 
-            status = attempt == 1 ? "connecting to ring…" : "reconnecting to ring…"
+            status = attempt == 1 ? "Looking for your ring nearby…" : "Looking for your ring again (attempt \(attempt)/\(maxAttempts))…"
             dlog("sync", "connecting — scanning for the Oura service (name filter 'Oura')…")
             // fresh transport + session per attempt: the previous link is dead and
             // BLETransport's notification stream is per-connection.
@@ -495,10 +500,20 @@ final class RingSync: ObservableObject {
                 // app holds it, leaving nothing to discover.
                 if case BLEError.poweredOff = error { status = "Bluetooth unavailable — check power and permission in Settings"; return nil }
                 t.disconnect()
+                if case BLEError.ringNotAdvertising(let count) = error, !connectedDuringRun {
+                    connectionIssue = "Your ring wasn’t found"
+                    status = count > 0
+                        ? "Bluetooth is detecting nearby devices, but your ring isn’t visible. Place it on its charger and disconnect it from other phones, then try again."
+                        : "Your ring isn’t visible yet. Keep it on its charger nearby and check Bluetooth in Settings, then try again."
+                    // An initial scan already waited 50 seconds. Repeating it six
+                    // times hides the setup problem; retain retries for actual drops.
+                    return nil
+                }
                 status = "couldn't connect (\(error)) — put the ring on its charger and " +
                     "turn off Bluetooth on the phone with the official Oura app"
                 continue
             }
+            connectedDuringRun = true
             dlog("sync", "BLE link ready — creating RingSession + inbound-frame pump")
 
             let s = RingSession(writer: RingWriter(t))

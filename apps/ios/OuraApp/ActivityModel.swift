@@ -18,6 +18,15 @@ enum ActivityModel {
         70937: "meditation", 71201: "eating", 71227: "relax", 71239: "transport",
     ]
 
+    private struct InferenceFailure: Error, CustomStringConvertible {
+        let description: String
+        init(_ message: String) { description = message }
+        static func bridge() -> Self {
+            let detail = oura_activity_last_error().map { String(cString: $0) } ?? ""
+            return Self(detail.isEmpty ? "model returned an error without details" : detail)
+        }
+    }
+
     private struct TimedRow {
         let unixMinute: Double
         let values: [Float]
@@ -155,7 +164,13 @@ enum ActivityModel {
             if let entry = cache[key], entry.fp == fp { sessions.append(contentsOf: entry.sessions) }
             else {
                 progress("detecting activity · day \(index + 1)/\(dayStarts.count)")
-                guard let daySessions = runDay(inputs, user: user, aadPath: aadPath, nan: nan) else { return (sessions, "activity inference failed") }
+                let daySessions: [WorkoutSession]
+                do { daySessions = try runDay(inputs, user: user, aadPath: aadPath, nan: nan) }
+                catch {
+                    guard !AnalysisRun.cancelled else { return (sessions, "analysis interrupted") }
+                    dlog("models", "activity day=\(key) met=\(inputs.met.count) motion=\(inputs.motion.count) temperature=\(inputs.temp.count) hr=\(inputs.hr.count) stepPackets=\(inputs.rawStep.count) failed: \(error)")
+                    return (sessions, "Activity analysis failed for \(key). See diagnostics for details.")
+                }
                 sessions.append(contentsOf: daySessions)
                 cache[key] = ActivityDayEntry(fp: fp, sessions: daySessions)
                 ModelCacheStore.save(ModelCacheStore.activityFile, globalKey: globalKey, entries: cache)
@@ -174,8 +189,8 @@ enum ActivityModel {
     }
 
     /// One AAD inference over one local day's inputs.
-    private static func runDay(_ inputs: DayInputs, user: [Float], aadPath: String, nan: Float) -> [WorkoutSession]? {
-        guard let decoded = decodeStepPackets(inputs.rawStep) else { return nil }
+    private static func runDay(_ inputs: DayInputs, user: [Float], aadPath: String, nan: Float) throws -> [WorkoutSession] {
+        let decoded = try decodeStepPackets(inputs.rawStep)
         let lo = inputs.dayStart.timeIntervalSince1970 / 60
         let firstMet = inputs.met.flat[0]
         let lastMet = inputs.met.flat[(inputs.met.count - 1) * 2]
@@ -196,7 +211,7 @@ enum ActivityModel {
                                   &metFlat, Int32(inputs.met.count), &step, Int32(stepCount),
                                   &motionFlat, Int32(inputs.motion.count), &tempFlat, Int32(inputs.temp.count),
                                   &hrFlat, Int32(inputs.hr.count), 0.5, 10.0, &output, 512)
-        guard count >= 0 else { return nil }
+        guard count >= 0 else { throw InferenceFailure.bridge() }
         if count == 0 { return [] }
         let stamp = DateFormatter(); stamp.timeZone = .current; stamp.dateFormat = "yyyy-MM-dd HH:mm"
         let time = DateFormatter(); time.timeZone = .current; time.dateFormat = "HH:mm"
@@ -235,21 +250,22 @@ enum ActivityModel {
     /// Decode one day's (or a chunked slice of a day's) 27-col gait packets.
     /// Hiking days can be thousands of pairs; the old path fed the whole history
     /// as one tensor and jetsam-killed the app.
-    private static func decodeStepPackets(_ packets: [TimedRow]) -> [TimedRow]? {
+    private static func decodeStepPackets(_ packets: [TimedRow]) throws -> [TimedRow] {
         guard !packets.isEmpty else { return [] }
         guard let modelPath = Bundle.main.path(forResource: "steps_motion_decoder_2_0_0", ofType: "ptl")
-        else { return nil }
+        else { throw InferenceFailure("step decoder model file is missing from the app bundle") }
         let chunk = 4096
         let overlap = 24
         if packets.count <= chunk {
-            return runStepDecoder(packets, modelPath: modelPath)
+            return try runStepDecoder(packets, modelPath: modelPath)
         }
         var out: [TimedRow] = []
         var seen = Set<Int64>()
         var i = 0
         while i < packets.count {
             let end = min(packets.count, i + chunk)
-            guard !AnalysisRun.cancelled, let decoded = runStepDecoder(Array(packets[i..<end]), modelPath: modelPath) else { return nil }
+            try AnalysisRun.check()
+            let decoded = try runStepDecoder(Array(packets[i..<end]), modelPath: modelPath)
             for row in decoded {
                 let key = Int64((row.unixMinute * 60_000).rounded())
                 if seen.insert(key).inserted { out.append(row) }
@@ -260,7 +276,7 @@ enum ActivityModel {
         return out
     }
 
-    private static func runStepDecoder(_ packets: [TimedRow], modelPath: String) -> [TimedRow]? {
+    private static func runStepDecoder(_ packets: [TimedRow], modelPath: String) throws -> [TimedRow] {
         var timestamps = packets.map { Int64(($0.unixMinute * 60_000).rounded()) }
         var raw = packets.flatMap(\.values)
         let capacity = packets.count * 3
@@ -268,7 +284,7 @@ enum ActivityModel {
         var outputFeatures = [Float](repeating: 0, count: capacity * 11)
         let count = oura_stepmotion(modelPath, &timestamps, &raw, Int32(packets.count),
                                     &outputTimestamps, &outputFeatures, Int32(capacity))
-        guard count >= 0 else { return nil }
+        guard count >= 0 else { throw InferenceFailure.bridge() }
         if count == 0 { return [] }
         let order = [6, 7, 9, 10, 8, 5, 4, 0, 3, 1, 2]
         return (0..<Int(count)).map { row in
