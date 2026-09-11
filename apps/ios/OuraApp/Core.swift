@@ -1,5 +1,14 @@
 import Foundation
 
+enum DayAnalysisKind: String, CaseIterable {
+    case sleep = "Sleep", activity = "Activity"
+}
+
+struct DayAnalysisRequest: Equatable {
+    let day: String
+    let kind: DayAnalysisKind
+}
+
 /// Last successfully rendered summary. It is display-only: the SQLite store remains
 /// the source of truth and a fresh summary always replaces this after launch. Keeping
 /// it out of UserDefaults avoids loading a potentially large signal payload there.
@@ -60,6 +69,92 @@ enum Core {
     }
 
     #if TORCH
+    /// Launch and sync only fill the latest night's missing analysis. Historical
+    /// results stay visible, and older missing nights are refreshed on demand.
+    static func automaticSleepPlan(nights: [NightRow], previous: Summary?) -> (saved: [String: [Int]], pending: [NightRow]) {
+        var saved: [String: [Int]] = [:]
+        for night in nights {
+            guard let start = night.start_ds else { continue }
+            if let old = previous?.nights.first(where: {
+                $0.start_ds == start && $0.end_ds == night.end_ds
+                    && $0.ymd == night.ymd && $0.start == night.start && $0.end == night.end
+            }), let stages = old.stages, !stages.isEmpty {
+                saved[String(start)] = stages
+            }
+        }
+        // Pick the night you woke from most recently (absolute end time, falling
+        // back to wake date, then list order). Do not backfill an older missing
+        // night when the newest one already has a result.
+        let latest = nights.enumerated().max { lhs, rhs in
+            let l = lhs.element, r = rhs.element
+            if let le = l.end_unix, let re = r.end_unix, le != re { return le < re }
+            let lw = l.wake_ymd ?? l.ymd ?? "", rw = r.wake_ymd ?? r.ymd ?? ""
+            if lw != rw { return lw < rw }
+            return lhs.offset > rhs.offset
+        }?.element
+        guard let latest, let start = latest.start_ds,
+              latest.end_ds != nil, saved[String(start)] == nil else { return (saved, []) }
+        return (saved, [latest])
+    }
+
+    /// Refresh one report without running unrelated models or discarding other days.
+    static func refreshAnalysis(_ previous: Summary, request: DayAnalysisRequest,
+                                progress: @escaping @Sendable (String) -> Void = { _ in }) -> (summary: Summary, error: String?) {
+        let base = Core.base()
+        guard base.error == nil else { return (previous, "Couldn’t read saved data. Try again.") }
+        do {
+            let events = try EventStore.decodedEvents(dbPath: DB.readPath())
+            let clock = EventStore.RingClock(events: events)
+            try events.validate()
+            try AnalysisRun.check()
+            var updated = previous
+            switch request.kind {
+            case .sleep:
+                guard let night = base.night(forDay: request.day), let start = night.start_ds else {
+                    return (previous, "No sleep data is saved for this day.")
+                }
+                let result = SleepStaging.run(nights: [night], events: events, clock: clock,
+                                             force: true, pruneCache: false, progress: progress)
+                if let error = result.error { throw AnalysisRefreshFailure(error) }
+                guard let stages = result.staged[String(start)], !stages.isEmpty else {
+                    return (previous, "Not enough saved sleep data to refresh this night.")
+                }
+                let previousStart = previous.night(forDay: request.day)?.start_ds
+                if let index = updated.nights.firstIndex(where: {
+                    $0.start_ds == start || (previousStart != nil && $0.start_ds == previousStart)
+                }) {
+                    updated.nights[index] = night
+                } else { updated.nights.append(night) }
+                applySleepStages(result.staged, to: &updated)
+            case .activity:
+                guard base.activity_profile[request.day] != nil else {
+                    return (previous, "No activity data is saved for this day.")
+                }
+                let result = ActivityModel.run(profile: base.profile, events: events, clock: clock,
+                                               onlyDay: request.day, force: true, progress: progress)
+                if let error = result.error { throw AnalysisRefreshFailure(error) }
+                updated.workouts.removeAll { $0.dayLabel == request.day }
+                updated.workouts.append(contentsOf: result.sessions)
+                updated.workouts.sort { $0.start < $1.start }
+                updated.modelErrors.removeAll {
+                    $0 == "Activity analysis failed for \(request.day). See diagnostics for details."
+                }
+            }
+            try events.validate()
+            try AnalysisRun.check()
+            return (updated, nil)
+        } catch {
+            if AnalysisRun.cancelled { return (previous, "Refresh paused. Keep the app open and try again.") }
+            dlog("models", "refresh day=\(request.day) kind=\(request.kind.rawValue) failed: \(error)")
+            return (previous, "Couldn’t refresh \(request.kind.rawValue.lowercased()) analysis. Your previous results are still available. See Help & diagnostics for details.")
+        }
+    }
+
+    private struct AnalysisRefreshFailure: Error, CustomStringConvertible {
+        let description: String
+        init(_ message: String) { description = message }
+    }
+
     /// The slow part: run the three on-device torch models and fold their results into
     /// the summary. Call off the main thread (see RootView.load); never on launch.
     ///
@@ -72,7 +167,8 @@ enum Core {
         var s = base
         let profile = base.profile
 
-        var staged: [String: [Int]] = [:]
+        let sleepPlan = automaticSleepPlan(nights: base.nights, previous: previous)
+        var staged = sleepPlan.saved
         var cva: CvaModel.Result?
         var workouts: [WorkoutSession] = []
         var illness: IllnessResult?
@@ -80,7 +176,7 @@ enum Core {
 
         // One shared read: one failure point, one lock-contention window, and the
         // RingClock epoch recovery is paid once instead of once per model.
-        progress("reading ring data…")
+        progress("Reading saved ring data…")
         var events = EventStore.Events(path: DB.readPath())
         var readErr: String?
         do {
@@ -99,9 +195,13 @@ enum Core {
         if readErr == nil, !events.isEmpty {
             let clock = EventStore.RingClock(events: events)
             if events.error != nil || AnalysisRun.cancelled { return previous ?? base }
-            let rSleep = SleepStaging.run(nights: base.nights, events: events, clock: clock, progress: progress)
-            staged = rSleep.staged
+            let rSleep = sleepPlan.pending.isEmpty
+                ? (staged: [String: [Int]](), error: Optional<String>.none)
+                : SleepStaging.run(nights: sleepPlan.pending, events: events, clock: clock,
+                                   pruneCache: false, progress: progress)
+            staged.merge(rSleep.staged) { _, fresh in fresh }
             sleepErr = rSleep.error
+            dlog("models", "sleep automatic saved=\(sleepPlan.saved.count) pending=\(sleepPlan.pending.count)")
             stageFinished("sleep")
             if AnalysisRun.cancelled { return previous ?? base }
             let rAct = ActivityModel.run(profile: profile, events: events, clock: clock, progress: progress)
@@ -134,6 +234,23 @@ enum Core {
         }
         // fold SleepNet's hypnogram + stage breakdown into each night, keyed by the exact
         // bedtime start_ds so two sleeps on one calendar day don't collide.
+        applySleepStages(staged, to: &s)
+        if let cva {
+            s.cardio = Cardio(vascular_age: cva.vascularAge, chronological_age: profile?.age ?? 30,
+                              pwv_ms: cva.pwv, segments: cva.segments)
+        } else if cvaErr != nil {
+            s.cardio = previous?.cardio
+        }
+        s.workouts = actErr == nil ? workouts : (previous?.workouts ?? workouts)
+        s.illness = (illErr == nil || illness != nil) ? illness : previous?.illness
+        var seen = Set<String>()
+        s.modelErrors = [sleepErr, cvaErr, actErr, illErr].compactMap { $0 }
+            .filter { seen.insert($0).inserted }
+        for error in s.modelErrors { dlog("models", "failed: \(error)") }
+        return s
+    }
+
+    private static func applySleepStages(_ staged: [String: [Int]], to s: inout Summary) {
         for i in s.nights.indices {
             guard let sds = s.nights[i].start_ds, let stages = staged[String(sds)], !stages.isEmpty else { continue }
             s.nights[i].stages = stages
@@ -151,22 +268,6 @@ enum Core {
            stagedDebt.valid_days >= (s.sleepDebt?.valid_days ?? 0) {
             s.sleepDebt = stagedDebt
         }
-        if let cva {
-            s.cardio = Cardio(vascular_age: cva.vascularAge, chronological_age: profile?.age ?? 30,
-                              pwv_ms: cva.pwv, segments: cva.segments)
-        } else if cvaErr != nil {
-            s.cardio = previous?.cardio
-        }
-        // Never let a failed run replace real results with emptiness (the same
-        // principle as the staged-sleep-debt coverage guard above).
-        s.workouts = actErr == nil ? workouts : (previous?.workouts ?? workouts)
-        s.illness = (illErr == nil || illness != nil) ? illness : previous?.illness
-        // Deduplicated: a failed shared read sets the same message on three models.
-        var seen = Set<String>()
-        s.modelErrors = [sleepErr, cvaErr, actErr, illErr].compactMap { $0 }
-            .filter { seen.insert($0).inserted }
-        for error in s.modelErrors { dlog("models", "failed: \(error)") }
-        return s
     }
     #endif
 }

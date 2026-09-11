@@ -70,6 +70,27 @@ a nap doesn't shadow the real sleep.
 
 ## Where the two clients diverge
 
+- **Automatic sleep analysis (iOS)**: opening or syncing the app reuses saved sleep
+  results and analyzes only the latest night when its result is missing. A changed
+  bedtime window counts as missing. Older missing nights require “Refresh analysis”
+  in their Sleep tab. Automatic runs do not prune the historical model cache.
+- **iOS compact disclosures**: symptom radar initially shows its status and explanation;
+  “View details” reveals measurements and personal ranges together. Ring troubleshooting
+  uses a separate support panel with technical reports behind a second disclosure.
+  These phone-layout changes are intentionally iOS-only; the underlying health data is unchanged.
+- **Manual analysis refresh (iOS)**: each day's Sleep and Activity tabs can rerun their
+  respective model from saved ring data. Sleep uses the displayed night's bedtime window
+  (paired by wake date); activity uses the selected calendar day. The action bypasses
+  that result's cache, preserves other days, and publishes successful results to the open
+  report and summary cache. This is separate from syncing new data from the ring.
+- **Raw ring data export (iOS)**: Help & diagnostics → “Export raw ring data” writes a
+  self-contained copy of the phone's SQLite store (`VACUUM INTO`, no auth key) and hands
+  it to the share sheet. On a computer it is a normal `oura --db <file> …` input, so any
+  on-phone analysis can be reproduced exactly (`oura --db exported.db dashboard --tz-offset 2`).
+- **Ring clock diagnostics**: the summary JSON carries a `clock` block (per-boot ds range,
+  sync window, anchor count/sources, `undated_nights`, `warnings`) and each night carries
+  `wake_ymd`, `start_unix`, `end_unix`, `clock_source`. iOS renders the warnings on Home,
+  the per-boot table under Technical reports, and appends it to the shared diagnostic report.
 - **Home layout**: same day-unit model on both, but iOS uses thomas.md Quiet Ink (warm paper,
   hairlines, serif titles) while the web still uses its own teal/card theme. Match *data/features*,
   not pixel-for-pixel layout. iOS opens details as sheets; the web as stacked `<dialog>`s.
@@ -178,9 +199,24 @@ every time the ring reboots (battery drain, firmware reset). Naively anchoring e
 to one global `max_ds`/`captured_unix` scatters older boots to wildly wrong dates (a boot
 can land months in the past). The fix segments events into boot **epochs** — walk in real
 sync order `(captured_unix, then insertion id)`, split on any large backward jump in ds, then use
-the epoch's on-ring `time_sync` (`ring_timestamp` ↔ UTC) records as authoritative anchors.
-`captured_unix` is only an epoch-selection hint and a fallback for legacy data. This
-lives in **three places that must stay in sync**:
+the epoch's on-ring `time_sync` (0x42) and `rtc_beacon` (0x85)
+(`ring_timestamp` ↔ UTC) records as authoritative anchors. RTC beacons must also
+retain their JSON in the iOS metadata reader. Ignoring them can shift a whole
+night to its download time or project a new boot through an older boot's clock.
+`captured_unix` is only an epoch-selection hint and a fallback for legacy data. Every event
+resolves with a **source**: `anchor` (its own boot's time_sync/rtc_beacon/phone anchor),
+`projected` (another boot's anchor, only when this ds continues that boot's counter — a
+rebooted ring restarts near zero and must never be projected through an older boot that
+only ran at higher counts), `download_time` (capture-time arithmetic, allowed only for a
+boot drained sync after sync so the error is bounded by one sync gap) or `undated` (a boot
+downloaded in one go with no anchor). Nights whose bounds are not `anchor`/`projected` are
+**withheld** from `nights` and listed in `clock.undated_nights` — showing them dated to the
+download would put a 23:00→08:00 sleep at 07:00→15:00 on the wrong day. To make anchors
+exist for every boot, the iOS sync (`oura-core` `sync_inner`) now sends the phone clock to
+the ring (`sync_time_app`, which makes the ring log a `time_sync`) and, after a drain that saw
+new ring time, inserts a synthetic `time_sync` row (`decoded_json.source = "phone"`, body =
+unix LE + "phone") pairing the newest drained ds with the phone clock. This lives in
+**three places that must stay in sync**:
 
 - `crates/oura-summary/src/ring_time.rs` — the shared `RingClock`; fixes night/activity/
   movement **dates for both clients** at once.

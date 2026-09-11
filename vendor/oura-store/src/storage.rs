@@ -110,6 +110,24 @@ impl Store {
         Ok(inserted)
     }
 
+    /// Write a self-contained copy of the database (WAL folded in) to `out_path`,
+    /// for sharing a phone's raw ring records with the desktop tooling. Any file
+    /// at `out_path` is replaced.
+    pub fn export_to<P: AsRef<Path>>(&self, out_path: P) -> Result<()> {
+        let out = out_path.as_ref();
+        if out.exists() {
+            std::fs::remove_file(out).map_err(|e| {
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                    Some(format!("remove {}: {e}", out.display())),
+                )
+            })?;
+        }
+        let path = out.to_string_lossy().into_owned();
+        self.conn.execute("VACUUM INTO ?1", params![path])?;
+        Ok(())
+    }
+
     pub fn integrity_check(&self) -> Result<String> {
         Ok(self
             .conn

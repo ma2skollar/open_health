@@ -959,6 +959,28 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
         }
     }
     let beds = normalize_bed_periods(raw_beds, &sleep_support, &pulse_support, unix_s_at);
+    // A night whose boot has no time anchor cannot be placed on the calendar. Showing
+    // it dated to the download would put a 23:00→08:00 sleep at 07:00→15:00 on the
+    // wrong day, so it is withheld and reported instead; the next sync anchors it.
+    let mut undated_nights: Vec<Value> = Vec::new();
+    let beds: Vec<BedPeriod> = beds
+        .into_iter()
+        .filter(|bed| {
+            let start = clock.resolve(bed.start_ds, bed.captured_unix);
+            let end = clock.resolve(bed.end_ds, bed.captured_unix);
+            if start.source.is_dated() && end.source.is_dated() {
+                return true;
+            }
+            undated_nights.push(json!({
+                "start_ds": bed.start_ds,
+                "end_ds": bed.end_ds,
+                "in_bed_h": ((bed.end_ds - bed.start_ds) as f64 / 36_000.0 * 10.0).round() / 10.0,
+                "captured_unix": bed.captured_unix,
+                "source": end.source.label(),
+            }));
+            false
+        })
+        .collect();
 
     let mut nights: Vec<Night> = beds
         .iter()
@@ -1132,6 +1154,12 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
         nights_json.push(json!({
             "date": date_label(start_unix, tz),
             "ymd": ymd_label(start_unix, tz),
+            // The morning you woke up: what the apps group a night under. Computed
+            // here so the clients never have to guess it from the clock strings.
+            "wake_ymd": ymd_label(end_unix, tz),
+            "start_unix": start_unix.round() as i64,
+            "end_unix": end_unix.round() as i64,
+            "clock_source": clock.resolve(nt.end_ds, nt.captured_unix).source.label(),
             "start_ds": nt.start_ds, // exact bedtime key for on-device model injection
             "end_ds": nt.end_ds,
             // Android's interim schema likewise preserves bedtime_start/end_original
@@ -1445,10 +1473,23 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
 
     let digest = make_digest(&hrv_stat, &rhr_stat);
 
+    let mut clock_diag = clock.diagnostics();
+    clock_diag["undated_nights"] = json!(undated_nights);
+    clock_diag["warnings"] = json!(if undated_nights.is_empty() {
+        Vec::<String>::new()
+    } else {
+        vec![format!(
+            "{} night(s) could not be placed in time because the ring's clock was not \
+             synced for that period. They are hidden until the next sync anchors them.",
+            undated_nights.len()
+        )]
+    });
+
     Ok(json!({
         "generated_at": now,
         "tz": tz,
         "digest": digest,
+        "clock": clock_diag,
         "device": device,
         "profile": demo.to_json(),
         "nights": nights_json,

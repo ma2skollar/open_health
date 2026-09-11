@@ -36,6 +36,20 @@ xcodebuild -exportArchive -archivePath build/OuraApp.xcarchive \
   -exportOptionsPlist ExportOptions.plist -exportPath build/export   # then upload with `xcrun altool`/Transporter
 ```
 
+## Reproducing a phone's analysis on a computer
+
+In the app: Sync → Help & diagnostics → **Export raw ring data**, then AirDrop/save the
+`oura-ring-<date>.db` file. It is a self-contained SQLite copy of the phone's store (no auth
+key). On the desktop it is a normal `--db` input:
+
+```bash
+./target/debug/oura --db ~/Downloads/oura-ring-20260911-0930.db dashboard --port 8099 --tz-offset 2
+curl -s localhost:8099/api/summary | python3 -c 'import json,sys; s=json.load(sys.stdin); print(json.dumps(s["clock"], indent=1)); [print(n["ymd"], n["wake_ymd"], n["start"], n["end"], n["clock_source"]) for n in s["nights"][:5]]'
+```
+
+The `clock` block (per-boot ds range, sync window, anchors) and each night's `clock_source`
+say whether a misdated night is a clock-anchoring problem or an analysis problem.
+
 ## Activity model regression checks
 
 After changing the activity export, run `python -m unittest discover -s tools -p

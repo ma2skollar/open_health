@@ -6,7 +6,7 @@ import Foundation
 /// step-motion channel. Both details materially affect the predicted sport.
 enum ActivityModel {
     private static let behavior: [Int: String] = [
-        -1: "nothing", 0: "—", 1: "badminton", 2: "boxing", 3: "cross-country skiing",
+        -1: "nothing", 0: "–", 1: "badminton", 2: "boxing", 3: "cross-country skiing",
         4: "cross training", 5: "cycling", 6: "dance", 7: "elliptical", 8: "strength",
         9: "hockey", 10: "pilates", 11: "rowing", 12: "running", 13: "swimming", 14: "walking",
         15: "yoga", 16: "golf", 17: "tennis", 18: "climbing", 19: "downhill skiing",
@@ -47,11 +47,13 @@ enum ActivityModel {
     }
 
     static func run(profile: Profile?, events: EventStore.Events, clock: EventStore.RingClock,
+                    onlyDay: String? = nil, force: Bool = false,
+                    cacheFile: String = ModelCacheStore.activityFile,
                     progress: @escaping @Sendable (String) -> Void = { _ in }) -> (sessions: [WorkoutSession], error: String?) {
         guard let aadPath = Bundle.main.path(forResource: "automatic_activity_detection_3_1_11", ofType: "ptl")
         else { return ([], "activity model file missing from the app bundle") }
 
-        guard !events.isEmpty else { return ([], nil) }
+        guard !events.isEmpty else { return ([], onlyDay == nil ? nil : "No activity data is saved for this day.") }
         let nan = Float.nan
         func number(_ value: Any?) -> Float { (value as? NSNumber)?.floatValue ?? 0 }
 
@@ -89,7 +91,7 @@ enum ActivityModel {
             }
         }
         guard events.error == nil, !AnalysisRun.cancelled else { return ([], "analysis interrupted") }
-        guard !met.isEmpty else { return ([], nil) }
+        guard !met.isEmpty else { return ([], onlyDay == nil ? nil : "No activity data is saved for this day.") }
 
         let stepPackets = collectStepPackets(events: events, clock: clock)
         var calendar = Calendar(identifier: .gregorian)
@@ -147,43 +149,64 @@ enum ActivityModel {
             return h.hex
         }
         let globalKey = ModelCacheStore.globalKey(profile: profile)
-        var cache: [String: ActivityDayEntry] = ModelCacheStore.load(ModelCacheStore.activityFile,
+        var cache: [String: ActivityDayEntry] = ModelCacheStore.load(cacheFile,
                                                                      globalKey: globalKey)
         let dayKeyFmt = DateFormatter()
         dayKeyFmt.timeZone = .current
         dayKeyFmt.dateFormat = "yyyy-MM-dd"
 
+        // Pass 1: fingerprint every day and separate cache hits from the days that
+        // actually need the model, so the progress pill counts real work ("day 2 of 3")
+        // rather than the whole history.
         var sessions: [WorkoutSession] = []
         var currentKeys = Set<String>()
-        var recomputed = 0
-        for (index, dayStart) in dayStarts.enumerated() {
+        var pending: [(key: String, fp: String, inputs: DayInputs)] = []
+        for dayStart in dayStarts {
             guard !AnalysisRun.cancelled, events.error == nil else { return ([], "analysis interrupted") }
+            let key = dayKeyFmt.string(from: dayStart)
+            if let onlyDay, key != onlyDay { continue }
             guard let inputs = dayInputs(dayStart) else { continue }
-            let key = dayKeyFmt.string(from: dayStart), fp = fingerprint(inputs)
+            let fp = fingerprint(inputs)
             currentKeys.insert(key)
-            if let entry = cache[key], entry.fp == fp { sessions.append(contentsOf: entry.sessions) }
-            else {
-                progress("detecting activity · day \(index + 1)/\(dayStarts.count)")
-                let daySessions: [WorkoutSession]
-                do { daySessions = try runDay(inputs, user: user, aadPath: aadPath, nan: nan) }
-                catch {
-                    guard !AnalysisRun.cancelled else { return (sessions, "analysis interrupted") }
-                    dlog("models", "activity day=\(key) met=\(inputs.met.count) motion=\(inputs.motion.count) temperature=\(inputs.temp.count) hr=\(inputs.hr.count) stepPackets=\(inputs.rawStep.count) failed: \(error)")
-                    return (sessions, "Activity analysis failed for \(key). See diagnostics for details.")
-                }
-                sessions.append(contentsOf: daySessions)
-                cache[key] = ActivityDayEntry(fp: fp, sessions: daySessions)
-                ModelCacheStore.save(ModelCacheStore.activityFile, globalKey: globalKey, entries: cache)
-                recomputed += 1
-            }
+            if !force, let entry = cache[key], entry.fp == fp { sessions.append(contentsOf: entry.sessions) }
+            else { pending.append((key, fp, inputs)) }
         }
+        let staleKeys = pending.filter { cache[$0.key] != nil }.count
+        if !pending.isEmpty {
+            dlog("models", "activity pending=\(pending.count) of \(currentKeys.count) (inputs changed=\(staleKeys), new=\(pending.count - staleKeys), cached=\(cache.count))")
+        }
+        // Pass 2: run only the missing days; persist every few days and at the end so a
+        // mid-run kill resumes instead of restarting.
+        var recomputed = 0
+        for (index, day) in pending.enumerated() {
+            guard !AnalysisRun.cancelled, events.error == nil else {
+                if recomputed > 0 { ModelCacheStore.save(cacheFile, globalKey: globalKey, entries: cache) }
+                return ([], "analysis interrupted")
+            }
+            progress(onlyDay == nil ? "Analyzing activity · day \(index + 1) of \(pending.count)" : "Refreshing activity analysis…")
+            let daySessions: [WorkoutSession]
+            do { daySessions = try runDay(day.inputs, user: user, aadPath: aadPath, nan: nan) }
+            catch {
+                if recomputed > 0 { ModelCacheStore.save(cacheFile, globalKey: globalKey, entries: cache) }
+                guard !AnalysisRun.cancelled else { return (sessions, "analysis interrupted") }
+                let inputs = day.inputs
+                dlog("models", "activity day=\(day.key) met=\(inputs.met.count) motion=\(inputs.motion.count) temperature=\(inputs.temp.count) hr=\(inputs.hr.count) stepPackets=\(inputs.rawStep.count) failed: \(error)")
+                return (sessions, "Activity analysis failed for \(day.key). See diagnostics for details.")
+            }
+            sessions.append(contentsOf: daySessions)
+            cache[day.key] = ActivityDayEntry(fp: day.fp, sessions: daySessions)
+            recomputed += 1
+            if recomputed % 5 == 0 { ModelCacheStore.save(cacheFile, globalKey: globalKey, entries: cache) }
+        }
+        if recomputed > 0 { ModelCacheStore.save(cacheFile, globalKey: globalKey, entries: cache) }
         guard !AnalysisRun.cancelled, events.error == nil else { return ([], "analysis interrupted") }
+        if onlyDay != nil && currentKeys.isEmpty { return ([], "No activity data is saved for this day.") }
         dlog("models", "activity recomputed=\(recomputed) total=\(currentKeys.count)")
         // Drop days the current data no longer produces (e.g. re-dated by a clock
         // re-anchor) so the file tracks the DB instead of growing stale keys.
         let pruned = cache.filter { currentKeys.contains($0.key) }
-        if pruned.count != cache.count {
-            ModelCacheStore.save(ModelCacheStore.activityFile, globalKey: globalKey, entries: pruned)
+        if onlyDay == nil && pruned.count != cache.count {
+            ModelCacheStore.save(cacheFile, globalKey: globalKey, entries: pruned)
         }
         return (sessions.sorted { $0.start < $1.start }, nil)
     }

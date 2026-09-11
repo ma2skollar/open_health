@@ -587,8 +587,8 @@ public protocol RingSessionProtocol : AnyObject {
     /**
      * Interrupts even an idle Rust receive; a finished Swift AsyncStream cannot do this.
      */
-    func cancel(reason: String)
-
+    func cancel(reason: String) 
+    
     /**
      * Swift pushes each inbound BLE notification frame here.
      */
@@ -677,7 +677,7 @@ open func cancel(reason: String) {try! rustCall() {
     )
 }
 }
-
+    
     /**
      * Swift pushes each inbound BLE notification frame here.
      */
@@ -880,11 +880,11 @@ public struct FfiConverterTypeSyncError: FfiConverterRustBuffer {
             try FfiConverterString.read(from: &buf)
             )
         case 2: return .Storage(
-            operation: try FfiConverterString.read(from: &buf),
-            code: try FfiConverterInt32.read(from: &buf),
-            extendedCode: try FfiConverterInt32.read(from: &buf),
-            message: try FfiConverterString.read(from: &buf),
-            retryable: try FfiConverterBool.read(from: &buf),
+            operation: try FfiConverterString.read(from: &buf), 
+            code: try FfiConverterInt32.read(from: &buf), 
+            extendedCode: try FfiConverterInt32.read(from: &buf), 
+            message: try FfiConverterString.read(from: &buf), 
+            retryable: try FfiConverterBool.read(from: &buf), 
             checkpoint: try FfiConverterUInt32.read(from: &buf)
             )
         case 3: return .Interrupted(
@@ -906,7 +906,7 @@ public struct FfiConverterTypeSyncError: FfiConverterRustBuffer {
             writeInt(&buf, Int32(1))
             FfiConverterString.write(v1, into: &buf)
             
-
+        
         case let .Storage(operation,code,extendedCode,message,retryable,checkpoint):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(operation, into: &buf)
@@ -915,12 +915,12 @@ public struct FfiConverterTypeSyncError: FfiConverterRustBuffer {
             FfiConverterString.write(message, into: &buf)
             FfiConverterBool.write(retryable, into: &buf)
             FfiConverterUInt32.write(checkpoint, into: &buf)
-
-
+            
+        
         case let .Interrupted(reason):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(reason, into: &buf)
-
+            
         }
     }
 }
@@ -1239,6 +1239,19 @@ public func databaseIntegrity(dbPath: String)throws  -> String {
 })
 }
 /**
+ * Copy the synced database to `out_path` as one self-contained SQLite file
+ * (`VACUUM INTO`), so the exact on-phone ring records can be replayed on the
+ * desktop with `oura --db <file> …`. The auth key lives in the Keychain and is
+ * never part of the database.
+ */
+public func exportDatabase(dbPath: String, outPath: String)throws  {try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_oura_core_fn_func_export_database(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(outPath),$0
+    )
+}
+}
+/**
  * A lightweight, model-free summary (device + data-health only) — kept as a fast
  * path / fallback. Returns `{ serials, device, event_counts, decoded_events }`.
  */
@@ -1300,6 +1313,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_database_integrity() != 19533) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_func_export_database() != 46626) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_quick_summary_json() != 19199) {

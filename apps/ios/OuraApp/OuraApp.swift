@@ -27,11 +27,11 @@ struct TodayCard: View {
                         HStack {
                             ObsTag("sleep", icon: "moon.fill")
                             Spacer()
-                            Text(n.in_bed_h.map { String(format: "%.1fh", $0) } ?? "—")
+                            Text(n.in_bed_h.map { String(format: "%.1fh", $0) } ?? "–")
                                 .font(Obs.mono(11)).foregroundStyle(Obs.ink2)
                             Image(systemName: "chevron.right").font(.system(size: 11)).foregroundStyle(Obs.trace)
                         }
-                        Text("\(n.start ?? "—") → \(n.end ?? "—")")
+                        Text("\(n.start ?? "–") → \(n.end ?? "–")")
                             .font(Obs.mono(12)).foregroundStyle(Obs.ink2)
                         if n.hasHypnogram { Hypnogram(stages: n.stages!, height: 28) }
                         else if let e = n.efficiency {
@@ -73,8 +73,10 @@ struct TodayCard: View {
 // "show all days" → a page listing every day; tap one for its full report.
 struct AllDaysView: View {
     let s: Summary
+    @Environment(\.dayAnalysis) private var analysis
     @Environment(\.dismiss) private var dismiss
     var body: some View {
+        let s = analysis?.summary ?? s
         NavigationStack {
             ZStack {
                 Obs.canvas.ignoresSafeArea()
@@ -126,6 +128,8 @@ struct SyncView: View {
     @State private var diagnosticFile: URL?
     @State private var showKey = false
     @State private var showDiagnostics = false
+    @State private var showTechnicalReports = false
+    @State private var clockReport: String?
     @State private var confirmReset = false
     @FocusState private var keyFocused: Bool
 
@@ -321,7 +325,7 @@ struct SyncView: View {
                 }
                 .buttonStyle(.plain)
                 .disabled(!validKey)
-                Text("The first sync downloads your ring’s available history and may take a few minutes.")
+                Text("Your first sync may take a few minutes.")
                     .font(.footnote).foregroundStyle(Obs.ink2)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -330,11 +334,13 @@ struct SyncView: View {
 
     private var support: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Rectangle().fill(Obs.rule).frame(height: 1)
             DisclosureGroup(isExpanded: $showDiagnostics) {
                 VStack(alignment: .leading, spacing: 18) {
+                    Text("Check saved data or share a report for help.")
+                        .font(.footnote).foregroundStyle(Obs.ink2)
+                        .fixedSize(horizontal: false, vertical: true)
                     Button { Task { await ring.checkDatabase() } } label: {
-                        Label("Check database", systemImage: "externaldrive")
+                        Label("Check saved data", systemImage: "externaldrive")
                             .frame(minHeight: 44)
                     }
                     .disabled(ring.busy)
@@ -344,36 +350,70 @@ struct SyncView: View {
                             if let url { diagnosticFile = url }
                         }
                     } label: {
-                        Label("Share detailed diagnostics", systemImage: "square.and.arrow.up")
+                        Label("Share diagnostic report", systemImage: "square.and.arrow.up")
                             .frame(minHeight: 44)
                     }
-                    diagnosticHistory
-                    Button(role: .destructive) { confirmReset = true } label: {
-                        Label("Reset local sync data", systemImage: "trash")
-                            .foregroundStyle(Obs.alert)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Button {
+                            Task { if let url = await ring.exportRawDatabase() { diagnosticFile = url } }
+                        } label: {
+                            Label("Export raw ring data", systemImage: "externaldrive.badge.icloud")
+                                .frame(minHeight: 44)
+                        }
+                        .disabled(ring.busy)
+                        Text("A copy of the ring records saved on this iPhone, for reproducing an analysis on a computer. Your ring key is not included.")
+                            .font(.footnote).foregroundStyle(Obs.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    DisclosureGroup(isExpanded: $showTechnicalReports) {
+                        diagnosticHistory.padding(.top, 12)
+                            .task { clockReport = await Task.detached { ClockReport.text() }.value }
+                    } label: {
+                        Label("Technical reports", systemImage: "doc.text.magnifyingglass")
                             .frame(minHeight: 44)
                     }
-                    .disabled(ring.busy)
+                    Rectangle().fill(Obs.rule).frame(height: 1)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Button(role: .destructive) { confirmReset = true } label: {
+                            Label("Reset local sync data", systemImage: "trash")
+                                .foregroundStyle(Obs.alert)
+                                .frame(minHeight: 44)
+                        }
+                        .disabled(ring.busy)
+                        Text("Deletes saved data from this iPhone. Your next sync restores the history still on your ring.")
+                            .font(.footnote).foregroundStyle(Obs.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .font(.subheadline)
                 .padding(.top, 16)
             } label: {
-                Label("Troubleshooting & diagnostics", systemImage: "wrench.and.screwdriver")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(Obs.ink2)
+                HStack(alignment: .center, spacing: 12) {
+                    Image(systemName: "wrench.and.screwdriver")
+                        .font(.body).foregroundStyle(Obs.muted)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Help & diagnostics")
+                            .font(.subheadline.weight(.semibold)).foregroundStyle(Obs.ink2)
+                        Text("Troubleshoot sync · review technical reports")
+                            .font(.caption).foregroundStyle(Obs.muted)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
                     .frame(minHeight: 44)
             }
         }
+        .padding(16)
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
     }
 
     private var diagnosticHistory: some View {
         // live transcript + leftover logs from previous crashes / kills.
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("diagnostics")
-                    .font(Obs.mono(11)).foregroundStyle(Obs.ink2)
+                Text("Saved reports")
+                    .font(.subheadline.weight(.medium)).foregroundStyle(Obs.ink2)
                 Spacer()
-                Button(copied ? "copied ✓" : "Copy summary") {
+                Button(copied ? "Copied" : "Copy summary") {
                     Task {
                         let text = await Task.detached { DiagStore.shared.exportSummary() }.value
                         UIPasteboard.general.string = text
@@ -381,32 +421,42 @@ struct SyncView: View {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
                     }
                 }
-                .font(Obs.mono(11, .medium)).foregroundStyle(Obs.ink)
+                .font(.caption.weight(.medium)).foregroundStyle(Obs.ink)
+                .frame(minHeight: 44)
+            }
+            if let clock = clockReport {
+                Text("Ring clock").font(.caption.weight(.medium)).foregroundStyle(Obs.ink)
+                Text(clock).font(.caption.monospaced()).foregroundStyle(Obs.ink2)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
             if !store.incidents.isEmpty {
-                Text("diagnostic reports · \(store.incidents.count)")
-                    .font(Obs.mono(10, .medium)).foregroundStyle(Obs.bad)
+                Text("\(store.incidents.count) recorded incidents")
+                    .font(.caption).foregroundStyle(Obs.muted)
                 ForEach(store.incidents.prefix(8)) { item in
                     VStack(alignment: .leading, spacing: 4) {
-                        Text(item.title).font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink)
-                        Text(item.preview).font(Obs.mono(9)).foregroundStyle(Obs.ink2)
+                        Text(item.title).font(.caption.weight(.medium)).foregroundStyle(Obs.ink)
+                        Text(item.date, format: .dateTime.month(.abbreviated).day().hour().minute())
+                            .font(.caption2).foregroundStyle(Obs.muted)
+                        Text(item.preview).font(.caption.monospaced()).foregroundStyle(Obs.ink2)
                             .lineLimit(5)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                        Button("copy this") {
+                        Button("Copy report") {
                             UIPasteboard.general.string = item.body
                         }
-                        .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink)
+                        .font(.caption.weight(.medium)).foregroundStyle(Obs.ink)
+                        .frame(minHeight: 44)
                     }
                     .padding(8)
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(Obs.trace, lineWidth: 0.8))
                 }
             } else {
-                Text("No recorded incidents. Interrupted sessions are retained without assuming a crash.")
+                Text("No incidents recorded.")
                     .font(Obs.mono(10)).foregroundStyle(Obs.muted)
                     .fixedSize(horizontal: false, vertical: true)
             }
             if !store.sessions.isEmpty {
-                Text("older sessions · \(store.sessions.count)")
+                Text("Previous sessions · \(store.sessions.count)")
                     .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink2)
                 ForEach(store.sessions.prefix(4)) { item in
                     HStack {
@@ -418,7 +468,7 @@ struct SyncView: View {
                 }
             }
             if diag.totalLines > 0 {
-                Text("this launch · \(diag.totalLines) lines")
+                Text("Current session · \(diag.totalLines) lines")
                     .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink2)
                 ScrollView {
                     VStack(alignment: .leading, spacing: 2) {
@@ -436,6 +486,27 @@ struct SyncView: View {
             }
         }
 
+    }
+}
+
+/// Human-readable rendering of the shared brain's `clock` block (per-boot ring clock
+/// anchors), from the last rendered summary. Shown in Technical reports and appended
+/// to the shared diagnostic report so a misdated night can be diagnosed remotely.
+enum ClockReport {
+    static func text() -> String? {
+        guard let clock = SummaryCache.load()?.clock else { return nil }
+        let fmt = DateFormatter(); fmt.dateFormat = "yyyy-MM-dd HH:mm"; fmt.timeZone = .current
+        let day = { (unix: Int64?) -> String in unix.map { fmt.string(from: Date(timeIntervalSince1970: Double($0))) } ?? "–" }
+        var lines: [String] = []
+        for (i, e) in clock.epochs.enumerated() {
+            let sources = (e.anchor_sources ?? []).joined(separator: ",")
+            lines.append("boot \(i + 1): ds \(e.min_ds ?? 0)…\(e.max_ds ?? 0) (\(e.span_h ?? 0)h) synced \(day(e.capture_min))…\(day(e.capture_max)) anchors=\(e.anchors ?? 0)\(sources.isEmpty ? "" : " [\(sources)]") latest=\(day(e.latest_anchor_unix))")
+        }
+        for n in clock.undated_nights {
+            lines.append("undated night: ds \(n.start_ds ?? 0)…\(n.end_ds ?? 0) \(n.in_bed_h ?? 0)h captured \(day(n.captured_unix)) (\(n.source ?? "?"))")
+        }
+        lines.append(contentsOf: clock.warnings.map { "warning: \($0)" })
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
     }
 }
 
@@ -502,7 +573,7 @@ struct RootView: View {
     @State private var isRefreshingSummary = false
     @StateObject private var ring = RingSync()
     @StateObject private var modelProgress = ModelProgress()
-    private func f(_ v: Double?, _ fallback: String = "—") -> String {
+    private func f(_ v: Double?, _ fallback: String = "–") -> String {
         v.map { "\(Int($0))" } ?? fallback
     }
     private func relAge(_ diff: Double) -> String {
@@ -534,7 +605,7 @@ struct RootView: View {
             } else {
                 VStack(spacing: 14) {
                     ProgressView().tint(Obs.ink)
-                    Text("reading your ring…").font(Obs.mono(12)).foregroundStyle(Obs.ink2)
+                    Text("Loading your data…").font(Obs.mono(12)).foregroundStyle(Obs.ink2)
                 }
             }
         }
@@ -546,6 +617,10 @@ struct RootView: View {
         .sheet(isPresented: $showProfile) { ProfileSettingsView(profile: s?.profile, onSaved: refreshDerivedData) }
         .sheet(isPresented: $showSleepDebt) { if let debt = s?.sleepDebt { SleepDebtDetail(debt: debt) } }
         .sheet(item: $vital) { kind in if let s { VitalTrendView(s: s, kind: kind) } }
+        #if TORCH
+        .environment(\.dayAnalysis, DayAnalysisContext(summary: s,
+            isBusy: isRefreshingSummary || ring.busy, refresh: refreshDayAnalysis))
+        #endif
         .onAppear {
             // A cached summary makes launch immediate; this forced load replaces it
             // with SQLite + model output without blanking the existing Today card.
@@ -599,6 +674,52 @@ struct RootView: View {
         }
     }
 
+    #if TORCH
+    @MainActor private func refreshDayAnalysis(_ request: DayAnalysisRequest) async -> String? {
+        guard !isRefreshingSummary, !ring.busy, let previous = s else {
+            return "Wait for sync and analysis to finish, then try again."
+        }
+        guard WorkCoordinator.shared.available else { return "Keep the app open to refresh analysis." }
+        let run = WorkCoordinator.shared.newAnalysis()
+        loadGeneration += 1
+        let generation = loadGeneration
+        isRefreshingSummary = true
+        modelProgress.begin(generation)
+        let progress = modelProgress.sink(generation)
+        await WorkGate.shared.acquire()
+        guard !run.isCancelled, WorkCoordinator.shared.available else {
+            await WorkGate.shared.release()
+            WorkCoordinator.shared.finishAnalysis(run)
+            if generation == loadGeneration { isRefreshingSummary = false }
+            return "Refresh paused. Keep the app open and try again."
+        }
+        IdleTimerLock.acquire("models")
+        dlog("models", "refresh start day=\(request.day) kind=\(request.kind.rawValue) run=\(run.id)")
+        let result: (summary: Summary, error: String?) = await withCheckedContinuation { completion in
+            DispatchQueue.global(qos: .userInitiated).async {
+                completion.resume(returning: run.perform {
+                    Core.refreshAnalysis(previous, request: request, progress: progress)
+                })
+            }
+        }
+        let canPublish = generation == loadGeneration && !run.isCancelled && WorkCoordinator.shared.available
+        if canPublish && result.error == nil {
+            s = result.summary
+            SummaryCache.save(result.summary)
+            HealthExport.shared.push(result.summary)
+        }
+        if generation == loadGeneration {
+            isRefreshingSummary = false
+            modelProgress.report(generation, nil)
+        }
+        IdleTimerLock.release("models")
+        WorkCoordinator.shared.finishAnalysis(run)
+        await WorkGate.shared.release()
+        dlog("models", "refresh end day=\(request.day) kind=\(request.kind.rawValue) cancelled=\(run.isCancelled)")
+        return canPublish ? result.error : "Refresh paused. Keep the app open and try again."
+    }
+    #endif
+
     private func load(force: Bool = false, clearCurrent: Bool = false) {
         guard force || s == nil else { return }
         let run = WorkCoordinator.shared.newAnalysis()
@@ -614,7 +735,7 @@ struct RootView: View {
             guard !run.isCancelled, WorkCoordinator.shared.available else {
                 await WorkGate.shared.release()
                 WorkCoordinator.shared.finishAnalysis(run)
-                if generation == loadGeneration { isRefreshingSummary = false; modelProgress.report(generation, "paused") }
+                if generation == loadGeneration { isRefreshingSummary = false; modelProgress.report(generation, "Analysis paused") }
                 return
             }
             IdleTimerLock.acquire("models")
@@ -641,8 +762,8 @@ struct RootView: View {
                         SummaryCache.save(full)
                         HealthExport.shared.push(full)
                     } else if s == nil { s = full }
-                    modelProgress.report(generation, full.error == nil ? nil : "refresh failed")
-                } else { modelProgress.report(generation, "paused") }
+                    modelProgress.report(generation, full.error == nil ? nil : "Couldn’t refresh data.")
+                } else { modelProgress.report(generation, "Analysis paused") }
                 isRefreshingSummary = false
             }
             dlog("models", "end run=\(run.id) cancelled=\(run.isCancelled) duration=\(Int(ProcessInfo.processInfo.systemUptime - started))s")
@@ -717,7 +838,7 @@ struct RootView: View {
                         }
                         HStack(alignment: .top, spacing: 24) {
                             VitalCell(tag: "skin temp",
-                                      value: latestTemp?.skin_temp.map { String(format: "%.1f", $0) } ?? "—",
+                                      value: latestTemp?.skin_temp.map { String(format: "%.1f", $0) } ?? "–",
                                       unit: "°c",
                                       series: recentTemperatures,
                                       detail: latestTemp.map { latestLabel(date: s.wakeYmd($0)) },
@@ -765,6 +886,18 @@ struct RootView: View {
                             }.buttonStyle(.plain)
                         }
 
+                        // nights the shared brain withheld because the ring clock was not
+                        // anchored for that boot (fixed by the next sync)
+                        if let warnings = s.clock?.warnings, !warnings.isEmpty {
+                            ObsTag("ring clock", icon: "clock.badge.exclamationmark")
+                            VStack(alignment: .leading, spacing: 6) {
+                                ForEach(warnings, id: \.self) { w in
+                                    Text("• \(w)").font(Obs.mono(11)).foregroundStyle(Obs.bad)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+
                         // on-device model failures (empty unless a torch model genuinely
                         // failed — a missing bundle or an inference error, not just no data)
                         if !s.modelErrors.isEmpty {
@@ -780,15 +913,15 @@ struct RootView: View {
                         // device & data health
                         ObsTag("device & data health", icon: "cpu")
                         VStack(spacing: 12) {
-                            ObsStat(label: "serial", value: s.device?.serial ?? "—")
-                            ObsStat(label: "firmware", value: s.device?.firmware ?? "—")
+                            ObsStat(label: "serial", value: s.device?.serial ?? "–")
+                            ObsStat(label: "firmware", value: s.device?.firmware ?? "–")
                             ObsStat(label: "battery",
-                                    value: s.device?.battery_pct.map { "\($0)%" } ?? "—",
+                                    value: s.device?.battery_pct.map { "\($0)%" } ?? "–",
                                     accent: (s.device?.battery_pct ?? 100) < 20 ? Obs.bad : Obs.ink)
                             ObsStat(label: "synced",
-                                    value: s.device.flatMap { d in d.synced.map { "\($0) \(d.synced_hm ?? "")" } } ?? "—")
+                                    value: s.device.flatMap { d in d.synced.map { "\($0) \(d.synced_hm ?? "")" } } ?? "–")
                             ObsStat(label: "days of data",
-                                    value: s.device?.days_of_data.map { String(format: "%.0f", $0) } ?? "—")
+                                    value: s.device?.days_of_data.map { String(format: "%.0f", $0) } ?? "–")
                             ObsStat(label: "nights", value: "\(s.device?.nights ?? s.nights.count)")
                         }
                         .obsCard()

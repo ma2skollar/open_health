@@ -3,6 +3,16 @@ import SQLite3
 @testable import OuraApp
 
 final class StabilityTests: XCTestCase {
+    func testOperationFailureSummaryKeepsCauseBeforeStackTrace() {
+        let cause = "2026-09-09 error [models] activity day=2026-07-06 failed: select index out of range"
+        let trace = (0..<24).map { "frame #\($0): libtorch_cpu" }.joined(separator: "\n")
+        let preview = DiagStore.incidentPreview("[diag] omitted 2 queued records\n" + cause + "\n" + trace,
+                                                kind: "operation-failure")
+        XCTAssertTrue(preview.hasPrefix(cause))
+        XCTAssertFalse(preview.contains("frame #23"))
+        XCTAssertEqual(DiagStore.incidentPreview("", kind: "operation-failure"), "")
+    }
+
     func testLeftoverSessionIsNotACrash() {
         XCTAssertEqual(DiagStore.classify("[models] complete"), "interrupted-session-cause-unknown")
         XCTAssertEqual(DiagStore.classify("[lifecycle] state=background"), "backgrounded-session")
@@ -59,6 +69,105 @@ final class StabilityTests: XCTestCase {
     }
 
     #if TORCH
+    func testAutomaticSleepOnlyFillsLatestMissingNight() {
+        let latest = NightRow(ymd: "2026-09-09", start_ds: 200, end_ds: 300, start: "23:00", end: "07:00")
+        let older = NightRow(ymd: "2026-09-08", start_ds: 100, end_ds: 190, start: "23:00", end: "07:00")
+        var savedLatest = latest
+        savedLatest.stages = [1, 2, 3, 4]
+        var savedOlder = older
+        savedOlder.stages = [2, 3, 2, 1]
+        let nights = [latest, older]
+
+        let firstLaunch = Core.automaticSleepPlan(nights: nights, previous: nil)
+        XCTAssertEqual(firstLaunch.pending.map(\.start_ds), [200])
+        let missingLatest = Core.automaticSleepPlan(nights: nights, previous: Summary(nights: [savedOlder]))
+        XCTAssertEqual(missingLatest.pending.map(\.start_ds), [200])
+        XCTAssertEqual(missingLatest.saved["100"], savedOlder.stages)
+        let missingOlder = Core.automaticSleepPlan(nights: nights, previous: Summary(nights: [savedLatest]))
+        XCTAssertTrue(missingOlder.pending.isEmpty)
+        let reopen = Core.automaticSleepPlan(nights: nights, previous: Summary(nights: [savedLatest, savedOlder]))
+        XCTAssertTrue(reopen.pending.isEmpty)
+        XCTAssertEqual(reopen.saved.count, 2)
+
+        var changed = latest
+        changed.end_ds = 310
+        XCTAssertEqual(Core.automaticSleepPlan(nights: [changed, older], previous: Summary(nights: [savedLatest])).pending.count, 1)
+        XCTAssertTrue(Core.automaticSleepPlan(nights: [], previous: nil).pending.isEmpty)
+    }
+
+    func testAutomaticSleepPicksTheNightWokenFromMostRecently() {
+        // List order is not trusted: a misdated older night could sort first.
+        var real = NightRow(ymd: "2026-09-10", start_ds: 900, end_ds: 990, start: "23:00", end: "08:00")
+        real.wake_ymd = "2026-09-11"; real.end_unix = 1_789_020_000
+        var older = NightRow(ymd: "2026-09-09", start_ds: 500, end_ds: 590, start: "23:30", end: "07:30")
+        older.wake_ymd = "2026-09-10"; older.end_unix = 1_788_933_600
+        XCTAssertEqual(Core.automaticSleepPlan(nights: [older, real], previous: nil).pending.map(\.start_ds), [900])
+        // Without absolute bounds (older cached summary) the wake date decides.
+        real.end_unix = nil; older.end_unix = nil
+        XCTAssertEqual(Core.automaticSleepPlan(nights: [older, real], previous: nil).pending.map(\.start_ds), [900])
+    }
+
+    func testWakeDateComesFromTheSharedBrainWhenPresent() {
+        var night = NightRow(ymd: "2026-09-10", start_ds: 1, end_ds: 2, start: "07:11", end: "15:33")
+        XCTAssertEqual(Summary().wakeYmd(night), "2026-09-10")   // legacy heuristic: no midnight crossing
+        night.wake_ymd = "2026-09-11"
+        XCTAssertEqual(Summary().wakeYmd(night), "2026-09-11")
+    }
+
+    func testHistoricalActivityRefreshBypassesCacheAndPreservesOtherDays() throws {
+        let url = try fixture()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let file = "test-activity-\(UUID().uuidString).json"
+        let cacheURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(file)
+        defer { try? FileManager.default.removeItem(at: cacheURL) }
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        let calendar = Calendar.current
+        let midnight = calendar.date(from: DateComponents(year: 2026, month: 7, day: 6))!
+        let next = calendar.date(byAdding: .day, value: 1, to: midnight)!
+        let unix = Int64(midnight.timeIntervalSince1970)
+        let nextUnix = Int64(next.timeIntervalSince1970)
+        let met = String(data: try JSONSerialization.data(withJSONObject: ["met": Array(repeating: 1.2, count: 720)]), encoding: .utf8)!
+        let sql = """
+        DELETE FROM events;
+        INSERT INTO events VALUES (1,5000000,66,'{"unix_time":\(unix)}',\(unix),NULL);
+        INSERT INTO events VALUES (2,5000000,80,'\(met)',\(unix),NULL);
+        INSERT INTO events VALUES (3,\(5000000 + (nextUnix - unix) * 10),80,'\(met)',\(nextUnix),NULL);
+        """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+        let events = try EventStore.decodedEvents(dbPath: url.path)
+        let clock = EventStore.RingClock(events: events)
+        let key = ModelCacheStore.globalKey(profile: nil)
+        let unrelated = ActivityDayEntry(fp: "preserve-this-day", sessions: [])
+        ModelCacheStore.save(file, globalKey: key, entries: ["2026-07-07": unrelated])
+
+        let first = ActivityModel.run(profile: nil, events: events, clock: clock,
+                                      onlyDay: "2026-07-06", force: true, cacheFile: file)
+        XCTAssertNil(first.error)
+        var cache: [String: ActivityDayEntry] = ModelCacheStore.load(file, globalKey: key)
+        XCTAssertEqual(cache["2026-07-07"]?.fp, unrelated.fp)
+        var old = try XCTUnwrap(cache["2026-07-06"])
+        old.sessions = [WorkoutSession(start: "2026-07-06 01:00", end: "01:10", durationMin: 10,
+                                       label: "stale cached result", isWorkout: 1)]
+        cache["2026-07-06"] = old
+        ModelCacheStore.save(file, globalKey: key, entries: cache)
+        let cached = ActivityModel.run(profile: nil, events: events, clock: clock,
+                                       onlyDay: "2026-07-06", cacheFile: file)
+        XCTAssertEqual(cached.sessions.first?.label, "stale cached result")
+        let refreshed = ActivityModel.run(profile: nil, events: events, clock: clock,
+                                          onlyDay: "2026-07-06", force: true, cacheFile: file)
+        XCTAssertNil(refreshed.error)
+        XCTAssertTrue(refreshed.sessions.isEmpty)
+        cache = ModelCacheStore.load(file, globalKey: key)
+        XCTAssertTrue(try XCTUnwrap(cache["2026-07-06"]).sessions.isEmpty)
+        XCTAssertEqual(cache["2026-07-07"]?.fp, unrelated.fp)
+        let missing = ActivityModel.run(profile: nil, events: events, clock: clock,
+                                        onlyDay: "2026-07-05", force: true, cacheFile: file)
+        XCTAssertNotNil(missing.error)
+    }
+
     func testActivitySparseDayReturnsNoWorkouts() throws {
         let path = try XCTUnwrap(Bundle.main.path(forResource: "automatic_activity_detection_3_1_11", ofType: "ptl"))
         let nan = Float.nan
@@ -158,6 +267,85 @@ final class StabilityTests: XCTestCase {
         XCTAssertEqual(result.segments?.count, 4000 * 1500)
         XCTAssertEqual(result.segments?.first, 3001)
         XCTAssertEqual(result.segments?.last, Float(4002 * 1500))
+    }
+
+    func testRtcBeaconDatesSleepIndependentlyOfDownloadTime() throws {
+        for previousBoot in [false, true] {
+            let url = try fixture()
+            defer { try? FileManager.default.removeItem(at: url) }
+            var db: OpaquePointer?
+            XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+            let sql = """
+            DELETE FROM events;
+            \(previousBoot ? "INSERT INTO events VALUES (1,5000000,66,'{\"unix_time\":1788800000}',1788800000,NULL);" : "")
+            INSERT INTO events VALUES (2,672400,1,'{}',1789056420,NULL);
+            INSERT INTO events VALUES (3,1000000,133,'{"unix_time":1789020420}',1789056420,NULL);
+            """
+            XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+            sqlite3_close(db)
+            let events = try EventStore.decodedEvents(dbPath: url.path)
+            let clock = EventStore.RingClock(events: events)
+            // UTC+1: Sep 9 22:01 -> Sep 10 07:07, downloaded at 17:07.
+            XCTAssertEqual(clock.unixSeconds(672400, capturedUnix: 1789056420), 1788987660)
+            XCTAssertEqual(clock.unixSeconds(1000000, capturedUnix: 1789056420), 1789020420)
+            XCTAssertEqual(clock.latestUnix, 1789020420)
+            if previousBoot {
+                XCTAssertEqual(clock.unixSeconds(5000000, capturedUnix: 1788800000), 1788800000)
+            }
+            try events.validate()
+        }
+    }
+
+    func testUnanchoredBootIsUndatedInsteadOfDatedToDownloadTime() throws {
+        // A rebooted ring drained in one go with no time_sync/rtc_beacon: dating the
+        // night to the download would show 07:11→15:33 instead of 23:00→08:00, and
+        // projecting it through the previous boot's clock would land it days earlier.
+        let url = try fixture()
+        defer { try? FileManager.default.removeItem(at: url) }
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        let sql = """
+        DELETE FROM events;
+        INSERT INTO events VALUES (1,5000000,66,'{"unix_time":1788800000}',1788800000,NULL);
+        INSERT INTO events VALUES (2,5100000,1,'{}',1788800000,NULL);
+        INSERT INTO events VALUES (3,10,1,'{}',1789056420,NULL);
+        INSERT INTO events VALUES (4,300000,118,'{"bedtime_start_ds":300000}',1789056420,NULL);
+        INSERT INTO events VALUES (5,700000,1,'{}',1789056420,NULL);
+        """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+        let events = try EventStore.decodedEvents(dbPath: url.path)
+        let clock = EventStore.RingClock(events: events)
+        let resolved = clock.resolve(300000, capturedUnix: 1789056420)
+        XCTAssertEqual(resolved.source, .undated)
+        XCTAssertFalse(resolved.source.isDated)
+        XCTAssertNotEqual(resolved.unix, 1788800000 + Double(300000 - 5000000) / 10)
+        XCTAssertEqual(clock.resolve(5100000, capturedUnix: 1788800000).source, .anchor)
+        try events.validate()
+    }
+
+    func testPhoneAnchorDatesANewBoot() throws {
+        // The sync wrote a phone-time anchor at the newest drained ds: 23:00→08:00 UTC+2.
+        let url = try fixture()
+        defer { try? FileManager.default.removeItem(at: url) }
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        let sql = """
+        DELETE FROM events;
+        INSERT INTO events VALUES (1,5000000,66,'{"unix_time":1788800000}',1788800000,NULL);
+        INSERT INTO events VALUES (2,10,1,'{}',1789056420,NULL);
+        INSERT INTO events VALUES (3,705000,66,'{"unix_time":1789056420,"source":"phone"}',1789056420,NULL);
+        """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+        let events = try EventStore.decodedEvents(dbPath: url.path)
+        let clock = EventStore.RingClock(events: events)
+        let startDs: Int64 = 705000 - (1789056420 - 1789002000) * 10
+        let endDs: Int64 = 705000 - (1789056420 - 1789020000) * 10
+        XCTAssertEqual(clock.resolve(startDs, capturedUnix: 1789056420).source, .anchor)
+        XCTAssertEqual(clock.unixSeconds(startDs, capturedUnix: 1789056420), 1789002000)
+        XCTAssertEqual(clock.unixSeconds(endDs, capturedUnix: 1789056420), 1789020000)
+        try events.validate()
     }
 
     func testStreamIsRepeatableAndKeepsRebootOrder() throws {

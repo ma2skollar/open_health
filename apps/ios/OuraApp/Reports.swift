@@ -335,7 +335,7 @@ struct Polysomnograph: View {
         guard let s = lane.signal else { return "" }
         let fmt = { (x: Double) in s.dp > 0 ? String(format: "%.\(s.dp)f", x) : String(Int(x.rounded())) }
         if let f = cursorF {
-            guard f >= s.span[0], f <= s.span[1] else { return "—" }
+            guard f >= s.span[0], f <= s.span[1] else { return "–" }
             let local = (f - s.span[0]) / max(1e-9, s.span[1] - s.span[0])
             let v = s.v[min(s.v.count - 1, max(0, Int(local * Double(s.v.count - 1))))]
             return "\(fmt(v)) \(lane.unit)"
@@ -500,7 +500,8 @@ struct SleepDebtCard: View {
 // A readable summary first; personal ranges are available on demand.
 struct IllnessCard: View {
     let illness: IllnessResult
-    @State private var showRanges = false
+    @State private var showDetails = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private static let names = [
         "AverageBreath": "Breathing rate", "LowestHeartRate": "Lowest heart rate",
@@ -537,7 +538,7 @@ struct IllnessCard: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
                 Text("Symptom radar").font(.headline).foregroundStyle(Obs.ink)
                 Spacer(minLength: 12)
@@ -552,30 +553,43 @@ struct IllnessCard: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if illness.available {
+                Button {
+                    withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.2)) {
+                        showDetails.toggle()
+                    }
+                } label: {
+                    HStack {
+                        Text(showDetails ? "Hide details" : "View details")
+                        Spacer()
+                        Image(systemName: showDetails ? "chevron.up" : "chevron.down")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(Obs.ink2)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityValue(showDetails ? "Expanded" : "Collapsed")
+                .accessibilityHint("Shows overnight measurements and personal ranges")
+            }
+            if illness.available && showDetails {
                 Rectangle().fill(Obs.rule).frame(height: 1)
+                Text("Overnight measurements")
+                    .font(.subheadline.weight(.medium)).foregroundStyle(Obs.ink)
                 VStack(alignment: .leading, spacing: 18) {
                     ForEach(Self.order, id: \.self) { type in
                         if let biomarker = illness.biomarkers.first(where: { $0.type == type }) {
                             BiomarkerRow(name: Self.names[type] ?? type,
-                                         unit: Self.units[type] ?? "", biomarker: biomarker,
-                                         showRange: showRanges)
+                                         unit: Self.units[type] ?? "", biomarker: biomarker)
                         }
                     }
                 }
-                VStack(alignment: .leading, spacing: 2) {
-                    Button { showRanges.toggle() } label: {
-                        HStack(spacing: 6) {
-                            Text(showRanges ? "Hide personal ranges" : "Show personal ranges")
-                            Image(systemName: showRanges ? "chevron.up" : "chevron.down")
-                                .font(.caption2.weight(.semibold))
-                        }
-                        .font(.footnote.weight(.medium))
-                        .foregroundStyle(Obs.ink2)
-                        .frame(minHeight: 44)
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityValue(showRanges ? "Expanded" : "Collapsed")
+                if illness.biomarkers.isEmpty {
+                    Text("Measurement details aren’t available for this result.")
+                        .font(.subheadline).foregroundStyle(Obs.muted)
+                }
+                VStack(alignment: .leading, spacing: 4) {
                     Text("Based on \(illness.daysWithData) nights in the past 30 days")
                         .font(.caption).foregroundStyle(Obs.muted)
                         .fixedSize(horizontal: false, vertical: true)
@@ -591,7 +605,7 @@ private struct BiomarkerRow: View {
     let name: String
     let unit: String
     let biomarker: IllnessBiomarker
-    let showRange: Bool
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     private var change: String {
         switch biomarker.reason {
@@ -601,17 +615,20 @@ private struct BiomarkerRow: View {
         }
     }
     private func formatted(_ value: Double) -> String {
-        guard value.isFinite else { return "—" }
+        guard value.isFinite else { return "–" }
         return unit == "°C"
             ? value.formatted(.number.precision(.fractionLength(1)))
             : value.formatted(.number.precision(.fractionLength(0...1)))
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack(alignment: .firstTextBaseline, spacing: 12) {
+            let layout = dynamicTypeSize.isAccessibilitySize
+                ? AnyLayout(VStackLayout(alignment: .leading, spacing: 4))
+                : AnyLayout(HStackLayout(alignment: .firstTextBaseline, spacing: 12))
+            layout {
                 Text(name).font(.subheadline).foregroundStyle(Obs.ink2)
                     .fixedSize(horizontal: false, vertical: true)
-                Spacer(minLength: 0)
+                if !dynamicTypeSize.isAccessibilitySize { Spacer(minLength: 0) }
                 Text("\(formatted(biomarker.value)) \(unit)")
                     .font(.subheadline.weight(.medium)).monospacedDigit()
                     .foregroundStyle(biomarker.indicatesSymptoms ? Obs.alert : Obs.ink)
@@ -620,10 +637,12 @@ private struct BiomarkerRow: View {
             if biomarker.indicatesSymptoms {
                 Text(change).font(.caption).foregroundStyle(Obs.alert)
             }
-            if showRange {
-                Text("Usual range: \(formatted(biomarker.lower))–\(formatted(biomarker.upper)) \(unit)")
+            if biomarker.lower.isFinite && biomarker.upper.isFinite && biomarker.lower <= biomarker.upper {
+                Text("Personal range: \(formatted(biomarker.lower)) to \(formatted(biomarker.upper)) \(unit)")
                     .font(.caption).foregroundStyle(Obs.muted)
                     .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("Personal range unavailable").font(.caption).foregroundStyle(Obs.muted)
             }
         }
         .accessibilityElement(children: .combine)
@@ -711,12 +730,32 @@ struct SleepDebtDetail: View {
 }
 
 // ── the full-page report (sleep ⇄ activity) ──────────────────────────────────
+struct DayAnalysisContext {
+    var summary: Summary?
+    var isBusy: Bool
+    var refresh: (DayAnalysisRequest) async -> String?
+}
+
+private struct DayAnalysisContextKey: EnvironmentKey {
+    static let defaultValue: DayAnalysisContext? = nil
+}
+
+extension EnvironmentValues {
+    var dayAnalysis: DayAnalysisContext? {
+        get { self[DayAnalysisContextKey.self] }
+        set { self[DayAnalysisContextKey.self] = newValue }
+    }
+}
+
 struct DayReportView: View {
     let s: Summary
     let day: String
     @State var tab: Tab
     @Environment(\.dismiss) private var dismiss
-    enum Tab: String, CaseIterable { case sleep = "Sleep", activity = "Activity" }
+    @Environment(\.dayAnalysis) private var analysis
+    @State private var refreshing: Tab?
+    @State private var refreshMessages: [String: String] = [:]
+    typealias Tab = DayAnalysisKind
 
     var body: some View {
         ZStack {
@@ -741,13 +780,45 @@ struct DayReportView: View {
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 26) {
-                        if tab == .sleep { SleepReport(s: s, day: day) }
-                        else { ActivityReport(s: s, day: day) }
+                        if let analysis {
+                            VStack(alignment: .leading, spacing: 6) {
+                                Button {
+                                    let selected = tab
+                                    refreshing = selected
+                                    refreshMessages[selected.rawValue] = nil
+                                    Task {
+                                        let error = await analysis.refresh(DayAnalysisRequest(day: day, kind: selected))
+                                        refreshMessages[selected.rawValue] = error ?? "Analysis updated."
+                                        refreshing = nil
+                                    }
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        if refreshing == tab { ProgressView().controlSize(.small) }
+                                        else { Image(systemName: "arrow.clockwise") }
+                                        Text(refreshing == tab ? "Refreshing analysis…" : "Refresh analysis")
+                                    }
+                                    .font(.subheadline.weight(.medium))
+                                    .frame(minHeight: 44)
+                                }
+                                .buttonStyle(.plain).foregroundStyle(Obs.ink2)
+                                .disabled(refreshing != nil || analysis.isBusy)
+                                Text(refreshMessages[tab.rawValue]
+                                     ?? (refreshing == tab ? "Keep the app open while analysis runs."
+                                         : analysis.isBusy ? "Available when sync and analysis finish."
+                                         : "Rerun \(tab.rawValue.lowercased()) analysis for this day using saved ring data."))
+                                    .font(.footnote).foregroundStyle(Obs.muted)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .accessibilityAddTraits(.updatesFrequently)
+                            }
+                        }
+                        if tab == .sleep { SleepReport(s: analysis?.summary ?? s, day: day) }
+                        else { ActivityReport(s: analysis?.summary ?? s, day: day) }
                     }
                     .padding(20).padding(.bottom, 60)
                 }
             }
         }
+        .toolbar(.hidden, for: .navigationBar)
     }
 }
 
@@ -761,18 +832,18 @@ struct SleepReport: View {
 
             // summary strip
             HStack(alignment: .top, spacing: 0) {
-                Readout(value: n.in_bed_h.map { String(format: "%.1f h", $0) } ?? "—", caption: "in bed")
-                Readout(value: asleepH.map { String(format: "%.1f h", $0) } ?? "—", caption: "asleep")
-                Readout(value: n.efficiency.map { "\(Int($0))%" } ?? "—", caption: "efficiency")
-                Readout(value: "\(n.start ?? "—")–\(n.end ?? "—")", caption: "bedtime")
+                Readout(value: n.in_bed_h.map { String(format: "%.1f h", $0) } ?? "–", caption: "in bed")
+                Readout(value: asleepH.map { String(format: "%.1f h", $0) } ?? "–", caption: "asleep")
+                Readout(value: n.efficiency.map { "\(Int($0))%" } ?? "–", caption: "efficiency")
+                Readout(value: "\(n.start ?? "–")–\(n.end ?? "–")", caption: "bedtime")
             }
 
             if n.hasHypnogram {
-                Rule("overnight polysomnograph")
+                Rule("Sleep stages & signals")
                 stageLegend
                 Polysomnograph(night: n)
 
-                Rule("sleep architecture")
+                Rule("Sleep stages")
                 StageBar(n: n)
                 HStack(spacing: 16) {
                     ForEach([("Deep", n.deep_pct), ("Light", n.light_pct), ("REM", n.rem_pct), ("Awake", n.wake_pct)], id: \.0) { name, pct in
@@ -785,11 +856,11 @@ struct SleepReport: View {
                 let auto = Sleep.autonomic(hr: n.series?.hr ?? [], hrv: n.series?.hrv ?? [],
                                            stages: Sleep.smooth(n.stages ?? [], 5))
                 if auto.any {
-                    Rule("autonomic recovery by stage")
+                    Rule("Heart rate & HRV by stage")
                     autonomicGrid(auto)
                 }
 
-                Rule("interpretation")
+                Rule("Sleep summary")
                 interpretation(n, metrics)
             } else {
                 // model-free build: signals only, no hypnogram
@@ -797,7 +868,7 @@ struct SleepReport: View {
                     Rule("overnight signals")
                     Polysomnograph(night: n)
                 }
-                Text("On-device sleep staging (SleepNet) runs in the torch build — the hypnogram, sleep cycles, and stage metrics appear there. The raw signals above are model-free.")
+                Text("Sleep analysis is not available for this night yet.")
                     .font(Obs.mono(12)).foregroundStyle(Obs.ink2).fixedSize(horizontal: false, vertical: true)
             }
         } else {
@@ -822,7 +893,7 @@ struct SleepReport: View {
     }
 
     @ViewBuilder private func clinicalGrid(_ m: SleepMetrics) -> some View {
-        let mins = { (x: Double?) in x.map { "\(Int($0.rounded())) min" } ?? "—" }
+        let mins = { (x: Double?) in x.map { "\(Int($0.rounded())) min" } ?? "–" }
         let cells: [(String, String)] = [
             ("sleep onset", mins(m.solMin)),
             ("rem latency", mins(m.remLatencyMin)),
@@ -838,8 +909,8 @@ struct SleepReport: View {
     }
 
     @ViewBuilder private func autonomicGrid(_ a: StageAutonomic) -> some View {
-        let hrv = { (x: Double?) in x.map { "\(Int($0)) ms" } ?? "—" }
-        let hr = { (x: Double?) in x.map { "\(Int($0)) bpm" } ?? "—" }
+        let hrv = { (x: Double?) in x.map { "\(Int($0)) ms" } ?? "–" }
+        let hr = { (x: Double?) in x.map { "\(Int($0)) bpm" } ?? "–" }
         let cells: [(String, String)] = [
             ("hrv · deep", hrv(a.hrvDeep)), ("hrv · light", hrv(a.hrvLight)), ("hrv · rem", hrv(a.hrvRem)),
             ("hr · deep", hr(a.hrDeep)), ("hr · light", hr(a.hrLight)), ("hr · rem", hr(a.hrRem)),
@@ -869,13 +940,10 @@ struct SleepReport: View {
     private func sentences(_ n: NightRow, _ m: SleepMetrics?) -> [String] {
         var out: [String] = []
         if let e = n.efficiency {
-            out.append(e >= 85 ? "Sleep efficiency of \(Int(e))% is solid — little time awake once down."
-                : e >= 75 ? "Efficiency \(Int(e))% is fair; some fragmentation kept you from deeper rest."
-                : "Efficiency \(Int(e))% is low — much of the night in bed wasn't spent asleep.")
+            out.append("You spent \(Int(e))% of your time in bed asleep.")
         }
         if let dp = n.deep_pct {
-            out.append(dp < 10 ? "Deep sleep was scarce (\(Int(dp))%), the physically-restorative stage — often suppressed by late meals, alcohol, or stress."
-                : "Deep sleep \(Int(dp))% (target ~13–23%), the physically-restorative stage.")
+            out.append("Deep sleep made up \(Int(dp))% of recorded sleep.")
         }
         if let rp = n.rem_pct, let rl = m?.remLatencyMin {
             out.append("REM was \(Int(rp))% with first REM \(Int(rl.rounded())) min after onset.")
@@ -897,8 +965,8 @@ struct ActivityReport: View {
 
         HStack(alignment: .top, spacing: 0) {
             Readout(value: steps.value, caption: steps.unit)
-            Readout(value: st.map { "\(Int($0.active_kcal ?? 0))" } ?? "—", caption: "active kcal")
-            Readout(value: st.map { "\(Int($0.total_kcal ?? 0))" } ?? "—", caption: "total kcal")
+            Readout(value: st.map { "\(Int($0.active_kcal ?? 0))" } ?? "–", caption: "active kcal")
+            Readout(value: st.map { "\(Int($0.total_kcal ?? 0))" } ?? "–", caption: "total kcal")
             if let d = st?.distance_m { Readout(value: String(format: "%.1f", d / 1000), caption: "distance · km") }
         }
 
@@ -929,7 +997,7 @@ struct ActivityReport: View {
 }
 
 private func compactSteps(_ steps: Double?) -> (value: String, unit: String) {
-    guard let steps else { return ("—", "steps") }
+    guard let steps else { return ("–", "steps") }
     guard steps >= 1_000 else { return ("\(Int(steps.rounded()))", "steps") }
     return (String(format: "%.1f", steps / 1_000), "k steps")
 }

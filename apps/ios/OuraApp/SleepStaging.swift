@@ -20,6 +20,7 @@ enum SleepStaging {
     // Returns date-key → stage codes, plus a non-nil `error` only for genuine failures
     // (bundled model missing). An empty map with `error == nil` just means no sleep data.
     static func run(nights: [NightRow], events: EventStore.Events, clock: EventStore.RingClock,
+                    force: Bool = false, pruneCache: Bool = true,
                     progress: @escaping @Sendable (String) -> Void = { _ in }) -> (staged: [String: [Int]], error: String?) {
         guard let modelPath = Bundle.main.path(forResource: "sleepnet_moonstone_1_2_0", ofType: "ptl")
         else { return ([:], "sleep model file missing from the app bundle") }
@@ -62,29 +63,39 @@ enum SleepStaging {
         var result: [String: [Int]] = [:]
         var currentKeys = Set<String>()
         var recomputed = 0
-        for (index, bed) in beds.enumerated() {
+        // Count only the nights that actually need the model, so the progress pill
+        // reads "night 1 of 1" on a normal launch instead of the whole history.
+        var pending: [(key: String, fp: String, inputs: NightInputs)] = []
+        for bed in beds {
             guard !AnalysisRun.cancelled, events.error == nil else { return ([:], "analysis interrupted") }
             guard let inputs = nightInputs(start: bed.start, end: bed.end, cu: bed.cu,
                                            events: events, clock: clock) else { continue }
             guard events.error == nil else { return ([:], "event read failed") }
             let key = String(bed.start), fp = fingerprint(inputs)
             currentKeys.insert(key)
-            if let entry = cache[key], entry.fp == fp {
+            if !force, let entry = cache[key], entry.fp == fp {
                 if !entry.stages.isEmpty { result[key] = entry.stages }
             } else {
-                progress("staging sleep · night \(index + 1)/\(beds.count)")
-                guard !AnalysisRun.cancelled else { return ([:], "analysis paused") }
-                guard let stages = stageNight(inputs, modelPath: modelPath) else { return (result, "sleep inference failed") }
-                result[key] = stages
-                cache[key] = StagedNightEntry(fp: fp, stages: stages)
-                ModelCacheStore.save(ModelCacheStore.stagingFile, globalKey: globalKey, entries: cache)
-                recomputed += 1
+                pending.append((key, fp, inputs))
             }
+        }
+        for (index, night) in pending.enumerated() {
+            let key = night.key, fp = night.fp, inputs = night.inputs
+            progress("Analyzing sleep · night \(index + 1) of \(pending.count)")
+            guard !AnalysisRun.cancelled else { return ([:], "analysis paused") }
+            guard let stages = stageNight(inputs, modelPath: modelPath) else { return (result, "sleep inference failed") }
+            // A manual refresh with insufficient data must not erase a useful
+            // cached hypnogram. The caller reports that no result was produced.
+            if force && stages.isEmpty { continue }
+            result[key] = stages
+            cache[key] = StagedNightEntry(fp: fp, stages: stages)
+            ModelCacheStore.save(ModelCacheStore.stagingFile, globalKey: globalKey, entries: cache)
+            recomputed += 1
         }
         guard events.error == nil, !AnalysisRun.cancelled else { return ([:], "analysis interrupted") }
         dlog("models", "sleep recomputed=\(recomputed) total=\(currentKeys.count)")
         let pruned = cache.filter { currentKeys.contains($0.key) }
-        if pruned.count != cache.count {
+        if pruneCache && pruned.count != cache.count {
             ModelCacheStore.save(ModelCacheStore.stagingFile, globalKey: globalKey, entries: pruned)
         }
         return (result, nil)

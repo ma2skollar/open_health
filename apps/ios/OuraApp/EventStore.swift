@@ -60,7 +60,7 @@ enum EventStore {
                     source.fail(ReadError.open(message())); finished = true; return
                 }
                 sqlite3_busy_timeout(db, 5000)
-                let json = source.metadata ? "CASE WHEN tag=66 THEN decoded_json ELSE '{}' END" : "decoded_json"
+                let json = source.metadata ? "CASE WHEN tag IN (66,133) THEN decoded_json ELSE '{}' END" : "decoded_json"
                 let body = source.metadata ? "NULL" : "CASE WHEN tag IN (126,127) THEN body ELSE NULL END"
                 let sql = "SELECT ring_timestamp,tag,\(json),captured_unix,\(body) FROM events WHERE decoded_json IS NOT NULL AND \(source.predicate) ORDER BY captured_unix,id"
                 guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
@@ -84,7 +84,7 @@ enum EventStore {
                 return autoreleasepool {
                     let tag = Int(sqlite3_column_int(statement, 1))
                     var json: [String: Any] = [:]
-                    if tag != 0x7e && tag != 0x7f && (!source.metadata || tag == 66) {
+                    if tag != 0x7e && tag != 0x7f && (!source.metadata || tag == 66 || tag == 133) {
                         guard let text = sqlite3_column_text(statement, 2),
                               let data = String(cString: text).data(using: .utf8),
                               let parsed = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -128,8 +128,15 @@ enum EventStore {
         private static let epochResetSlackDs: Int64 = 6 * 3600 * 10
         private static let futureSlackSeconds: Int64 = 6 * 3600
 
+        /// How a wall-clock time was obtained. Mirrors `ClockSource` in ring_time.rs:
+        /// only `anchor`/`projected` are trustworthy; `downloadTime` is off by up to a
+        /// sync gap and `undated` means nothing ties that boot to real time.
+        enum Source: String { case anchor, projected, downloadTime = "download_time", undated
+            var isDated: Bool { self == .anchor || self == .projected }
+        }
+
         private let epochs: [Epoch]
-        private let anchorOffsetsDs: [Int64]
+        private let anchorOffsetsDs: [(offset: Int64, epoch: Int)]
 
         init(events: Events) {
             precondition(!events.isEmpty)
@@ -144,14 +151,14 @@ enum EventStore {
                     epoch.minDs = min(epoch.minDs, event.ds)
                     epoch.captureMin = min(epoch.captureMin, event.cu)
                     epoch.captureMax = max(epoch.captureMax, event.cu)
-                    if event.tag == 0x42,
+                    if (event.tag == 0x42 || event.tag == 0x85),
                        let unix = (event.json["unix_time"] as? NSNumber)?.int64Value {
                         epoch.anchors.append((event.ds, unix))
                     }
                     built[built.count - 1] = epoch
                 } else {
                     var anchors: [(Int64, Int64)] = []
-                    if event.tag == 0x42,
+                    if (event.tag == 0x42 || event.tag == 0x85),
                        let unix = (event.json["unix_time"] as? NSNumber)?.int64Value {
                         anchors.append((event.ds, unix))
                     }
@@ -161,14 +168,18 @@ enum EventStore {
                 }
             }
             epochs = built
-            anchorOffsetsDs = built.flatMap(\.anchors)
-                .map { $0.unix * 10 - $0.ds }
-                .sorted()
+            anchorOffsetsDs = built.enumerated()
+                .flatMap { index, epoch in epoch.anchors.map { ($0.unix * 10 - $0.ds, index) } }
+                .sorted { $0.0 < $1.0 }
         }
 
-        /// Map a raw ds to wall-clock seconds via the ring's authoritative time-sync.
+        /// Map a raw ds to wall-clock seconds via time-sync or RTC beacon anchors.
         /// `capturedUnix` selects the right boot when ds ranges overlap.
         func unixSeconds(_ ds: Int64, capturedUnix: Int64? = nil) -> Double {
+            resolve(ds, capturedUnix: capturedUnix).unix
+        }
+
+        func resolve(_ ds: Int64, capturedUnix: Int64? = nil) -> (unix: Double, source: Source) {
             let candidates = epochs.filter {
                 ds >= $0.minDs - Self.epochResetSlackDs
                     && ds <= $0.maxDs + Self.epochResetSlackDs
@@ -187,18 +198,25 @@ enum EventStore {
                 let predicted = Double(anchor.unix) + Double(ds - anchor.ds) / 10.0
                 if capturedUnix == nil
                     || predicted <= Double(capturedUnix! + Self.futureSlackSeconds) {
-                    return predicted
+                    return (predicted, .anchor)
                 }
             }
             if let capturedUnix,
                let predicted = latestPlausibleProjection(ds, capturedUnix: capturedUnix) {
-                return predicted
+                return (predicted, .projected)
             }
+            // Download-time arithmetic only when the phone kept up with the ring (capture
+            // span comparable to the ds span). A boot downloaded in one go would be dated
+            // to the sync moment, so it is reported undated instead.
+            let dsSpan = Double(epoch.maxDs - epoch.minDs) / 10.0
+            let captureSpan = Double(epoch.captureMax - epoch.captureMin)
+            let incremental = dsSpan <= 0 || captureSpan * 2 >= dsSpan
             let fallback = Double(epoch.fallbackAnchorUnix)
                 - Double(epoch.maxDs - ds) / 10.0
-            return capturedUnix.map {
+            let unix = capturedUnix.map {
                 min(fallback, Double($0 + Self.futureSlackSeconds))
             } ?? fallback
+            return (unix, incremental ? .downloadTime : .undated)
         }
 
         var latestUnix: Int64 {
@@ -218,14 +236,24 @@ enum EventStore {
             var high = anchorOffsetsDs.count
             while low < high {
                 let middle = low + (high - low) / 2
-                if anchorOffsetsDs[middle] <= maxOffset {
+                if anchorOffsetsDs[middle].offset <= maxOffset {
                     low = middle + 1
                 } else {
                     high = middle
                 }
             }
-            guard low > 0 else { return nil }
-            return Double(ds + anchorOffsetsDs[low - 1]) / 10.0
+            // Borrowing another boot's clock is only legitimate when this ds continues
+            // that boot's counter: a new boot restarts near zero and must never be
+            // projected through an older boot that only ran at higher counts.
+            var index = low - 1
+            while index >= 0 {
+                let candidate = anchorOffsetsDs[index]
+                if ds >= epochs[candidate.epoch].minDs - Self.epochResetSlackDs {
+                    return Double(ds + candidate.offset) / 10.0
+                }
+                index -= 1
+            }
+            return nil
         }
     }
 }

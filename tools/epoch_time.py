@@ -1,4 +1,4 @@
-"""Epoch-aware ring deciseconds -> wall clock, anchored by ring time-sync events."""
+"""Epoch-aware ring deciseconds -> wall clock, anchored by time-sync and RTC events."""
 
 import json
 
@@ -31,7 +31,7 @@ def build_epochs(rows):
             e[0], e[3], e[4] = min(e[0], ds), min(e[3], cu), max(e[4], cu)
         else:
             epochs.append([ds, ds, cu, cu, cu, []])
-        if tag == 0x42 and js:
+        if tag in (0x42, 0x85) and js:
             try:
                 unix = json.loads(js).get("unix_time")
                 if unix is not None:
@@ -64,14 +64,43 @@ def make_unix_s(epochs):
             if captured_unix is None or predicted <= captured_unix + FUTURE_SLACK_S:
                 return predicted
         if captured_unix is not None:
+            # Only borrow a boot's clock when this ds continues that boot's counter;
+            # a rebooted ring restarts near zero and must not be projected through an
+            # older boot that only ran at higher counts.
             plausible = [unix + (ds - anchor_ds) / 10.0
                          for epoch in epochs for anchor_ds, unix in epoch[5]
-                         if unix + (ds - anchor_ds) / 10.0 <= captured_unix + FUTURE_SLACK_S]
+                         if unix + (ds - anchor_ds) / 10.0 <= captured_unix + FUTURE_SLACK_S
+                         and ds >= epoch[0] - EPOCH_RESET_SLACK_DS]
             if plausible:
                 return max(plausible)
         fallback = e[2] - (e[1] - ds) / 10.0
         return min(fallback, captured_unix + FUTURE_SLACK_S) if captured_unix is not None else fallback
     return unix_s
+
+
+def is_dated(epochs, ds, captured_unix):
+    """False when the boot holding `ds` has no anchor and was downloaded in one go
+    (so the only available time is the download time). Mirrors `ClockSource::is_dated`."""
+    candidates = [e for e in epochs
+                  if e[0] - EPOCH_RESET_SLACK_DS <= ds <= e[1] + EPOCH_RESET_SLACK_DS]
+    if not candidates:
+        return False
+    def capture_distance(e):
+        if captured_unix < e[3]:
+            return e[3] - captured_unix
+        if captured_unix > e[4]:
+            return captured_unix - e[4]
+        return 0
+    e = min(candidates, key=capture_distance)
+    if e[5]:
+        anchor_ds, anchor_unix = min(e[5], key=lambda a: abs(a[0] - ds))
+        if anchor_unix + (ds - anchor_ds) / 10.0 <= captured_unix + FUTURE_SLACK_S:
+            return True
+    if any(unix + (ds - anchor_ds) / 10.0 <= captured_unix + FUTURE_SLACK_S
+           and ds >= epoch[0] - EPOCH_RESET_SLACK_DS
+           for epoch in epochs for anchor_ds, unix in epoch[5]):
+        return True
+    return False
 
 
 def latest_unix(epochs):

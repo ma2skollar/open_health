@@ -14,6 +14,7 @@ crate-type = ["lib", "staticlib", "cdylib"]
 [dependencies]
 oura-analysis = { git = "https://github.com/Th0rgal/open_oura", rev = "b1b52a0da36a592d5fe8967b0024dcc40d5c746f" }
 oura-store = { git = "https://github.com/Th0rgal/open_oura", rev = "b1b52a0da36a592d5fe8967b0024dcc40d5c746f" }
+oura-protocol = { git = "https://github.com/Th0rgal/open_oura", rev = "b1b52a0da36a592d5fe8967b0024dcc40d5c746f" }
 oura-summary = { path = "../oura-summary" }
 # the ring client + transport trait, WITHOUT btleplug (iOS supplies the transport)
 oura-link = { git = "https://github.com/Th0rgal/open_oura", rev = "b1b52a0da36a592d5fe8967b0024dcc40d5c746f", default-features = false }

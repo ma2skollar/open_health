@@ -185,8 +185,20 @@ final class DiagStore: NSObject, ObservableObject, @unchecked Sendable {
             else if name.hasPrefix("metrickit") { kind = name.components(separatedBy: "_")[0] }
             else { kind = Self.classify(body) }
             return Incident(id: url, date: date(url), kind: kind, title: kind,
-                            preview: body.split(separator: "\n").suffix(4).joined(separator: "\n"))
+                            preview: Self.incidentPreview(body, kind: kind))
         }.sorted { $0.date > $1.date }
+    }
+
+    static func incidentPreview(_ body: String, kind: String) -> String {
+        let lines = body.split(separator: "\n")
+        if kind == "operation-failure" {
+            // A Torch exception can end with dozens of stack frames. Keep its
+            // leading cause and input context in the summary; full exports retain
+            // the trace. Older records can include a dropped-record notice first.
+            let start = lines.firstIndex { $0.contains(" error [") } ?? lines.startIndex
+            return lines.dropFirst(start).prefix(4).joined(separator: "\n")
+        }
+        return lines.suffix(4).joined(separator: "\n")
     }
     func exportSummary() -> String {
         flush()
@@ -205,10 +217,11 @@ final class DiagStore: NSObject, ObservableObject, @unchecked Sendable {
     }
     func exportAll() -> String {
         flush()
+        let clock = ClockReport.text().map { "\n--- ring clock ---\n\($0)\n" } ?? ""
         return queue.sync {
             let current = (try? String(contentsOf: live, encoding: .utf8)) ?? ""
             let retained = loadFolder("crashes") + loadFolder("sessions")
-            return current + "\nRetained reports included: \(retained.count)/\(retained.count)\n"
+            return current + clock + "\nRetained reports included: \(retained.count)/\(retained.count)\n"
                 + retained.map { "\n--- \($0.kind) ---\n\($0.body)" }.joined()
         }
     }

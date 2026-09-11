@@ -45,7 +45,7 @@ private struct ModelCacheFile<Entry: Codable>: Codable {
 
 /// Mirrors SummaryCache: Application Support, serial queue, atomic writes.
 enum ModelCacheStore {
-    static let version = 3
+    static let version = 4
     static let cvaFile = "cva-model-cache.json"
     static let illnessFile = "illness-model-cache.json"
     static let activityFile = "activity-model-cache.json"
@@ -61,19 +61,26 @@ enum ModelCacheStore {
     /// Entries for `file`, or empty when missing / from another schema version /
     /// written under a different global key (profile, timezone, DB, app build).
     static func load<E: Codable>(_ file: String, globalKey: String) -> [String: E] {
-        guard let data = try? Data(contentsOf: url(file)),
-              let decoded = try? JSONDecoder().decode(ModelCacheFile<E>.self, from: data),
-              decoded.version == version, decoded.globalKey == globalKey
-        else { return [:] }
-        return decoded.entries
+        queue.sync {
+            guard let data = try? Data(contentsOf: url(file)) else { return [:] }
+            guard let decoded = try? JSONDecoder().decode(ModelCacheFile<E>.self, from: data) else {
+                dlog("models", "\(file): cache unreadable, recomputing everything")
+                return [:]
+            }
+            guard decoded.version == version, decoded.globalKey == globalKey else {
+                dlog("models", "\(file): cache discarded (schema v\(decoded.version)→v\(version) or global key changed), recomputing everything")
+                return [:]
+            }
+            return decoded.entries
+        }
     }
 
+    /// Every entry is a finished, input-fingerprinted result, so it is worth keeping
+    /// even when the run around it is being cancelled (backgrounding mid-history
+    /// used to throw away every day computed so far and redo them on relaunch).
     static func save<E: Codable>(_ file: String, globalKey: String, entries: [String: E]) {
-        guard !AnalysisRun.cancelled else { return }
-        let run = AnalysisRun.current
         let payload = ModelCacheFile(version: version, globalKey: globalKey, entries: entries)
         queue.async {
-            guard run?.isCancelled != true else { return }
             guard let data = try? JSONEncoder().encode(payload) else { return }
             try? data.write(to: url(file), options: .atomic)
         }
@@ -89,15 +96,20 @@ enum ModelCacheStore {
     }
 
     /// Everything that invalidates every cached unit at once: model demographics,
-    /// day bucketing, which DB is being read, and the app build (a shipped model
-    /// or port change must not serve results from the old code).
+    /// day bucketing, and which store is being read (the bundled seed vs the synced
+    /// store). Deliberately NOT the DB's absolute path (it contains the install
+    /// container id, so every reinstall/dev build used to recompute all history)
+    /// nor the build number: a shipped model or port change bumps `version` instead.
     static func globalKey(profile: Profile?) -> String {
         let material = "v\(version)|\(profile?.sex ?? "")|\(profile?.age ?? -1)"
             + "|\(profile?.height_m ?? -1)|\(profile?.weight_kg ?? -1)|\(profile?.ring_size ?? -1)"
             + "|\(TimeZone.current.identifier)"
-            + "|\(DB.readPath())"
-            + "|\(Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "")"
+            + "|\(storeKind())"
         return SHA256.hash(data: Data(material.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func storeKind() -> String {
+        DB.readPath() == DB.url.path ? "store" : "seed"
     }
 }
 #endif

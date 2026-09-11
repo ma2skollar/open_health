@@ -332,6 +332,11 @@ RustBuffer uniffi_oura_core_fn_func_core_version(RustCallStatus *_Nonnull out_st
 RustBuffer uniffi_oura_core_fn_func_database_integrity(RustBuffer db_path, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EXPORT_DATABASE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EXPORT_DATABASE
+void uniffi_oura_core_fn_func_export_database(RustBuffer db_path, RustBuffer out_path, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_QUICK_SUMMARY_JSON
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_QUICK_SUMMARY_JSON
 RustBuffer uniffi_oura_core_fn_func_quick_summary_json(RustBuffer db_path, RustCallStatus *_Nonnull out_status
@@ -636,7 +641,13 @@ uint16_t uniffi_oura_core_checksum_func_core_version(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_DATABASE_INTEGRITY
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_DATABASE_INTEGRITY
 uint16_t uniffi_oura_core_checksum_func_database_integrity(void
-
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_EXPORT_DATABASE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_EXPORT_DATABASE
+uint16_t uniffi_oura_core_checksum_func_export_database(void
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_QUICK_SUMMARY_JSON
@@ -660,7 +671,7 @@ uint16_t uniffi_oura_core_checksum_func_summary_json(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_CANCEL
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_CANCEL
 uint16_t uniffi_oura_core_checksum_method_ringsession_cancel(void
-
+    
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_PUSH_FRAME

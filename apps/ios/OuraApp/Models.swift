@@ -34,6 +34,9 @@ struct NightRow: Codable, Identifiable {
     var date: String?; var ymd: String?; var start_ds: Int64?; var end_ds: Int64?
     var raw_start_ds: Int64?; var raw_end_ds: Int64?; var bedtime_adjusted: Bool?
     var start: String?; var end: String?
+    // supplied by the shared brain: the morning you woke (day the night belongs to),
+    // absolute bounds, and how the ring clock was tied to wall time for this night.
+    var wake_ymd: String?; var start_unix: Int64?; var end_unix: Int64?; var clock_source: String?
     var in_bed_h: Double?; var hrv_ms: Double?; var rhr: Double?
     var skin_temp: Double?; var spo2_mean: Double?
     // model-derived (present once the hypnogram runner is wired): per-30s stage codes
@@ -103,10 +106,25 @@ struct IllnessResult: Codable {
     var biomarkers: [IllnessBiomarker]
 }
 
+/// Per-boot ring clock diagnostics from the shared brain (`clock` in the summary JSON).
+struct ClockEpoch: Codable {
+    var min_ds: Int64?; var max_ds: Int64?; var span_h: Double?
+    var capture_min: Int64?; var capture_max: Int64?
+    var anchors: Int?; var anchor_sources: [String]?; var latest_anchor_unix: Int64?
+}
+struct ClockDiag: Codable {
+    var epochs: [ClockEpoch] = []
+    var warnings: [String] = []
+    var undated_nights: [UndatedNight] = []
+}
+struct UndatedNight: Codable {
+    var start_ds: Int64?; var end_ds: Int64?; var in_bed_h: Double?; var captured_unix: Int64?; var source: String?
+}
 struct Summary: Codable {
     var digest: String?
     var device: Device?
     var nights: [NightRow] = []
+    var clock: ClockDiag?
     var vitals = Vitals()
     var activity_profile: [String: [Double]] = [:]   // date → 96 × 15-min mean MET-above-rest
     var activity_daily: [String: DailyStat] = [:]     // date → steps / active-kcal / total-kcal
@@ -135,6 +153,8 @@ extension Summary {
     // started that evening — is what makes "night + activity of the day" one coherent
     // day. Kept identical to the web dashboard's wakeYmd().
     func wakeYmd(_ n: NightRow) -> String? {
+        if let wake = n.wake_ymd { return wake }
+        // Older cached summaries predate `wake_ymd`: infer it from the clock strings.
         guard let ymd = n.ymd else { return nil }
         guard let s = n.start, let e = n.end, e < s else { return ymd }
         let p = ymd.split(separator: "-").compactMap { Int($0) }

@@ -74,12 +74,12 @@ final class RingDiag: ObservableObject, @unchecked Sendable {
     func dump() -> String {
         lock.lock()
         let body = lines.joined(separator: "\n")
-        let droppedNote = dropped > 0 ? "\n(oldest \(dropped) lines dropped — buffer cap \(Self.cap))" : ""
+        let droppedNote = dropped > 0 ? "\n(oldest \(dropped) lines dropped; buffer cap \(Self.cap))" : ""
         lock.unlock()
         let os = ProcessInfo.processInfo.operatingSystemVersionString
         let v = Bundle.main.infoDictionary
         let app = "\(v?["CFBundleShortVersionString"] ?? "?") (\(v?["CFBundleVersion"] ?? "?"))"
-        return "Open Oura \(app) — iOS \(os) — \(Date())\(droppedNote)\n\(body)"
+        return "Open Oura \(app); iOS \(os); \(Date())\(droppedNote)\n\(body)"
     }
 
     func summary() -> String {
@@ -282,7 +282,7 @@ final class RingWriter: BleWriter, @unchecked Sendable {
                 // a failed write means the ring never got the frame — close the inbound
                 // stream so the Rust drain stops waiting and the sync fails loudly
                 // instead of proceeding as if the request was sent.
-                dlog("write", "FAILED (\(error)) — aborting inbound stream so the sync errors out")
+                dlog("write", "FAILED (\(error)); aborting inbound stream so the sync errors out")
                 t.abort()
             }
         }
@@ -339,7 +339,7 @@ final class RingSync: ObservableObject {
         paused = true
         session?.cancel(reason: "paused")
         transport?.abort()
-        status = "paused — resumes when you return to the app"
+        status = "Sync paused. Return to the app to resume."
     }
 
 
@@ -387,7 +387,7 @@ final class RingSync: ObservableObject {
             return nil
         }
         lastAutomaticAttemptAt = now
-        if resuming { status = "resuming interrupted sync from checkpoint…" }
+        if resuming { status = "Resuming sync…" }
         return await run(keyHex: key,
                          maxAttempts: resuming ? 3 : 1,
                          source: resuming ? "resume" : "automatic")
@@ -428,6 +428,30 @@ final class RingSync: ObservableObject {
         dlog("db", status)
     }
 
+    /// Write a self-contained copy of the saved ring database to a temporary file
+    /// for sharing (AirDrop/Files). Contains raw ring records only; the auth key
+    /// lives in the Keychain and is never included. Returns nil on failure.
+    func exportRawDatabase() async -> URL? {
+        await WorkGate.shared.acquire()
+        defer { Task { await WorkGate.shared.release() } }
+        guard WorkCoordinator.shared.available else { return nil }
+        let source = DB.readPath()
+        let stamp = { () -> String in
+            let f = DateFormatter(); f.dateFormat = "yyyyMMdd-HHmm"; return f.string(from: Date())
+        }()
+        let out = FileManager.default.temporaryDirectory.appendingPathComponent("oura-ring-\(stamp).db")
+        let result: String? = await Task.detached {
+            do { try exportDatabase(dbPath: source, outPath: out.path); return nil }
+            catch { return "\(error)" }
+        }.value
+        if let result {
+            status = "Export failed: \(result)"; dlog("db", status); return nil
+        }
+        let size = (try? FileManager.default.attributesOfItem(atPath: out.path)[.size] as? Int) ?? 0
+        dlog("db", "exported \(out.lastPathComponent) (\(size) bytes) from \(source)")
+        return out
+    }
+
     /// Connect, wire the inbound-frame pump, and run a full sync into the writable DB.
     @discardableResult
     func run(keyHex: String, maxAttempts: Int = 6, source: String = "manual") async -> SyncReport? {
@@ -445,7 +469,7 @@ final class RingSync: ObservableObject {
             status = "key must be 32 hex characters"
             return nil
         }
-        guard WorkCoordinator.shared.available else { status = "paused — open the app to sync"; return nil }
+        guard WorkCoordinator.shared.available else { status = "Sync paused. Open the app to resume."; return nil }
         busy = true
         paused = false
         WorkCoordinator.shared.invalidateAnalysis()
@@ -474,18 +498,18 @@ final class RingSync: ObservableObject {
         // safe and cheap. Retries cover both connect failures and mid-sync drops.
         var connectedDuringRun = source == "resume"
         for attempt in 1...max(1, maxAttempts) {
-            if paused || Task.isCancelled || !WorkCoordinator.shared.available { status = "paused — resumes on return"; return nil }
+            if paused || Task.isCancelled || !WorkCoordinator.shared.available { status = "Sync paused. Return to the app to resume."; return nil }
             attemptID = UUID().uuidString
             dlog("sync", "attempt=\(attempt) id=\(attemptID) run=\(runID)")
             if attempt > 1 {
-                dlog("sync", "attempt \(attempt)/\(maxAttempts) — resuming from the checkpointed cursor in 3 s")
-                status = "connection lost — resuming (attempt \(attempt)/\(maxAttempts))…"
+                dlog("sync", "attempt \(attempt)/\(maxAttempts); resuming from the checkpointed cursor in 3 s")
+                status = "Connection lost. Retrying (\(attempt) of \(maxAttempts))…"
                 do { try await Task.sleep(nanoseconds: 3_000_000_000) } catch { return nil }
                 guard !paused, WorkCoordinator.shared.available else { return nil }
             }
 
             status = attempt == 1 ? "Looking for your ring nearby…" : "Looking for your ring again (attempt \(attempt)/\(maxAttempts))…"
-            dlog("sync", "connecting — scanning for the Oura service (name filter 'Oura')…")
+            dlog("sync", "connecting; scanning for the Oura service (name filter 'Oura')…")
             // fresh transport + session per attempt: the previous link is dead and
             // BLETransport's notification stream is per-connection.
             let t = BLETransport(nameContains: "Oura")
@@ -493,28 +517,28 @@ final class RingSync: ObservableObject {
             do {
                 try await t.connect()
             } catch {
-                if paused { status = "paused — resumes on return"; return nil }
+                if paused { status = "Sync paused. Return to the app to resume."; return nil }
                 dlog("sync", "BLE connect FAILED: \(error)")
                 // the ring advertises reliably only ON its charger (low-power adv when
                 // worn), and it has a single BLE link — a phone running the official
                 // app holds it, leaving nothing to discover.
-                if case BLEError.poweredOff = error { status = "Bluetooth unavailable — check power and permission in Settings"; return nil }
+                if case BLEError.poweredOff = error { status = "Bluetooth is unavailable. Check Bluetooth and app permissions in Settings."; return nil }
                 t.disconnect()
                 if case BLEError.ringNotAdvertising(let count) = error, !connectedDuringRun {
                     connectionIssue = "Your ring wasn’t found"
                     status = count > 0
-                        ? "Bluetooth is detecting nearby devices, but your ring isn’t visible. Place it on its charger and disconnect it from other phones, then try again."
-                        : "Your ring isn’t visible yet. Keep it on its charger nearby and check Bluetooth in Settings, then try again."
+                        ? "Place your ring on its charger nearby. Disconnect it from other phones, then try again."
+                        : "Place your ring on its charger nearby. Check Bluetooth in Settings, then try again."
                     // An initial scan already waited 50 seconds. Repeating it six
                     // times hides the setup problem; retain retries for actual drops.
                     return nil
                 }
-                status = "couldn't connect (\(error)) — put the ring on its charger and " +
-                    "turn off Bluetooth on the phone with the official Oura app"
+                dlog("sync", "connection failed: \(error)")
+                status = "Couldn’t connect. Place your ring on its charger and disconnect it from other phones."
                 continue
             }
             connectedDuringRun = true
-            dlog("sync", "BLE link ready — creating RingSession + inbound-frame pump")
+            dlog("sync", "BLE link ready; creating RingSession + inbound-frame pump")
 
             let s = RingSession(writer: RingWriter(t))
             session = s
@@ -526,8 +550,8 @@ final class RingSync: ObservableObject {
                 s.cancel(reason: "transport closed")
             }
 
-            status = "syncing…"
-            dlog("sync", "starting FFI sync() — authenticate, app stream, then event drain")
+            status = "Syncing…"
+            dlog("sync", "starting FFI sync(); authenticate, app stream, then event drain")
             do {
                 let expectedAttempt = attemptID
                 let progress = SyncProgressBridge { [weak self] stage, bytesLeft, events in
@@ -544,15 +568,15 @@ final class RingSync: ObservableObject {
                                           forKey: Self.lastSuccessfulSyncKey)
                 clearIncompleteSync()
                 dlog("sync", "OK run=\(runID) inserted=\(report.inserted) events=\(report.eventsSynced) cursor=\(report.nextCursor)")
-                status = "synced — \(report.inserted) new events from \(report.serial)"
+                status = "Sync complete."
                 return report
             } catch {
                 // the Rust layer packs the diagnostic detail (auth state, missing
                 // summary, cursor) into this message — log it verbatim.
-                if paused { status = "paused — resumes on return"; return nil }
+                if paused { status = "Sync paused. Return to the app to resume."; return nil }
                 dlog("sync", "attempt \(attempt) FAILED: \(error)")
                 if case SyncError.Storage(_, _, _, _, _, _) = error {
-                    status = "storage failed: \(error)"
+                    status = "Couldn’t save ring data. See Help & diagnostics for details."
                     memLog("storage failure")
                     return nil
                 }
@@ -560,13 +584,13 @@ final class RingSync: ObservableObject {
                 pump = nil
                 t.disconnect() // release the (possibly half-dead) link before retrying
                 if Self.isAuthenticationFailure(error) {
-                    status = "auth failed — this key was rejected by the ring; paste the key exported from the phone that onboarded this exact ring"
+                    status = "Your ring rejected this pairing key. Use the key from the phone that originally set up this ring."
                     dlog("sync", "not retrying: auth rejection is deterministic")
                     // Deterministic rejection — an eager resume would just re-fail.
                     clearIncompleteSync()
                     return nil
                 }
-                status = "sync interrupted: \(error)"
+                status = "Sync interrupted. Try connecting again."
             }
         }
         dlog("sync", "failed run=\(runID) attempts=\(maxAttempts) reason=\(status)")
@@ -588,12 +612,12 @@ final class RingSync: ObservableObject {
         }
         switch stage {
         case "auth":
-            status = "authenticating…"
+            status = "Checking pairing key…"
         case "setup":
-            status = "configuring ring…"
+            status = "Preparing your ring…"
         case "rebase":
-            status = "ring clock reset detected — recovering history…"
-            dlog("sync", "saved cursor is absent on ring — rebasing to the new boot epoch")
+            status = "Recovering ring history…"
+            dlog("sync", "saved cursor is absent on ring; rebasing to the new boot epoch")
         default:
             if bytesLeft > 0 {
                 let now = Date()
@@ -620,7 +644,7 @@ final class RingSync: ObservableObject {
             } else if events > 0 {
                 status = "syncing… \(events) events · finishing up"
             } else {
-                status = "syncing…"
+                status = "Syncing…"
             }
         }
     }

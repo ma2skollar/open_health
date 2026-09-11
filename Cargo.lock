@@ -1309,6 +1309,7 @@ dependencies = [
  "async-trait",
  "oura-analysis",
  "oura-link",
+ "oura-protocol",
  "oura-store",
  "oura-summary",
  "serde_json",

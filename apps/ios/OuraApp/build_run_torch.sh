@@ -42,7 +42,7 @@ xcrun -sdk iphonesimulator swiftc \
     "$APPDIR/BLETransport.swift" "$APPDIR/RingSync.swift" "$APPDIR/ProfileSettings.swift" \
     "$APPDIR/EventStore.swift" "$APPDIR/ModelCache.swift" "$APPDIR/ModelProgress.swift" \
     "$APPDIR/SleepStaging.swift" "$APPDIR/CvaModel.swift" "$APPDIR/ActivityModel.swift" "$APPDIR/IllnessModel.swift" \
-    "$APPDIR/Diagnostics.swift" "$APPDIR/HealthExport.swift" "$BUILD/TorchBridge.o" "$BUILD/CrashCatch.o" \
+    "$APPDIR/Diagnostics.swift" "$APPDIR/HealthExport.swift" "$APPDIR/WorkCoordinator.swift" "$BUILD/TorchBridge.o" "$BUILD/CrashCatch.o" \
     -L "$XCF" -loura_core \
     -lc++ -lsqlite3 \
     -L "$LT/lib" -ltorch -ltorch_cpu -lc10 \

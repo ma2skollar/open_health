@@ -102,6 +102,7 @@ use std::sync::{Arc, Mutex};
 
 use oura_link::transport::Transport;
 use oura_link::OuraClient;
+use oura_protocol::events::RingEvent;
 use oura_store::storage::Store;
 use tokio::sync::{broadcast, watch};
 
@@ -170,6 +171,17 @@ pub fn database_integrity(db_path: String) -> Result<String, SyncError> {
     Store::open_read_only(db_path)
         .and_then(|s| s.integrity_check())
         .map_err(|e| storage_failure("quick_check", e, 0))
+}
+
+/// Copy the synced database to `out_path` as one self-contained SQLite file
+/// (`VACUUM INTO`), so the exact on-phone ring records can be replayed on the
+/// desktop with `oura --db <file> …`. The auth key lives in the Keychain and is
+/// never part of the database.
+#[uniffi::export]
+pub fn export_database(db_path: String, out_path: String) -> Result<(), SyncError> {
+    Store::open_read_only(db_path)
+        .and_then(|s| s.export_to(out_path))
+        .map_err(|e| storage_failure("export", e, 0))
 }
 
 /// A live sync session bound to a connected ring: Swift creates it with a writer,
@@ -353,6 +365,12 @@ impl RingSession {
             .setup_app_stream()
             .await
             .map_err(|e| fail(e.to_string()))?;
+        // Push the phone's clock to the ring so this boot logs a `time_sync` anchor.
+        // Without one, a rebooted ring's nights have no bridge to wall-clock time.
+        progress.on_progress("time".into(), 0, 0);
+        if let Err(error) = client.sync_time_app().await {
+            progress.on_progress(format!("time_sync skipped: {error}"), 0, 0);
+        }
         let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
         let info = client.firmware().await.ok();
 
@@ -438,6 +456,14 @@ impl RingSession {
                 .await?;
             }
         }
+        // Second, ring-independent anchor: the newest drained ring timestamp is at
+        // most minutes old, so pairing it with the phone clock dates this boot even
+        // when the firmware never emits time_sync/rtc_beacon events.
+        if let Some(anchor) = phone_anchor_event(outcome.events_synced, outcome.next_cursor, now_unix()) {
+            if let Err(error) = store.lock().unwrap().insert_event(&serial, &anchor) {
+                progress.on_progress(format!("phone anchor not saved: {error}"), 0, 0);
+            }
+        }
         Ok(SyncReport {
             serial,
             events_synced: outcome.events_synced,
@@ -445,6 +471,33 @@ impl RingSession {
             next_cursor: outcome.next_cursor,
         })
     }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A synthetic `time_sync` (0x42) row pairing the newest drained ring timestamp
+/// with the phone clock. Only meaningful when this sync actually observed new ring
+/// time; the body keeps the standard 4-byte unix prefix (so `redecode` still yields
+/// `unix_time`) followed by a "phone" marker, and `decoded.source` says so.
+fn phone_anchor_event(events_synced: u32, next_cursor: u32, now: u64) -> Option<RingEvent> {
+    if events_synced == 0 || next_cursor == 0 || now == 0 {
+        return None;
+    }
+    let unix = u32::try_from(now).ok()?;
+    let mut body = unix.to_le_bytes().to_vec();
+    body.extend_from_slice(b"phone");
+    Some(RingEvent {
+        tag: 0x42,
+        name: oura_protocol::events::event_name(0x42),
+        timestamp: next_cursor - 1,
+        body,
+        decoded: Some(json!({ "unix_time": unix, "source": "phone" })),
+    })
 }
 
 fn parse_key(hex: &str) -> Option<[u8; 16]> {
@@ -492,6 +545,52 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(result, Err(SyncError::Interrupted { reason }) if reason == "background"));
+    }
+
+    #[test]
+    fn phone_anchor_requires_new_ring_time() {
+        assert!(phone_anchor_event(0, 500, 1_789_056_420).is_none());
+        assert!(phone_anchor_event(3, 0, 1_789_056_420).is_none());
+        let anchor = phone_anchor_event(3, 705_001, 1_789_056_420).unwrap();
+        assert_eq!(anchor.tag, 0x42);
+        assert_eq!(anchor.timestamp, 705_000);
+        assert_eq!(anchor.decoded.as_ref().unwrap()["source"], "phone");
+        assert_eq!(
+            oura_protocol::events::decode_event_body(0x42, &anchor.body).unwrap()["unix_time"],
+            1_789_056_420u32
+        );
+    }
+
+    #[test]
+    fn phone_anchor_round_trips_through_the_store() {
+        let store = Store::open_in_memory().unwrap();
+        let anchor = phone_anchor_event(1, 705_001, 1_789_056_420).unwrap();
+        assert!(store.insert_event("ring", &anchor).unwrap());
+        assert!(!store.insert_event("ring", &anchor).unwrap());
+        let events = store.decoded_events().unwrap();
+        assert_eq!(events.len(), 1);
+        let (ds, tag, json, _) = &events[0];
+        assert_eq!((*ds, *tag), (705_000, 0x42));
+        assert!(json.contains("\"source\":\"phone\""));
+    }
+
+    #[test]
+    fn export_database_writes_a_self_contained_copy() {
+        let dir = std::env::temp_dir().join(format!("oura-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("oura.db");
+        let out = dir.join("export.db");
+        {
+            let store = Store::open(&src).unwrap();
+            let anchor = phone_anchor_event(1, 705_001, 1_789_056_420).unwrap();
+            store.insert_event("ring", &anchor).unwrap();
+        }
+        std::fs::write(&out, b"stale").unwrap();
+        export_database(src.to_string_lossy().into(), out.to_string_lossy().into()).unwrap();
+        let copy = Store::open_read_only(&out).unwrap();
+        assert_eq!(copy.decoded_events().unwrap().len(), 1);
+        assert!(!out.with_extension("db-wal").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

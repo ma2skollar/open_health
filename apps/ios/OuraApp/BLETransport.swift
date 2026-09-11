@@ -160,8 +160,8 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
     }
 
     private func startScan() {
-        lock.lock(); stage = "scanning — no ring advertisement seen yet"; lock.unlock()
-        dlog("ble", "scanning (unfiltered, allow duplicates) — matching service \(RingUUID.service)")
+        lock.lock(); stage = "scanning; no ring advertisement seen yet"; lock.unlock()
+        dlog("ble", "scanning (unfiltered, allow duplicates); matching service \(RingUUID.service)")
         // UNFILTERED scan, matching done in didDiscover: an OS-side service filter
         // reports nothing when the ring isn't advertising, which is indistinguishable
         // from broken Bluetooth. Seeing (and counting) other devices' advertisements
@@ -248,9 +248,9 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
             let adKey = "\(peripheral.identifier.uuidString)|case|\(advName)"
             if loggedAds.insert(adKey).inserted {
                 let svc = advServices.map(\.uuidString).joined(separator: ",")
-                let mfr = (advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data)?.hexString ?? "—"
+                let mfr = (advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data)?.hexString ?? "–"
                 let conn = advertisementData[CBAdvertisementDataIsConnectable] as? Bool
-                dlog("scan", "saw charging case '\(advName.isEmpty ? "<no name>" : advName)' id=\(peripheral.identifier.uuidString.suffix(12)) rssi=\(RSSI) services=[\(svc)] mfr=\(mfr) connectable=\(conn.map(String.init) ?? "?") — waiting for the ring")
+                dlog("scan", "saw charging case '\(advName.isEmpty ? "<no name>" : advName)' id=\(peripheral.identifier.uuidString.suffix(12)) rssi=\(RSSI) services=[\(svc)] mfr=\(mfr) connectable=\(conn.map(String.init) ?? "?"); waiting for the ring")
             }
             return
         }
@@ -268,7 +268,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
             let count = otherDevices.count
             lock.unlock()
             if inserted && count <= 5 {
-                dlog("scan", "other device '\(advName.isEmpty ? "<no name>" : advName)' rssi=\(RSSI) — not a ring (\(count) distinct so far)")
+                dlog("scan", "other device '\(advName.isEmpty ? "<no name>" : advName)' rssi=\(RSSI); not a ring (\(count) distinct so far)")
             }
             return
         }
@@ -277,12 +277,12 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
         let adKey = "\(peripheral.identifier.uuidString)|\(advName)"
         if loggedAds.insert(adKey).inserted {
             let svc = advServices.map(\.uuidString).joined(separator: ",")
-            let mfr = (advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data)?.hexString ?? "—"
+            let mfr = (advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data)?.hexString ?? "–"
             let conn = advertisementData[CBAdvertisementDataIsConnectable] as? Bool
             dlog("scan", "saw '\(advName.isEmpty ? "<no name>" : advName)' id=\(peripheral.identifier.uuidString.suffix(12)) rssi=\(RSSI) services=[\(svc)] mfr=\(mfr) connectable=\(conn.map(String.init) ?? "?")")
         }
         central.stopScan()
-        dlog("ble", "ring matched rssi=\(RSSI) otherDevices=\(otherDevices.count) — connecting")
+        dlog("ble", "ring matched rssi=\(RSSI) otherDevices=\(otherDevices.count); connecting")
         lock.lock(); stage = "GATT-connecting to the discovered ring"; lock.unlock()
         self.peripheral = peripheral
         peripheral.delegate = self
@@ -292,7 +292,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         guard !closed, self.peripheral === peripheral else { return }
         let mtu = peripheral.maximumWriteValueLength(for: .withResponse)
-        dlog("ble", "GATT connected (maxWrite=\(mtu)B) — discovering the Oura service")
+        dlog("ble", "GATT connected (maxWrite=\(mtu)B); discovering the Oura service")
         lock.lock(); stage = "discovering services/characteristics"; lock.unlock()
         peripheral.discoverServices([RingUUID.service])
     }
@@ -325,7 +325,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
         let found = (peripheral.services ?? []).map(\.uuid.uuidString).joined(separator: ",")
         dlog("ble", "services: [\(found)]")
         guard let svc = peripheral.services?.first(where: { $0.uuid == RingUUID.service }) else {
-            dlog("ble", "Oura service 98ED0001 NOT among them — wrong device?")
+            dlog("ble", "Oura service 98ED0001 NOT among them; wrong device?")
             return finishConnect(.failure(BLEError.notFound))
         }
         peripheral.discoverCharacteristics(nil, for: svc)
@@ -354,9 +354,9 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
             if c.uuid == RingUUID.write { writeChar = c }
             if RingUUID.notify.contains(c.uuid.uuidString.uppercased()) { notifyChars.append(c) }
         }
-        dlog("ble", "characteristics discovered — write=\(writeChar != nil), notify=\(notifyChars.count)")
+        dlog("ble", "characteristics discovered; write=\(writeChar != nil), notify=\(notifyChars.count)")
         guard writeChar != nil else {
-            dlog("ble", "no write characteristic (98ED0002) — wrong device?")
+            dlog("ble", "no write characteristic (98ED0002); wrong device?")
             return finishConnect(.failure(BLEError.noWriteCharacteristic))
         }
         guard !notifyChars.isEmpty else {
@@ -385,7 +385,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
         dlog("ble", "subscribed …\(characteristic.uuid.uuidString.prefix(8).lowercased())")
         lock.lock(); pendingNotify -= 1; let ready = pendingNotify <= 0; lock.unlock()
         if ready {
-            dlog("ble", "all notify subscriptions confirmed — BLE link ready, handing to Rust auth")
+            dlog("ble", "all notify subscriptions confirmed; BLE link ready, handing to Rust auth")
             finishConnect(.success(()))
         }
     }
@@ -414,7 +414,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
         // compact diagnostic line instead of tens of thousands of raw payload lines.
         flushHistoryPayload()
         if historyFrames > 0 {
-            dlog("recv", "history payload omitted — \(historyFrames) BLE frames, \(historyBytes)B")
+            dlog("recv", "history payload omitted; \(historyFrames) BLE frames, \(historyBytes)B")
             historyFrames = 0
             historyBytes = 0
         }
@@ -444,7 +444,7 @@ final class BLETransport: NSObject, RingTransport, CBCentralManagerDelegate, CBP
 
     private func deliver(_ data: Data) {
         if case .dropped = notifyContinuation?.yield(data) {
-            dlog("ble", "receive queue overflow — replay from committed checkpoint")
+            dlog("ble", "receive queue overflow; replay from committed checkpoint")
             closeOnQueue()
         }
     }

@@ -184,6 +184,7 @@ function hypnogram(stages) {
 // as one coherent day. Kept identical to the iOS Summary.wakeYmd.
 function wakeYmd(n) {
   if (!n || !n.ymd) return null;
+  if (n.wake_ymd) return n.wake_ymd;
   if (n.start && n.end && n.end < n.start) {
     const [y, m, dd] = n.ymd.split("-").map(Number);
     const t = new Date(y, m - 1, dd + 1);

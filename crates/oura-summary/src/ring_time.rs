@@ -1,8 +1,8 @@
 use serde_json::Value;
 
-// A ring timestamp is a per-boot decisecond counter. `time_sync` events are the
-// authoritative bridge from that counter to UTC; captured_unix is only when the
-// phone downloaded the event and is therefore an epoch-selection hint/fallback.
+// A ring timestamp is a per-boot decisecond counter. `time_sync` and `rtc_beacon`
+// events are the authoritative bridge from that counter to UTC; captured_unix is
+// only when the phone downloaded it and is an epoch-selection hint/fallback.
 #[derive(Clone, Debug)]
 struct Epoch {
     min_ds: i64,
@@ -11,6 +11,7 @@ struct Epoch {
     capture_max: i64,
     fallback_anchor_unix: i64,
     anchors: Vec<(i64, i64)>, // (ring ds, UTC unix seconds)
+    anchor_sources: Vec<&'static str>,
 }
 
 const RESET_SLACK_DS: i64 = 6 * 3600 * 10;
@@ -19,13 +20,54 @@ const RESET_SLACK_DS: i64 = 6 * 3600 * 10;
 // pre-reboot high ds value to fabricate weeks of future data.
 const FUTURE_SLACK_S: f64 = 6.0 * 3600.0;
 
+/// How an event's wall-clock time was obtained. Only `Anchor` and `Projected` are
+/// trustworthy to the minute; `Fallback` is download-time arithmetic (off by up to
+/// one sync gap) and `Undated` means nothing ties this boot to real time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClockSource {
+    Anchor,
+    Projected,
+    Fallback,
+    Undated,
+}
+
+impl ClockSource {
+    pub(crate) fn is_dated(self) -> bool {
+        matches!(self, ClockSource::Anchor | ClockSource::Projected)
+    }
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            ClockSource::Anchor => "anchor",
+            ClockSource::Projected => "projected",
+            ClockSource::Fallback => "download_time",
+            ClockSource::Undated => "undated",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Resolved {
+    pub(crate) unix: f64,
+    pub(crate) source: ClockSource,
+}
+
 /// Maps the ring's rebooting relative clock onto UTC.
 pub(crate) struct RingClock {
     epochs: Vec<Epoch>,
-    // `unix * 10 - ring_ds` is the UTC projection offset in deciseconds.
-    // Sorted once so replay recovery can find the newest plausible projection
-    // in O(log n) instead of scanning every time-sync anchor for every event.
-    anchor_offsets_ds: Vec<i64>,
+    // `(unix * 10 - ring_ds, epoch index)`: the UTC projection offset in deciseconds
+    // of every anchor, sorted by offset so replay recovery can find the newest
+    // plausible projection in O(log n) instead of scanning every anchor per event.
+    anchor_offsets_ds: Vec<(i64, usize)>,
+}
+
+fn anchor_source(tag: u8, value: &Value) -> &'static str {
+    if value["source"].as_str() == Some("phone") {
+        "phone"
+    } else if tag == 0x85 {
+        "rtc_beacon"
+    } else {
+        "time_sync"
+    }
 }
 
 impl RingClock {
@@ -52,27 +94,31 @@ impl RingClock {
                     capture_max: *captured,
                     fallback_anchor_unix: *captured,
                     anchors: Vec::new(),
+                    anchor_sources: Vec::new(),
                 }),
             }
-            if *tag == 0x42 {
+            if matches!(*tag, 0x42 | 0x85) {
                 if let Ok(value) = serde_json::from_str::<Value>(json) {
                     if let Some(unix) = value["unix_time"].as_i64() {
-                        epochs.last_mut().unwrap().anchors.push((*ds, unix));
+                        let e = epochs.last_mut().unwrap();
+                        e.anchors.push((*ds, unix));
+                        e.anchor_sources.push(anchor_source(*tag, &value));
                     }
                 }
             }
         }
         let mut anchor_offsets_ds = epochs
             .iter()
-            .flat_map(|epoch| {
+            .enumerate()
+            .flat_map(|(idx, epoch)| {
                 epoch
                     .anchors
                     .iter()
-                    .map(|(ds, unix)| unix.saturating_mul(10).saturating_sub(*ds))
+                    .map(move |(ds, unix)| (unix.saturating_mul(10).saturating_sub(*ds), idx))
             })
             .collect::<Vec<_>>();
         anchor_offsets_ds.sort_unstable();
-        anchor_offsets_ds.dedup();
+        anchor_offsets_ds.dedup_by_key(|(offset, _)| *offset);
         Self {
             epochs,
             anchor_offsets_ds,
@@ -80,6 +126,10 @@ impl RingClock {
     }
 
     pub(crate) fn unix_s(&self, ds: i64, captured_unix: i64) -> f64 {
+        self.resolve(ds, captured_unix).unix
+    }
+
+    pub(crate) fn resolve(&self, ds: i64, captured_unix: i64) -> Resolved {
         let epoch = self.epoch_for(ds, captured_unix);
         if let Some((anchor_ds, anchor_unix)) = epoch
             .anchors
@@ -88,7 +138,10 @@ impl RingClock {
         {
             let predicted = *anchor_unix as f64 + (ds - *anchor_ds) as f64 / 10.0;
             if predicted <= captured_unix as f64 + FUTURE_SLACK_S {
-                return predicted;
+                return Resolved {
+                    unix: predicted,
+                    source: ClockSource::Anchor,
+                };
             }
         }
 
@@ -98,11 +151,30 @@ impl RingClock {
         // continuation of the new boot. If that epoch predicts the future, select the
         // most recent globally plausible time-sync projection instead.
         if let Some(predicted) = self.latest_plausible_projection(ds, captured_unix) {
-            return predicted;
+            return Resolved {
+                unix: predicted,
+                source: ClockSource::Projected,
+            };
         }
 
-        (epoch.fallback_anchor_unix as f64 - (epoch.max_ds - ds) as f64 / 10.0)
-            .min(captured_unix as f64 + FUTURE_SLACK_S)
+        // Download-time arithmetic is only meaningful when the phone kept up with the
+        // ring: a boot drained sync after sync has a capture span comparable to its ds
+        // span, so the error is bounded by one sync gap. A boot downloaded in one go
+        // (a fresh ring, a from-zero replay, an old boot) would simply be dated to the
+        // moment of the download, so it stays undated instead.
+        let ds_span_s = (epoch.max_ds - epoch.min_ds) as f64 / 10.0;
+        let capture_span_s = (epoch.capture_max - epoch.capture_min) as f64;
+        let incremental = ds_span_s <= 0.0 || capture_span_s * 2.0 >= ds_span_s;
+        let unix = (epoch.fallback_anchor_unix as f64 - (epoch.max_ds - ds) as f64 / 10.0)
+            .min(captured_unix as f64 + FUTURE_SLACK_S);
+        Resolved {
+            unix,
+            source: if incremental {
+                ClockSource::Fallback
+            } else {
+                ClockSource::Undated
+            },
+        }
     }
 
     pub(crate) fn latest_unix(&self) -> i64 {
@@ -121,6 +193,30 @@ impl RingClock {
 
     pub(crate) fn total_span_ds(&self) -> i64 {
         self.epochs.iter().map(|e| e.max_ds - e.min_ds).sum()
+    }
+
+    /// Per-boot diagnostics for support exports and the apps' technical reports.
+    pub(crate) fn diagnostics(&self) -> Value {
+        let epochs: Vec<Value> = self
+            .epochs
+            .iter()
+            .map(|e| {
+                let mut sources = e.anchor_sources.clone();
+                sources.sort_unstable();
+                sources.dedup();
+                serde_json::json!({
+                    "min_ds": e.min_ds,
+                    "max_ds": e.max_ds,
+                    "span_h": ((e.max_ds - e.min_ds) as f64 / 36_000.0 * 10.0).round() / 10.0,
+                    "capture_min": e.capture_min,
+                    "capture_max": e.capture_max,
+                    "anchors": e.anchors.len(),
+                    "anchor_sources": sources,
+                    "latest_anchor_unix": e.anchors.iter().map(|(_, u)| *u).max(),
+                })
+            })
+            .collect();
+        serde_json::json!({ "epochs": epochs })
     }
 
     fn epoch_for(&self, ds: i64, captured_unix: i64) -> &Epoch {
@@ -146,9 +242,16 @@ impl RingClock {
             .saturating_sub(ds);
         let end = self
             .anchor_offsets_ds
-            .partition_point(|offset| *offset <= max_offset);
-        let offset = *self.anchor_offsets_ds.get(end.checked_sub(1)?)?;
-        Some(ds.saturating_add(offset) as f64 / 10.0)
+            .partition_point(|(offset, _)| *offset <= max_offset);
+        // Borrowing another boot's clock is only legitimate when this ds continues
+        // that boot's counter. A new boot restarts near zero, so a low ds must never
+        // be projected through an older boot that only ever ran at higher counts —
+        // that is how a fresh night lands days in the past.
+        self.anchor_offsets_ds[..end]
+            .iter()
+            .rev()
+            .find(|(_, idx)| ds >= self.epochs[*idx].min_ds - RESET_SLACK_DS)
+            .map(|(offset, _)| ds.saturating_add(*offset) as f64 / 10.0)
     }
 }
 
@@ -158,6 +261,45 @@ mod tests {
 
     fn event(ds: i64, tag: u8, json: &str, captured: i64) -> (i64, u8, String, i64) {
         (ds, tag, json.into(), captured)
+    }
+
+    #[test]
+    fn rtc_beacon_dates_overnight_sleep_independently_of_download_time() {
+        // 22:01 Sep 9 -> 07:07 Sep 10 in UTC+1, downloaded ten hours later.
+        let clock = RingClock::from_events(&[
+            event(672_400, 1, "{}", 1_789_056_420),
+            event(
+                1_000_000,
+                0x85,
+                r#"{"unix_time":1789020420}"#,
+                1_789_056_420,
+            ),
+        ]);
+        assert_eq!(clock.unix_s(672_400, 1_789_056_420), 1_788_987_660.0);
+        assert_eq!(clock.unix_s(1_000_000, 1_789_056_420), 1_789_020_420.0);
+        assert_eq!(clock.latest_unix(), 1_789_020_420);
+    }
+
+    #[test]
+    fn rtc_beacon_anchors_new_boot_instead_of_reusing_old_time_sync() {
+        let clock = RingClock::from_events(&[
+            event(
+                5_000_000,
+                0x42,
+                r#"{"unix_time":1788800000}"#,
+                1_788_800_000,
+            ),
+            event(672_400, 1, "{}", 1_789_056_420),
+            event(
+                1_000_000,
+                0x85,
+                r#"{"unix_time":1789020420}"#,
+                1_789_056_420,
+            ),
+        ]);
+        assert_eq!(clock.unix_s(672_400, 1_789_056_420), 1_788_987_660.0);
+        assert_eq!(clock.unix_s(5_000_000, 1_788_800_000), 1_788_800_000.0);
+        assert_eq!(clock.latest_unix(), 1_789_020_420);
     }
 
     #[test]
@@ -187,6 +329,7 @@ mod tests {
                     capture_max: 1_700_000_199,
                     fallback_anchor_unix: 199,
                     anchors: vec![(5_000_000, 1_700_000_000)],
+                    anchor_sources: vec!["time_sync"],
                 },
                 Epoch {
                     min_ds: 0,
@@ -195,9 +338,13 @@ mod tests {
                     capture_max: 1_800_000_299,
                     fallback_anchor_unix: 299,
                     anchors: vec![(500_000, 1_800_000_000)],
+                    anchor_sources: vec!["time_sync"],
                 },
             ],
-            anchor_offsets_ds: vec![1_700_000_000 * 10 - 5_000_000, 1_800_000_000 * 10 - 500_000],
+            anchor_offsets_ds: vec![
+                (1_700_000_000 * 10 - 5_000_000, 0),
+                (1_800_000_000 * 10 - 500_000, 1),
+            ],
         };
         assert_eq!(clock.unix_s(400_000, 1_800_000_250), 1_799_990_000.0);
     }
@@ -225,5 +372,74 @@ mod tests {
             event(13_000_000, 1, "{}", 2_400_000),
         ]);
         assert_eq!(clock.unix_s(13_000_000, 2_400_000), 1_550_000.0);
+    }
+
+    #[test]
+    fn unanchored_full_drain_epoch_is_undated_not_download_time() {
+        // A whole boot downloaded in one second with no time_sync/rtc_beacon: dating
+        // it to the download would put the night's end at the sync time.
+        let clock = RingClock::from_events(&[
+            event(100_000, 1, "{}", 1_789_056_420),
+            event(400_000, 0x76, "{}", 1_789_056_420),
+            event(700_000, 1, "{}", 1_789_056_420),
+        ]);
+        let r = clock.resolve(400_000, 1_789_056_420);
+        assert_eq!(r.source, ClockSource::Undated);
+        assert!(!r.source.is_dated());
+    }
+
+    #[test]
+    fn incrementally_drained_epoch_falls_back_to_download_time() {
+        // Synced every day for three days: download time tracks ring time to within
+        // a sync gap, so the fallback is usable (but flagged).
+        let clock = RingClock::from_events(&[
+            event(100_000, 1, "{}", 1_000_000),
+            event(964_000, 1, "{}", 1_086_400),
+            event(1_828_000, 1, "{}", 1_172_800),
+        ]);
+        let r = clock.resolve(1_828_000, 1_172_800);
+        assert_eq!(r.source, ClockSource::Fallback);
+        assert_eq!(r.unix, 1_172_800.0);
+    }
+
+    #[test]
+    fn rebase_does_not_project_old_boot_offset_onto_new_boot() {
+        // Old boot ran at high counts (anchored). A reboot restarts near zero and the
+        // new boot has no anchor yet: its night must not be dated through the old
+        // boot's clock (which would land it days earlier), nor to the download time.
+        let clock = RingClock::from_events(&[
+            event(5_000_000, 0x42, r#"{"unix_time":1788800000}"#, 1_788_800_000),
+            event(5_100_000, 1, "{}", 1_788_800_000),
+            event(10, 1, "{}", 1_789_056_420),
+            event(300_000, 0x76, "{}", 1_789_056_420),
+        ]);
+        let r = clock.resolve(300_000, 1_789_056_420);
+        assert_eq!(r.source, ClockSource::Undated);
+        assert_ne!(r.unix, 1_788_800_000.0 + (300_000 - 5_000_000) as f64 / 10.0);
+    }
+
+    #[test]
+    fn phone_anchor_dates_new_boot() {
+        // Same reboot, but the phone recorded an anchor at the end of the sync
+        // (ring ds of the newest drained event ↔ phone time). 23:00→08:00 UTC+2.
+        let sync_unix = 1_789_056_420; // 2026-09-11 ~ 09:27 UTC
+        let clock = RingClock::from_events(&[
+            event(5_000_000, 0x42, r#"{"unix_time":1788800000}"#, 1_788_800_000),
+            event(10, 1, "{}", sync_unix),
+            event(
+                705_000,
+                0x42,
+                r#"{"unix_time":1789056420,"source":"phone"}"#,
+                sync_unix,
+            ),
+        ]);
+        // bed 22:59 UTC previous day → 06:00 UTC = 08:00 local
+        let start = clock.resolve(705_000 - (sync_unix - 1_789_002_000) * 10, sync_unix);
+        let end = clock.resolve(705_000 - (sync_unix - 1_789_020_000) * 10, sync_unix);
+        assert_eq!(start.source, ClockSource::Anchor);
+        assert_eq!(start.unix, 1_789_002_000.0);
+        assert_eq!(end.unix, 1_789_020_000.0);
+        let diag = clock.diagnostics();
+        assert_eq!(diag["epochs"][1]["anchor_sources"][0], "phone");
     }
 }
