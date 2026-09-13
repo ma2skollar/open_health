@@ -44,8 +44,8 @@ pub fn summary_json(db_path: String, tz_offset: i64) -> String {
     }
 }
 
-/// Hourly heart-rate candles for the HR detail screen — one candle per local-clock
-/// hour, `{low, high, open, close, mean, count}`, plus the newest quality-gated
+/// Hourly heart-rate bars for the HR detail screen — one bar per local-clock
+/// hour, `{low, high, mean, count}`, plus the newest quality-gated
 /// reading as `latest`.
 ///
 /// The nightly RHR trend answers "how have I been sleeping"; this answers "what did

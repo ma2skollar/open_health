@@ -8,11 +8,13 @@
 //! * `ibi_and_amplitude_event` (`0x60`) — overnight beats (6 per 14-byte packet),
 //! * `hrv_event` — `interval_min`-minute averages, overnight.
 //!
-//! Grouping those into local-clock hours gives one candle per hour: `low`/`high` are
-//! the extremes actually measured in that hour, `open`/`close` the first and last
-//! beat. Only `hrv_event` carries per-sample spacing (`interval_min`), so its samples
-//! are placed at `ds + i·interval`; the beat streams have no per-sample timestamps and
-//! sit at their event's time, which is honest — an event covers seconds, not hours.
+//! Grouping those into local-clock hours gives one bar per hour: the lowest and
+//! highest beat actually measured, and the mean of every beat in between. There is no
+//! open/close — a heart rate is not a share price, and "the first beat of the hour"
+//! carries no information the range and the mean do not. Only `hrv_event` carries
+//! per-sample spacing (`interval_min`), so its samples are placed at `ds + i·interval`;
+//! the beat streams have no per-sample timestamps and sit at their event's time, which
+//! is honest — an event covers seconds, not hours.
 //!
 //! `latest` deliberately mirrors `build_summary`'s `vitals.hr`: the newest
 //! quality-gated green-LED estimate, so the number on the detail screen is the same
@@ -36,47 +38,35 @@ const MAX_BPM: f64 = 240.0;
 const HOUR: i64 = 3600;
 
 #[derive(Default)]
-struct Candle {
+struct Bar {
     low: f64,
     high: f64,
     sum: f64,
     count: u64,
-    first: (f64, f64), // (unix seconds, bpm)
-    last: (f64, f64),
 }
 
-impl Candle {
-    fn add(&mut self, at: f64, bpm: f64) {
+impl Bar {
+    fn add(&mut self, bpm: f64) {
         if self.count == 0 {
             self.low = bpm;
             self.high = bpm;
-            self.first = (at, bpm);
-            self.last = (at, bpm);
         } else {
             self.low = self.low.min(bpm);
             self.high = self.high.max(bpm);
-            // events arrive in sync order, not clock order — compare times, not arrival
-            if at < self.first.0 {
-                self.first = (at, bpm);
-            }
-            if at >= self.last.0 {
-                self.last = (at, bpm);
-            }
         }
         self.sum += bpm;
         self.count += 1;
     }
 }
 
-/// One candle per local-clock hour that actually has beats, oldest first.
+/// One bar per local-clock hour that actually has beats, oldest first.
 ///
 /// `tz` is whole hours from UTC (the same offset `build_summary` takes), `days` caps
 /// the window to that many days back from the newest sample — 0 means everything.
 ///
 /// ```text
 /// { "tz_offset": 3, "hours": [ { "unix": 1757714400, "ymd": "2026-09-12", "hour": 21,
-///                                "low": 48, "high": 71, "open": 55, "close": 52,
-///                                "mean": 54.2, "count": 812 } ],
+///                                "low": 48, "high": 71, "mean": 54.2, "count": 812 } ],
 ///   "latest": { "bpm": 61, "unix": 1757800000 } }
 /// ```
 pub fn hourly_hr(db: &Path, tz: i64, days: u32) -> Result<Value> {
@@ -87,7 +77,7 @@ pub fn hourly_hr(db: &Path, tz: i64, days: u32) -> Result<Value> {
     }
     let clock = RingClock::from_events(&events);
 
-    let mut hours: BTreeMap<i64, Candle> = BTreeMap::new();
+    let mut hours: BTreeMap<i64, Bar> = BTreeMap::new();
     let mut latest: Option<(f64, f64)> = None; // (unix, bpm)
 
     for (ds, tag, jstr, cu) in &events {
@@ -117,7 +107,7 @@ pub fn hourly_hr(db: &Path, tz: i64, days: u32) -> Result<Value> {
             }
             let at = clock.unix_s(*ds + i as i64 * step_ds, *cu);
             let bucket = bucket_start(at, tz);
-            hours.entry(bucket).or_default().add(at, bpm);
+            hours.entry(bucket).or_default().add(bpm);
             if name == "green_ibi_quality_event"
                 && latest.map_or(true, |(current, _)| at > current)
             {
@@ -135,18 +125,16 @@ pub fn hourly_hr(db: &Path, tz: i64, days: u32) -> Result<Value> {
 
     let out: Vec<Value> = hours
         .iter()
-        .map(|(start, c)| {
+        .map(|(start, bar)| {
             let (ymd, hour) = local_ymd_hour(*start, tz);
             json!({
                 "unix": start,
                 "ymd": ymd,
                 "hour": hour,
-                "low": c.low,
-                "high": c.high,
-                "open": c.first.1,
-                "close": c.last.1,
-                "mean": (c.sum / c.count as f64 * 10.0).round() / 10.0,
-                "count": c.count,
+                "low": bar.low,
+                "high": bar.high,
+                "mean": (bar.sum / bar.count as f64 * 10.0).round() / 10.0,
+                "count": bar.count,
             })
         })
         .collect();
@@ -213,25 +201,18 @@ mod tests {
     }
 
     #[test]
-    fn candle_tracks_extremes_and_clock_order() {
-        let mut c = Candle::default();
-        c.add(100.0, 60.0);
-        c.add(50.0, 80.0); // arrives later but is EARLIER on the clock
-        c.add(200.0, 40.0);
-        assert_eq!(c.low, 40.0);
-        assert_eq!(c.high, 80.0);
-        assert_eq!(c.first.1, 80.0, "open is the earliest beat");
-        assert_eq!(c.close_bpm(), 40.0, "close is the latest beat");
-        assert_eq!(c.count, 3);
-    }
-
-    impl Candle {
-        fn close_bpm(&self) -> f64 {
-            self.last.1
+    fn bar_tracks_extremes_and_mean() {
+        let mut bar = Bar::default();
+        for bpm in [60.0, 80.0, 40.0] {
+            bar.add(bpm);
         }
+        assert_eq!(bar.low, 40.0);
+        assert_eq!(bar.high, 80.0);
+        assert_eq!(bar.sum / bar.count as f64, 60.0);
+        assert_eq!(bar.count, 3);
     }
 
-    /// End to end over a real store: three sources, three hours, one candle each.
+    /// End to end over a real store: three sources, three hours, one bar each.
     #[test]
     fn groups_beats_into_local_hours() {
         use oura_protocol::events::RingEvent;
@@ -294,8 +275,7 @@ mod tests {
         assert_eq!(hours.len(), 3, "{v}");
         assert_eq!(hours[0]["low"], 60.0);
         assert_eq!(hours[0]["high"], 70.0);
-        assert_eq!(hours[0]["open"], 60.0);
-        assert_eq!(hours[0]["close"], 70.0);
+        assert_eq!(hours[0]["mean"], 65.0);
         assert_eq!(hours[0]["count"], 2);
         assert_eq!(hours[1]["low"], 50.0, "500 bpm must be gated out: {v}");
         assert_eq!(hours[1]["high"], 50.0);

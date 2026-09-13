@@ -1503,8 +1503,8 @@ public func exportDatabase(dbPath: String, outPath: String)throws  {try rustCall
 }
 }
 /**
- * Hourly heart-rate candles for the HR detail screen — one candle per local-clock
- * hour, `{low, high, open, close, mean, count}`, plus the newest quality-gated
+ * Hourly heart-rate bars for the HR detail screen — one bar per local-clock
+ * hour, `{low, high, mean, count}`, plus the newest quality-gated
  * reading as `latest`.
  *
  * The nightly RHR trend answers "how have I been sleeping"; this answers "what did
@@ -1595,7 +1595,7 @@ private var initializationResult: InitializationResult = {
     if (uniffi_oura_core_checksum_func_export_database() != 46626) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_oura_core_checksum_func_hourly_hr_json() != 6725) {
+    if (uniffi_oura_core_checksum_func_hourly_hr_json() != 21410) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_quick_summary_json() != 19199) {

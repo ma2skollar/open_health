@@ -1,28 +1,26 @@
 import Foundation
 import SwiftUI
 
-/// Hourly heart-rate candles — the day-shaped HR view behind the dashboard's heart
+/// Hourly heart-rate bars — the day-shaped HR view behind the dashboard's heart
 /// rate cell.
 ///
 /// The nightly RHR trend says how the last few weeks of sleep went; it says nothing
-/// about the day you are in. One candle per local-clock hour does: the wick is the
-/// lowest and highest beat measured in that hour, the body runs from the first beat
-/// to the last. Aggregation happens in Rust (`oura-summary::hourly_hr`) because it
-/// walks the whole event table — the same read the summary does, not a second
-/// decoding of the database in Swift.
+/// about the day you are in. One bar per local-clock hour does: it spans the lowest
+/// and highest beat measured in that hour, with a tick at the hour's mean. No
+/// open/close — that is a stock-chart habit, and a heart rate has no opening price.
+/// Aggregation happens in Rust (`oura-summary::hourly_hr`) because it walks the whole
+/// event table — the same read the summary does, not a second decoding of the
+/// database in Swift.
 enum HourlyHR {
-    struct Candle: Identifiable {
+    struct Bar: Identifiable {
         let unix: Double        // UTC start of the local hour
         let ymd: String
         let hour: Int
         let low: Double
         let high: Double
-        let open: Double
-        let close: Double
         let mean: Double
         let count: Int
         var id: Double { unix }
-        var rising: Bool { close >= open }
     }
 
     struct Reading {
@@ -31,7 +29,7 @@ enum HourlyHR {
     }
 
     struct Result {
-        var candles: [Candle] = []
+        var bars: [Bar] = []
         var latest: Reading?
         var error: String?
     }
@@ -49,26 +47,24 @@ enum HourlyHR {
         else { return Result(error: "unreadable response") }
         if let err = root["error"] as? String { return Result(error: err) }
 
-        let candles = (root["hours"] as? [[String: Any]] ?? []).compactMap { row -> Candle? in
+        let bars = (root["hours"] as? [[String: Any]] ?? []).compactMap { row -> Bar? in
             guard let unix = (row["unix"] as? NSNumber)?.doubleValue,
                   let low = (row["low"] as? NSNumber)?.doubleValue,
-                  let high = (row["high"] as? NSNumber)?.doubleValue,
-                  let open = (row["open"] as? NSNumber)?.doubleValue,
-                  let close = (row["close"] as? NSNumber)?.doubleValue
+                  let high = (row["high"] as? NSNumber)?.doubleValue
             else { return nil }
-            return Candle(unix: unix,
-                          ymd: row["ymd"] as? String ?? "",
-                          hour: (row["hour"] as? NSNumber)?.intValue ?? 0,
-                          low: low, high: high, open: open, close: close,
-                          mean: (row["mean"] as? NSNumber)?.doubleValue ?? (low + high) / 2,
-                          count: (row["count"] as? NSNumber)?.intValue ?? 0)
+            return Bar(unix: unix,
+                       ymd: row["ymd"] as? String ?? "",
+                       hour: (row["hour"] as? NSNumber)?.intValue ?? 0,
+                       low: low, high: high,
+                       mean: (row["mean"] as? NSNumber)?.doubleValue ?? (low + high) / 2,
+                       count: (row["count"] as? NSNumber)?.intValue ?? 0)
         }
         let latest = (root["latest"] as? [String: Any]).flatMap { l -> Reading? in
             guard let bpm = (l["bpm"] as? NSNumber)?.doubleValue,
                   let unix = (l["unix"] as? NSNumber)?.doubleValue else { return nil }
             return Reading(bpm: bpm, unix: unix)
         }
-        return Result(candles: candles, latest: latest)
+        return Result(bars: bars, latest: latest)
     }
 }
 
@@ -87,19 +83,19 @@ enum HourlyWindow: String, CaseIterable {
     var days: UInt32 { self == .d7 ? 8 : 2 }
 }
 
-/// The hourly candle panel: current reading, the candles, and the window's extremes.
+/// The hourly panel: current reading, the range bars, and the window's extremes.
 struct HourlyHeartRateSection: View {
     @State private var window: HourlyWindow = .h24
     @State private var result = HourlyHR.Result()
     @State private var loading = true
-    @State private var selected: HourlyHR.Candle?
+    @State private var selected: HourlyHR.Bar?
 
-    /// The candles inside the chosen window, anchored on the newest hour that has
+    /// The bars inside the chosen window, anchored on the newest hour that has
     /// data — a ring that last synced yesterday still fills the chart.
-    private var visible: [HourlyHR.Candle] {
-        guard let newest = result.candles.last?.unix else { return [] }
+    private var visible: [HourlyHR.Bar] {
+        guard let newest = result.bars.last?.unix else { return [] }
         let cut = newest - Double((window.hours - 1) * 3600)
-        return result.candles.filter { $0.unix >= cut }
+        return result.bars.filter { $0.unix >= cut }
     }
 
     var body: some View {
@@ -125,7 +121,7 @@ struct HourlyHeartRateSection: View {
                     .fixedSize(horizontal: false, vertical: true)
             } else {
                 readout
-                CandleChart(candles: visible, window: window, selected: $selected)
+                HourlyRangeChart(bars: visible, window: window, selected: $selected)
                     .frame(height: 210)
                 axis
                 stats
@@ -137,14 +133,14 @@ struct HourlyHeartRateSection: View {
 
     /// Either the hour you are touching, or the latest reading when nothing is held.
     @ViewBuilder private var readout: some View {
-        if let c = selected {
+        if let bar = selected {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline, spacing: 6) {
-                    Text("\(Int(c.low.rounded()))–\(Int(c.high.rounded()))")
+                    Text("\(Int(bar.low.rounded()))–\(Int(bar.high.rounded()))")
                         .font(Obs.mono(30, .medium)).foregroundStyle(Obs.ink).monospacedDigit()
                     Text("bpm").font(Obs.mono(13)).foregroundStyle(Obs.ink2)
                 }
-                Text("\(Self.dayLabel(c)) · \(String(format: "%02d:00", c.hour)) · open \(Int(c.open.rounded())) → close \(Int(c.close.rounded())) · \(c.count) beats")
+                Text("\(Self.dayLabel(bar)) · \(String(format: "%02d:00", bar.hour)) · avg \(Int(bar.mean.rounded())) · \(bar.count) beats")
                     .font(Obs.mono(10)).foregroundStyle(Obs.muted)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -205,28 +201,28 @@ struct HourlyHeartRateSection: View {
     static func stamp(_ unix: Double) -> String {
         stampFmt.string(from: Date(timeIntervalSince1970: unix))
     }
-    static func dayLabel(_ c: HourlyHR.Candle) -> String { String(c.ymd.suffix(5)) }
+    static func dayLabel(_ bar: HourlyHR.Bar) -> String { String(bar.ymd.suffix(5)) }
 }
 
-/// Candles on a real-time axis: every hour of the window gets a slot, so a gap in the
-/// data is a gap in the chart. Wick = low…high, body = open…close (filled when the
-/// hour ended higher than it started, hollow when it ended lower).
-private struct CandleChart: View {
-    let candles: [HourlyHR.Candle]
+/// Range bars on a real-time axis: every hour of the window gets a slot, so a gap in
+/// the data is a gap in the chart. Each bar spans that hour's lowest to highest beat,
+/// with a tick at the mean — the three numbers an hour of heart rate actually has.
+private struct HourlyRangeChart: View {
+    let bars: [HourlyHR.Bar]
     let window: HourlyWindow
-    @Binding var selected: HourlyHR.Candle?
+    @Binding var selected: HourlyHR.Bar?
 
     /// Slot start times: the newest hour anchors the right edge and the window runs
     /// backwards from it, one slot per hour whether or not it has beats.
     private var slots: [Double] {
-        guard let newest = candles.last?.unix else { return [] }
+        guard let newest = bars.last?.unix else { return [] }
         return (0..<window.hours).map { newest - Double((window.hours - 1 - $0) * 3600) }.sorted()
     }
 
     var body: some View {
-        let byHour = Dictionary(uniqueKeysWithValues: candles.map { ($0.unix, $0) })
-        let lo = candles.map(\.low).min() ?? 40
-        let hi = candles.map(\.high).max() ?? 120
+        let byHour = Dictionary(uniqueKeysWithValues: bars.map { ($0.unix, $0) })
+        let lo = bars.map(\.low).min() ?? 40
+        let hi = bars.map(\.high).max() ?? 120
         let pad = max(hi - lo, 1) * 0.1
         let domainLo = lo - pad, domainHi = hi + pad
         let span = max(domainHi - domainLo, 1e-6)
@@ -265,29 +261,26 @@ private struct CandleChart: View {
                         ctx.stroke(rule, with: .color(Obs.trace), style: StrokeStyle(lineWidth: 0.6, dash: [3, 3]))
                     }
 
-                    let bodyWidth = max(1.5, slotWidth * 0.62)
+                    let barWidth = max(1.5, slotWidth * 0.62)
                     for (i, start) in slots.enumerated() {
-                        guard let c = byHour[start] else { continue }
+                        guard let bar = byHour[start] else { continue }
                         let cx = slotWidth * (CGFloat(i) + 0.5)
                         let isSelected = selected?.unix == start
                         let tint = isSelected ? Obs.ink : Obs.chart
 
-                        var wick = Path()
-                        wick.move(to: CGPoint(x: cx, y: y(c.high)))
-                        wick.addLine(to: CGPoint(x: cx, y: y(c.low)))
-                        ctx.stroke(wick, with: .color(tint.opacity(isSelected ? 1 : 0.75)), lineWidth: 1)
+                        let top = y(bar.high)
+                        let bottom = y(bar.low)
+                        let rect = CGRect(x: cx - barWidth / 2, y: top,
+                                          width: barWidth, height: max(1.4, bottom - top))
+                        let shape = Path(roundedRect: rect, cornerRadius: min(2.5, barWidth / 2))
+                        ctx.fill(shape, with: .color(tint.opacity(isSelected ? 0.55 : 0.32)))
 
-                        let top = min(y(c.open), y(c.close))
-                        let bottom = max(y(c.open), y(c.close))
-                        let body = CGRect(x: cx - bodyWidth / 2, y: top,
-                                          width: bodyWidth, height: max(1.4, bottom - top))
-                        let shape = Path(roundedRect: body, cornerRadius: min(2, bodyWidth / 3))
-                        if c.rising {
-                            ctx.fill(shape, with: .color(tint.opacity(isSelected ? 1 : 0.85)))
-                        } else {
-                            ctx.fill(shape, with: .color(Obs.paper))
-                            ctx.stroke(shape, with: .color(tint), lineWidth: 1)
-                        }
+                        // the mean, where an hour spent most of its beats
+                        var tick = Path()
+                        let my = y(bar.mean)
+                        tick.move(to: CGPoint(x: cx - barWidth / 2, y: my))
+                        tick.addLine(to: CGPoint(x: cx + barWidth / 2, y: my))
+                        ctx.stroke(tick, with: .color(tint), lineWidth: isSelected ? 2 : 1.4)
                     }
                 }
                 .contentShape(Rectangle())
@@ -298,9 +291,8 @@ private struct CandleChart: View {
                             guard slots.indices.contains(i) else { return }
                             selected = byHour[slots[i]]
                         }
-                        .onEnded { _ in }
                 )
-                .accessibilityLabel("Hourly heart rate candles, \(candles.count) hours with data")
+                .accessibilityLabel("Hourly heart rate range, \(bars.count) hours with data")
             }
         }
     }

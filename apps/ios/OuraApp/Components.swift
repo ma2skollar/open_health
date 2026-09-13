@@ -295,7 +295,7 @@ struct VitalTrendView: View {
                         Text(kind.caption).font(Obs.prose(14)).foregroundStyle(Obs.ink2)
                             .fixedSize(horizontal: false, vertical: true)
                         // Heart rate is the one vital with all-day coverage, so it gets
-                        // the hour-by-hour view above the nightly trend.
+                        // the hour-by-hour range view above the nightly trend.
                         if kind == .heartRate {
                             HourlyHeartRateSection()
                             ObsTag("nightly resting", icon: "moon.fill")
