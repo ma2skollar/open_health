@@ -375,9 +375,83 @@ impl RingSession {
             result = self.pair_inner(existing_key_hex) => result,
         }
     }
+
+    /// **DESTRUCTIVE.** Wipe the ring back to factory state: the installed auth key,
+    /// every BLE bond, the on-ring event buffer and the anthropometric profile are
+    /// erased. Sync first — anything still only on the ring is lost.
+    ///
+    /// `confirm_serial` must equal the serial of the ring that actually answers, so a
+    /// tap can never wipe a different ring that happened to win the scan (a partner's
+    /// ring on the same charger, say). A mismatch aborts before anything is sent.
+    ///
+    /// The ring normally drops the link before replying, so an empty response is the
+    /// expected success path. Afterwards the ring is pairable again — `pair` mints a
+    /// new key — and its event counter keeps running, so start a fresh database
+    /// rather than resuming the old cursor.
+    pub async fn factory_reset(
+        &self,
+        key_hex: String,
+        confirm_serial: String,
+    ) -> Result<String, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.factory_reset_inner(key_hex, confirm_serial) => result,
+        }
+    }
 }
 
 impl RingSession {
+    /// The wipe opcode is assembled here, at the call site, rather than in
+    /// `oura-protocol` — upstream deliberately keeps it out of the shared protocol
+    /// crate so nothing that merely links the decoder can emit it.
+    const FACTORY_RESET_REQUEST: [u8; 2] = [0x1a, 0x00];
+
+    async fn factory_reset_inner(
+        &self,
+        key_hex: String,
+        confirm_serial: String,
+    ) -> Result<String, SyncError> {
+        let fail = SyncError::Failed;
+        let key = parse_key(&key_hex)
+            .ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
+        let transport = FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        };
+        let client = OuraClient::new(transport);
+
+        let serial = client
+            .serial()
+            .await
+            .map_err(|e| fail(format!("reading the ring serial: {e}")))?;
+        let expected = confirm_serial.trim();
+        if !expected.eq_ignore_ascii_case(&serial) {
+            return Err(fail(format!(
+                "refusing to wipe: the ring that answered is {serial}, not {expected}"
+            )));
+        }
+        client
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(format!("authenticating before wipe: {e}")))?;
+
+        // An empty reply is the expected outcome: the ring resets and drops the link
+        // faster than it answers. A transport error here is therefore not a failure.
+        let _ = oura_link::transport::transact(
+            client.transport(),
+            &Self::FACTORY_RESET_REQUEST,
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        Ok(serial)
+    }
+
     async fn pair_inner(
         &self,
         existing_key_hex: Option<String>,

@@ -128,6 +128,7 @@ struct SyncView: View {
     @State private var showKey = false
     @State private var clockReport: String?
     @State private var confirmReset = false
+    @State private var confirmWipeRing = false
     @FocusState private var keyFocused: Bool
 
     private var validKey: Bool {
@@ -176,6 +177,21 @@ struct SyncView: View {
                 }
             } message: {
                 Text("This removes the synced data on this iPhone. Your next sync will download the history still available on your ring.")
+            }
+            .alert("Factory-reset \(ring.knownSerial ?? "the ring")?", isPresented: $confirmWipeRing) {
+                Button("Cancel", role: .cancel) {}
+                Button("Erase the ring", role: .destructive) {
+                    let serial = ring.knownSerial ?? ""
+                    let current = key
+                    Task {
+                        if await ring.factoryReset(keyHex: current, confirmSerial: serial) {
+                            key = ""
+                            showKey = false
+                        }
+                    }
+                }
+            } message: {
+                Text("Erases the ring's pairing key, its Bluetooth bonds, any events it hasn't sent yet, and your stored body profile. Sync first if you want those events. This cannot be undone — but the ring stays yours: pair it again right here afterwards.")
             }
         }
         .tint(Obs.ink)
@@ -397,6 +413,13 @@ struct SyncView: View {
                 SupportRow(icon: "trash", title: "Reset local sync data",
                            detail: "Removes saved data from this iPhone. The next sync restores what your ring still holds.",
                            tint: Obs.alert, disabled: ring.busy) { confirmReset = true }
+                SupportDivider()
+                SupportRow(icon: "exclamationmark.triangle", title: "Factory-reset the ring",
+                           detail: ring.knownSerial == nil
+                               ? "Available once this iPhone has talked to your ring."
+                               : "Wipes the ring itself, not just this phone. Pair it again afterwards \u{2014} no computer needed.",
+                           tint: Obs.alert,
+                           disabled: ring.busy || ring.knownSerial == nil || !validKey) { confirmWipeRing = true }
             }
             .background(Obs.alert.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
             .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Obs.alert.opacity(0.18)))

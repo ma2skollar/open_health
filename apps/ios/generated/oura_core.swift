@@ -590,6 +590,22 @@ public protocol RingSessionProtocol : AnyObject {
     func cancel(reason: String) 
     
     /**
+     * **DESTRUCTIVE.** Wipe the ring back to factory state: the installed auth key,
+     * every BLE bond, the on-ring event buffer and the anthropometric profile are
+     * erased. Sync first — anything still only on the ring is lost.
+     *
+     * `confirm_serial` must equal the serial of the ring that actually answers, so a
+     * tap can never wipe a different ring that happened to win the scan (a partner's
+     * ring on the same charger, say). A mismatch aborts before anything is sent.
+     *
+     * The ring normally drops the link before replying, so an empty response is the
+     * expected success path. Afterwards the ring is pairable again — `pair` mints a
+     * new key — and its event counter keeps running, so start a fresh database
+     * rather than resuming the old cursor.
+     */
+    func factoryReset(keyHex: String, confirmSerial: String) async throws  -> String
+    
+    /**
      * Pair with a **factory-reset** ring: install a 16-byte app-auth key over the
      * already-connected link and verify it authenticates. This is the on-device
      * equivalent of the desktop `oura pair`, so a ring can be adopted from the phone
@@ -691,6 +707,37 @@ open func cancel(reason: String) {try! rustCall() {
         FfiConverterString.lower(reason),$0
     )
 }
+}
+    
+    /**
+     * **DESTRUCTIVE.** Wipe the ring back to factory state: the installed auth key,
+     * every BLE bond, the on-ring event buffer and the anthropometric profile are
+     * erased. Sync first — anything still only on the ring is lost.
+     *
+     * `confirm_serial` must equal the serial of the ring that actually answers, so a
+     * tap can never wipe a different ring that happened to win the scan (a partner's
+     * ring on the same charger, say). A mismatch aborts before anything is sent.
+     *
+     * The ring normally drops the link before replying, so an empty response is the
+     * expected success path. Afterwards the ring is pairable again — `pair` mints a
+     * new key — and its event counter keeps running, so start a fresh database
+     * rather than resuming the old cursor.
+     */
+open func factoryReset(keyHex: String, confirmSerial: String)async throws  -> String {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_oura_core_fn_method_ringsession_factory_reset(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(keyHex),FfiConverterString.lower(confirmSerial)
+                )
+            },
+            pollFunc: ffi_oura_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_oura_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_oura_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeSyncError.lift
+        )
 }
     
     /**
@@ -1486,6 +1533,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_method_ringsession_cancel() != 11635) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_method_ringsession_factory_reset() != 9780) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_method_ringsession_pair() != 40653) {
