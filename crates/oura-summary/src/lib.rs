@@ -12,6 +12,7 @@
 //! *render* it: web `dashboard/web/app.js`, iOS `apps/ios/OuraApp/OuraApp.swift`. See
 //! `docs/clients-web-and-ios.md`.
 
+pub mod hourly_hr;
 pub mod ring_time;
 
 use std::path::{Path, PathBuf};

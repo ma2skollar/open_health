@@ -79,6 +79,7 @@ targets:
       - path: Reports.swift
       - path: DayExport.swift
       - path: RawData.swift
+      - path: HeartRate.swift
       - path: Theme.swift
       - path: BLETransport.swift
       - path: RingSync.swift

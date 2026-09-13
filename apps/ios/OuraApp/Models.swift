@@ -230,7 +230,7 @@ enum VitalKind: String, Identifiable, CaseIterable {
     var caption: String {
         switch self {
         case .hrv: return "RMSSD from the longest sleep of each morning"
-        case .heartRate: return "Nightly minimum resting heart rate"
+        case .heartRate: return "Hour by hour from the beats the ring recorded, plus the nightly minimum resting rate"
         case .temp: return "Nightly skin temperature"
         case .oxygen: return "Nightly average blood oxygen"
         }

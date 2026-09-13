@@ -1503,6 +1503,26 @@ public func exportDatabase(dbPath: String, outPath: String)throws  {try rustCall
 }
 }
 /**
+ * Hourly heart-rate candles for the HR detail screen — one candle per local-clock
+ * hour, `{low, high, open, close, mean, count}`, plus the newest quality-gated
+ * reading as `latest`.
+ *
+ * The nightly RHR trend answers "how have I been sleeping"; this answers "what did
+ * my heart do today". `tz_offset` is whole hours from UTC (same as [`summary_json`]),
+ * `days` caps the window to that many days back from the newest sample (0 = all).
+ *
+ * Returns the JSON string, or `{ "error": "…" }`.
+ */
+public func hourlyHrJson(dbPath: String, tzOffset: Int64, days: UInt32) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_oura_core_fn_func_hourly_hr_json(
+        FfiConverterString.lower(dbPath),
+        FfiConverterInt64.lower(tzOffset),
+        FfiConverterUInt32.lower(days),$0
+    )
+})
+}
+/**
  * A lightweight, model-free summary (device + data-health only) — kept as a fast
  * path / fallback. Returns `{ serials, device, event_counts, decoded_events }`.
  */
@@ -1573,6 +1593,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_export_database() != 46626) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_func_hourly_hr_json() != 6725) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_quick_summary_json() != 19199) {

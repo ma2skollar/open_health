@@ -294,6 +294,12 @@ struct VitalTrendView: View {
                     VStack(alignment: .leading, spacing: 22) {
                         Text(kind.caption).font(Obs.prose(14)).foregroundStyle(Obs.ink2)
                             .fixedSize(horizontal: false, vertical: true)
+                        // Heart rate is the one vital with all-day coverage, so it gets
+                        // the hour-by-hour view above the nightly trend.
+                        if kind == .heartRate {
+                            HourlyHeartRateSection()
+                            ObsTag("nightly resting", icon: "moon.fill")
+                        }
                         Picker("Period", selection: $period) {
                             ForEach(VitalPeriod.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                         }
