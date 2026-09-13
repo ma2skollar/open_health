@@ -301,6 +301,11 @@ void*_Nonnull uniffi_oura_core_fn_constructor_ringsession_new(uint64_t writer, R
 void uniffi_oura_core_fn_method_ringsession_cancel(void*_Nonnull ptr, RustBuffer reason, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PAIR
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PAIR
+uint64_t uniffi_oura_core_fn_method_ringsession_pair(void*_Nonnull ptr, RustBuffer existing_key_hex
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PUSH_FRAME
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PUSH_FRAME
 void uniffi_oura_core_fn_method_ringsession_push_frame(void*_Nonnull ptr, RustBuffer data, RustCallStatus *_Nonnull out_status
@@ -671,6 +676,12 @@ uint16_t uniffi_oura_core_checksum_func_summary_json(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_CANCEL
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_CANCEL
 uint16_t uniffi_oura_core_checksum_method_ringsession_cancel(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_PAIR
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_PAIR
+uint16_t uniffi_oura_core_checksum_method_ringsession_pair(void
     
 );
 #endif

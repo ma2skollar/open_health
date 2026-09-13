@@ -21,6 +21,8 @@ oura-link = { git = "https://github.com/Th0rgal/open_oura", rev = "bd2f1508fbd57
 uniffi = { version = "0.28", features = ["cli", "tokio"] }
 tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "macros", "time"] }
 async-trait = "0.1"
+# CSPRNG for minting a ring auth key on device (SecRandomCopyBytes on Apple)
+getrandom = "0.2"
 thiserror = "1"
 serde_json = "1"
 

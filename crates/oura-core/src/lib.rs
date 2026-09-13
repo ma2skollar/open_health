@@ -130,6 +130,20 @@ pub struct SyncReport {
     pub next_cursor: u32,
 }
 
+/// What a successful [`RingSession::pair`] installed.
+///
+/// `key_hex` is the ONLY copy of the ring's auth key: the ring stores it but never
+/// reads it back, and losing it can only be undone by another factory reset. Persist
+/// it (Keychain) before doing anything else with this value.
+#[derive(uniffi::Record)]
+pub struct PairReport {
+    pub serial: String,
+    pub key_hex: String,
+    /// True when the key was freshly minted here, false when `existing_key_hex`
+    /// re-installed a key the caller already held.
+    pub minted: bool,
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum SyncError {
     #[error("{0}")]
@@ -337,9 +351,76 @@ impl RingSession {
             result = self.sync_inner(db_path, key_hex, progress) => result,
         }
     }
+
+    /// Pair with a **factory-reset** ring: install a 16-byte app-auth key over the
+    /// already-connected link and verify it authenticates. This is the on-device
+    /// equivalent of the desktop `oura pair`, so a ring can be adopted from the phone
+    /// alone — no computer, and the key never leaves the device.
+    ///
+    /// `existing_key_hex` re-installs a key the caller already holds (keeping a
+    /// re-paired ring's history attributable to the same key); `None` mints a fresh
+    /// one from the system CSPRNG.
+    ///
+    /// Only valid on a reset ring: one that still holds a key answers `set_auth_key`
+    /// with a non-zero status and the call fails without changing anything.
+    pub async fn pair(&self, existing_key_hex: Option<String>) -> Result<PairReport, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.pair_inner(existing_key_hex) => result,
+        }
+    }
 }
 
 impl RingSession {
+    async fn pair_inner(
+        &self,
+        existing_key_hex: Option<String>,
+    ) -> Result<PairReport, SyncError> {
+        let fail = SyncError::Failed;
+        let (key, minted) = match existing_key_hex
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(hex) => (
+                parse_key(hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?,
+                false,
+            ),
+            None => (random_key().map_err(fail)?, true),
+        };
+        let transport = FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        };
+        let client = OuraClient::new(transport);
+
+        // Read the serial first: it needs no auth, so a dead link or a charging case
+        // that won the scan fails here rather than after a key is already installed.
+        let serial = client
+            .serial()
+            .await
+            .map_err(|e| fail(format!("reading the ring serial: {e}")))?;
+        client
+            .set_auth_key(&key)
+            .await
+            .map_err(|e| fail(format!("{e} — is the ring factory-reset?")))?;
+        client
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(format!("key installed on {serial} but verification failed: {e}")))?;
+        Ok(PairReport {
+            serial,
+            key_hex: to_hex(&key),
+            minted,
+        })
+    }
+
     async fn sync_inner(
         &self,
         db_path: String,
@@ -500,6 +581,17 @@ fn phone_anchor_event(events_synced: u32, next_cursor: u32, now: u64) -> Option<
     })
 }
 
+/// A fresh 16-byte auth key from the system CSPRNG (`SecRandomCopyBytes` on Apple).
+fn random_key() -> Result<[u8; 16], String> {
+    let mut key = [0u8; 16];
+    getrandom::getrandom(&mut key).map_err(|e| format!("system CSPRNG unavailable: {e}"))?;
+    Ok(key)
+}
+
+fn to_hex(key: &[u8; 16]) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn parse_key(hex: &str) -> Option<[u8; 16]> {
     let hex = hex.trim();
     if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -515,6 +607,20 @@ fn parse_key(hex: &str) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minted_keys_round_trip_through_hex() {
+        let key = random_key().expect("system CSPRNG");
+        let hex = to_hex(&key);
+        assert_eq!(hex.len(), 32);
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert_eq!(parse_key(&hex), Some(key));
+    }
+
+    #[test]
+    fn minted_keys_are_not_constant() {
+        assert_ne!(random_key().unwrap(), random_key().unwrap());
+    }
 
     struct SilentWriter;
     impl BleWriter for SilentWriter {

@@ -255,11 +255,35 @@ struct SyncView: View {
             .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(keyFocused ? Obs.muted : Obs.rule))
             Text(!key.isEmpty && !validKey
                  ? "Use all 32 characters: numbers 0–9 and letters A–F."
-                 : "Paste the 32-character key exported on your computer.")
+                 : "Paste the 32-character key exported on your computer, or pair a reset ring below.")
+                .font(.footnote)
+                .foregroundStyle(Obs.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+            pairReset
+        }
+    }
+
+    /// Adopt a factory-reset ring without a computer: mint the key on this iPhone.
+    private var pairReset: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                keyFocused = false
+                Task { if let minted = await ring.pair() { key = minted } }
+            } label: {
+                Label("Pair a factory-reset ring", systemImage: "key")
+                    .font(.subheadline.weight(.medium))
+                    .frame(maxWidth: .infinity, minHeight: 48)
+                    .foregroundStyle(Obs.ink)
+                    .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Obs.rule))
+            }
+            .buttonStyle(.plain)
+            .disabled(ring.busy)
+            Text("Mints a new key on this iPhone and installs it on the ring. Only works on a ring that has been factory-reset — it replaces nothing on a ring that already has a key. Reveal and write the key down afterwards: it cannot be read back off the ring.")
                 .font(.footnote)
                 .foregroundStyle(Obs.ink2)
                 .fixedSize(horizontal: false, vertical: true)
         }
+        .padding(.top, 4)
     }
 
     @ViewBuilder

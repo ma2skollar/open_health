@@ -590,6 +590,21 @@ public protocol RingSessionProtocol : AnyObject {
     func cancel(reason: String) 
     
     /**
+     * Pair with a **factory-reset** ring: install a 16-byte app-auth key over the
+     * already-connected link and verify it authenticates. This is the on-device
+     * equivalent of the desktop `oura pair`, so a ring can be adopted from the phone
+     * alone — no computer, and the key never leaves the device.
+     *
+     * `existing_key_hex` re-installs a key the caller already holds (keeping a
+     * re-paired ring's history attributable to the same key); `None` mints a fresh
+     * one from the system CSPRNG.
+     *
+     * Only valid on a reset ring: one that still holds a key answers `set_auth_key`
+     * with a non-zero status and the call fails without changing anything.
+     */
+    func pair(existingKeyHex: String?) async throws  -> PairReport
+    
+    /**
      * Swift pushes each inbound BLE notification frame here.
      */
     func pushFrame(data: Data) 
@@ -679,6 +694,36 @@ open func cancel(reason: String) {try! rustCall() {
 }
     
     /**
+     * Pair with a **factory-reset** ring: install a 16-byte app-auth key over the
+     * already-connected link and verify it authenticates. This is the on-device
+     * equivalent of the desktop `oura pair`, so a ring can be adopted from the phone
+     * alone — no computer, and the key never leaves the device.
+     *
+     * `existing_key_hex` re-installs a key the caller already holds (keeping a
+     * re-paired ring's history attributable to the same key); `None` mints a fresh
+     * one from the system CSPRNG.
+     *
+     * Only valid on a reset ring: one that still holds a key answers `set_auth_key`
+     * with a non-zero status and the call fails without changing anything.
+     */
+open func pair(existingKeyHex: String?)async throws  -> PairReport {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_oura_core_fn_method_ringsession_pair(
+                    self.uniffiClonePointer(),
+                    FfiConverterOptionString.lower(existingKeyHex)
+                )
+            },
+            pollFunc: ffi_oura_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_oura_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_oura_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePairReport.lift,
+            errorHandler: FfiConverterTypeSyncError.lift
+        )
+}
+    
+    /**
      * Swift pushes each inbound BLE notification frame here.
      */
 open func pushFrame(data: Data) {try! rustCall() {
@@ -765,6 +810,95 @@ public func FfiConverterTypeRingSession_lift(_ pointer: UnsafeMutableRawPointer)
 #endif
 public func FfiConverterTypeRingSession_lower(_ value: RingSession) -> UnsafeMutableRawPointer {
     return FfiConverterTypeRingSession.lower(value)
+}
+
+
+/**
+ * What a successful [`RingSession::pair`] installed.
+ *
+ * `key_hex` is the ONLY copy of the ring's auth key: the ring stores it but never
+ * reads it back, and losing it can only be undone by another factory reset. Persist
+ * it (Keychain) before doing anything else with this value.
+ */
+public struct PairReport {
+    public var serial: String
+    public var keyHex: String
+    /**
+     * True when the key was freshly minted here, false when `existing_key_hex`
+     * re-installed a key the caller already held.
+     */
+    public var minted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(serial: String, keyHex: String, 
+        /**
+         * True when the key was freshly minted here, false when `existing_key_hex`
+         * re-installed a key the caller already held.
+         */minted: Bool) {
+        self.serial = serial
+        self.keyHex = keyHex
+        self.minted = minted
+    }
+}
+
+
+
+extension PairReport: Equatable, Hashable {
+    public static func ==(lhs: PairReport, rhs: PairReport) -> Bool {
+        if lhs.serial != rhs.serial {
+            return false
+        }
+        if lhs.keyHex != rhs.keyHex {
+            return false
+        }
+        if lhs.minted != rhs.minted {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(serial)
+        hasher.combine(keyHex)
+        hasher.combine(minted)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePairReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PairReport {
+        return
+            try PairReport(
+                serial: FfiConverterString.read(from: &buf), 
+                keyHex: FfiConverterString.read(from: &buf), 
+                minted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PairReport, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.serial, into: &buf)
+        FfiConverterString.write(value.keyHex, into: &buf)
+        FfiConverterBool.write(value.minted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePairReport_lift(_ buf: RustBuffer) throws -> PairReport {
+    return try FfiConverterTypePairReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePairReport_lower(_ value: PairReport) -> RustBuffer {
+    return FfiConverterTypePairReport.lower(value)
 }
 
 
@@ -1155,6 +1289,30 @@ extension FfiConverterCallbackInterfaceSyncProgressListener : FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt16: FfiConverterRustBuffer {
     typealias SwiftType = [UInt16]
 
@@ -1328,6 +1486,9 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_method_ringsession_cancel() != 11635) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_method_ringsession_pair() != 40653) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_method_ringsession_push_frame() != 19557) {

@@ -454,6 +454,74 @@ final class RingSync: ObservableObject {
 
     /// Connect, wire the inbound-frame pump, and run a full sync into the writable DB.
     @discardableResult
+    /// Adopt a **factory-reset** ring from the phone alone: connect, install a freshly
+    /// minted 16-byte auth key, and save it to the Keychain. Returns the key as 32 hex
+    /// characters so the UI can offer a backup — it is the only copy, and a lost key
+    /// costs another factory reset.
+    ///
+    /// `existingKeyHex` re-installs a key you already hold instead of minting one.
+    /// A ring that still holds a key rejects this; reset it first.
+    func pair(existingKeyHex: String? = nil) async -> String? {
+        guard !busy else { return nil }
+        guard WorkCoordinator.shared.available else { status = "paused — open the app to pair"; return nil }
+        connectionIssue = nil
+        busy = true
+        paused = false
+        await WorkGate.shared.acquire()
+        IdleTimerLock.acquire("ring-pair")
+        defer {
+            busy = false
+            IdleTimerLock.release("ring-pair")
+            Task { await WorkGate.shared.release() }
+            WorkCoordinator.shared.endCleanup()
+            pump?.cancel()
+            pump = nil
+            // free the ring's single BLE link, exactly as a sync does
+            transport?.disconnect()
+            transport = nil
+            session = nil
+        }
+
+        dlog("pair", "start — scanning for a reset ring")
+        status = "looking for a ring on its charger…"
+        let t = BLETransport(nameContains: "Oura")
+        transport = t
+        do {
+            try await t.connect()
+        } catch {
+            dlog("pair", "BLE connect FAILED: \(error)")
+            if case BLEError.poweredOff = error {
+                status = "Bluetooth unavailable — check power and permission in Settings"
+            } else {
+                status = "couldn't connect (\(error)) — put the reset ring on its charger next to this iPhone"
+            }
+            return nil
+        }
+
+        let s = RingSession(writer: RingWriter(t))
+        session = s
+        let frames = t.notifications
+        pump = Task {
+            for await frame in frames { s.pushFrame(data: frame) }
+            s.cancel(reason: "transport closed")
+        }
+
+        status = "installing a new key…"
+        do {
+            let report = try await s.pair(existingKeyHex: existingKeyHex)
+            // Persist BEFORE anything else can fail: the ring now holds this key and
+            // will not hand it back.
+            Keychain.saveKey(report.keyHex)
+            dlog("pair", "paired \(report.serial) minted=\(report.minted)")
+            status = "paired with \(report.serial) — key saved to this iPhone. Back it up: it can't be read off the ring."
+            return report.keyHex
+        } catch {
+            dlog("pair", "FAILED: \(error)")
+            status = "pairing failed: \(error)"
+            return nil
+        }
+    }
+
     func run(keyHex: String, maxAttempts: Int = 6, source: String = "manual") async -> SyncReport? {
         guard !busy else { return nil }
         connectionIssue = nil
