@@ -147,6 +147,7 @@ struct SyncView: View {
                     if !ring.busy { pairingKey }
                     connection
                     support
+                    BuildStamp()
                 }
                 .frame(maxWidth: 520)
                 .padding(.horizontal, 24)
@@ -1033,10 +1034,63 @@ struct RootView: View {
                             ObsStat(label: "nights", value: "\(s.device?.nights ?? s.nights.count)")
                         }
                         .obsCard()
+                        BuildStamp()
                     }
                 }
                 .padding(24).padding(.top, 8)
             }
+    }
+}
+
+/// Which build is actually on this phone. A sideloaded app has no App Store version
+/// to compare against, and a failed install looks exactly like a successful one — so
+/// show the version, when this binary was signed, and when its free-account
+/// certificate stops launching (7 days).
+struct BuildStamp: View {
+    private static let signedAt: Date? = {
+        guard let path = Bundle.main.executableURL?.path,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
+        return attrs[.modificationDate] as? Date
+    }()
+
+    private static let stampFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d HH:mm"
+        return f
+    }()
+
+    private static let dayFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d"
+        return f
+    }()
+
+    private var line: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        var out = "Open Oura \(short) (\(build)) · \(coreVersion())"
+        if let signed = Self.signedAt {
+            out += " · built \(Self.stampFormat.string(from: signed))"
+            if let expiry = Calendar.current.date(byAdding: .day, value: 7, to: signed) {
+                let days = Calendar.current.dateComponents([.day], from: Date(), to: expiry).day ?? 0
+                out += days < 0
+                    ? " · signing expired"
+                    : " · signing good to \(Self.dayFormat.string(from: expiry))"
+            }
+        }
+        return out
+    }
+
+    var body: some View {
+        Text(line)
+            .font(Obs.mono(10))
+            .foregroundStyle(Obs.ink2)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.top, 6)
+            .textSelection(.enabled)
     }
 }
 
