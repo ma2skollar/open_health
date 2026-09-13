@@ -44,6 +44,124 @@ pub fn summary_json(db_path: String, tz_offset: i64) -> String {
     }
 }
 
+/// Write a clean single-file copy of the database to `dest_path` — the export half of
+/// backup/restore.
+///
+/// Uses `VACUUM INTO`, not a file copy: the store runs in WAL mode, so the `.db` on its
+/// own can be missing the most recent events, and `VACUUM INTO` folds the write-ahead
+/// log in and produces one consistent, defragmented file. It reads the source without
+/// modifying it, so it is safe while the app is otherwise idle.
+///
+/// The result carries ring data only. The auth key lives in the Keychain and is NOT in
+/// here — restoring onto a fresh phone still needs the key entered separately.
+#[uniffi::export]
+pub fn backup_database(db_path: String, dest_path: String) -> Result<u64, SyncError> {
+    let _ = std::fs::remove_file(&dest_path); // VACUUM INTO refuses an existing target
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| SyncError::Failed(format!("opening {db_path}: {e}")))?;
+    conn.execute("VACUUM INTO ?1", [&dest_path])
+        .map_err(|e| SyncError::Failed(format!("writing the backup: {e}")))?;
+    std::fs::metadata(&dest_path)
+        .map(|m| m.len())
+        .map_err(|e| SyncError::Failed(format!("backup written but unreadable: {e}")))
+}
+
+/// Every decoded event the ring has sent, newest first — the raw-data browser and
+/// the debug charts behind it.
+///
+/// `name_filter` limits to one event type (`hrv_event`, `green_ibi_quality_event`, …);
+/// empty means all. `limit` caps the rows returned — the table reaches six figures on
+/// a real ring, so the UI pages rather than loading everything.
+///
+/// Each event carries `unix_s`, resolved through the same boot-epoch [`RingClock`] the
+/// summary uses, so points land on the right day even across a ring reboot; the raw
+/// `ring_timestamp` and the phone's `captured_unix` are passed through unchanged for
+/// when that resolution is itself what you're debugging. `decoded` is the decoder's own
+/// JSON object, so a chart can plot any numeric field in it without the FFI knowing
+/// what the field means.
+///
+/// Returns `{ counts: [{name, total, decoded}], events: [...] }`, or `{ "error": … }`.
+#[uniffi::export]
+pub fn events_json(db_path: String, name_filter: String, limit: u32) -> String {
+    match raw_events(&db_path, &name_filter, limit) {
+        Ok(v) => v.to_string(),
+        Err(e) => json!({ "error": e }).to_string(),
+    }
+}
+
+fn raw_events(db_path: &str, name_filter: &str, limit: u32) -> Result<serde_json::Value, String> {
+    use rusqlite::OpenFlags;
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut counts = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, COUNT(*), SUM(decoded_json IS NOT NULL) \
+                 FROM events GROUP BY name ORDER BY COUNT(*) DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(json!({
+                    "name": r.get::<_, String>(0)?,
+                    "total": r.get::<_, i64>(1)?,
+                    "decoded": r.get::<_, i64>(2)?,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            counts.push(row.map_err(|e| e.to_string())?);
+        }
+    }
+
+    // The clock needs the WHOLE decoded history to find boot epochs and their
+    // time_sync anchors — resolving against a filtered slice would misdate events.
+    let store = oura_store::storage::Store::open_read_only(db_path).map_err(|e| e.to_string())?;
+    let all = store.decoded_events().map_err(|e| e.to_string())?;
+    let clock = oura_summary::ring_time::RingClock::from_events(&all);
+
+    let filtered = !name_filter.trim().is_empty();
+    let sql = if filtered {
+        "SELECT name, tag, ring_timestamp, captured_unix, decoded_json, LENGTH(body) \
+         FROM events WHERE name = ?1 ORDER BY captured_unix DESC, id DESC LIMIT ?2"
+    } else {
+        "SELECT name, tag, ring_timestamp, captured_unix, decoded_json, LENGTH(body) \
+         FROM events ORDER BY captured_unix DESC, id DESC LIMIT ?2"
+    };
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let mut events = Vec::new();
+    let rows = stmt
+        .query_map(rusqlite::params![name_filter.trim(), limit as i64], |r| {
+            let ds: i64 = r.get(2)?;
+            let captured: i64 = r.get(3)?;
+            let decoded: Option<String> = r.get(4)?;
+            Ok(json!({
+                "name": r.get::<_, String>(0)?,
+                "tag": r.get::<_, i64>(1)?,
+                "ring_timestamp": ds,
+                "captured_unix": captured,
+                "unix_s": clock.unix_s(ds, captured),
+                "body_len": r.get::<_, i64>(5)?,
+                "decoded": decoded
+                    .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok()),
+            }))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        events.push(row.map_err(|e| e.to_string())?);
+    }
+
+    Ok(json!({ "counts": counts, "events": events }))
+}
+
 /// A lightweight, model-free summary (device + data-health only) — kept as a fast
 /// path / fallback. Returns `{ serials, device, event_counts, decoded_events }`.
 #[uniffi::export]
@@ -814,5 +932,56 @@ mod tests {
             "protocol error: extended history request failed with result code 0xff"
         ));
         assert!(!is_rejected_history_cursor("BLE link lost mid-batch"));
+    }
+}
+
+#[cfg(test)]
+mod raw_event_tests {
+    use super::*;
+
+    #[test]
+    fn backup_round_trips_through_vacuum_into() {
+        let dir = std::env::temp_dir().join(format!("oura-core-backup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("oura.db");
+        let dst = dir.join("backup.db");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+        drop(oura_store::storage::Store::open(src.to_str().unwrap()).unwrap());
+
+        let bytes = backup_database(src.to_str().unwrap().into(), dst.to_str().unwrap().into())
+            .expect("backup");
+        assert!(bytes > 0);
+        // the copy must be a usable store, not just bytes on disk
+        assert!(database_integrity(dst.to_str().unwrap().into())
+            .expect("integrity")
+            .contains("ok"));
+        // and re-running must overwrite rather than fail on an existing file
+        backup_database(src.to_str().unwrap().into(), dst.to_str().unwrap().into())
+            .expect("second backup");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn missing_database_reports_an_error_object() {
+        let out = events_json("/nonexistent/oura.db".into(), String::new(), 10);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("error").is_some(), "{out}");
+    }
+
+    #[test]
+    fn empty_database_yields_empty_lists() {
+        let dir = std::env::temp_dir().join(format!("oura-core-raw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("oura.db");
+        let _ = std::fs::remove_file(&db);
+        // Store::open creates the schema.
+        drop(oura_store::storage::Store::open(db.to_str().unwrap()).unwrap());
+        let out = events_json(db.to_str().unwrap().into(), String::new(), 10);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["counts"].as_array().unwrap().len(), 0, "{out}");
+        assert_eq!(v["events"].as_array().unwrap().len(), 0, "{out}");
+        let _ = std::fs::remove_file(&db);
     }
 }

@@ -1428,6 +1428,26 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
     }
 }
 /**
+ * Write a clean single-file copy of the database to `dest_path` — the export half of
+ * backup/restore.
+ *
+ * Uses `VACUUM INTO`, not a file copy: the store runs in WAL mode, so the `.db` on its
+ * own can be missing the most recent events, and `VACUUM INTO` folds the write-ahead
+ * log in and produces one consistent, defragmented file. It reads the source without
+ * modifying it, so it is safe while the app is otherwise idle.
+ *
+ * The result carries ring data only. The auth key lives in the Keychain and is NOT in
+ * here — restoring onto a fresh phone still needs the key entered separately.
+ */
+public func backupDatabase(dbPath: String, destPath: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_oura_core_fn_func_backup_database(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(destPath),$0
+    )
+})
+}
+/**
  * Build/version string — a trivial call to validate the FFI round-trip.
  */
 public func coreVersion() -> String {
@@ -1440,6 +1460,32 @@ public func databaseIntegrity(dbPath: String)throws  -> String {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
     uniffi_oura_core_fn_func_database_integrity(
         FfiConverterString.lower(dbPath),$0
+    )
+})
+}
+/**
+ * Every decoded event the ring has sent, newest first — the raw-data browser and
+ * the debug charts behind it.
+ *
+ * `name_filter` limits to one event type (`hrv_event`, `green_ibi_quality_event`, …);
+ * empty means all. `limit` caps the rows returned — the table reaches six figures on
+ * a real ring, so the UI pages rather than loading everything.
+ *
+ * Each event carries `unix_s`, resolved through the same boot-epoch [`RingClock`] the
+ * summary uses, so points land on the right day even across a ring reboot; the raw
+ * `ring_timestamp` and the phone's `captured_unix` are passed through unchanged for
+ * when that resolution is itself what you're debugging. `decoded` is the decoder's own
+ * JSON object, so a chart can plot any numeric field in it without the FFI knowing
+ * what the field means.
+ *
+ * Returns `{ counts: [{name, total, decoded}], events: [...] }`, or `{ "error": … }`.
+ */
+public func eventsJson(dbPath: String, nameFilter: String, limit: UInt32) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_oura_core_fn_func_events_json(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(nameFilter),
+        FfiConverterUInt32.lower(limit),$0
     )
 })
 }
@@ -1514,10 +1560,16 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_oura_core_checksum_func_backup_database() != 40677) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_oura_core_checksum_func_core_version() != 24695) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_database_integrity() != 19533) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_func_events_json() != 22398) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_export_database() != 46626) {

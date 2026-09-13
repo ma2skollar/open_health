@@ -331,6 +331,11 @@ void uniffi_oura_core_fn_init_callback_vtable_blewriter(UniffiVTableCallbackInte
 void uniffi_oura_core_fn_init_callback_vtable_syncprogresslistener(UniffiVTableCallbackInterfaceSyncProgressListener* _Nonnull vtable
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_BACKUP_DATABASE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_BACKUP_DATABASE
+uint64_t uniffi_oura_core_fn_func_backup_database(RustBuffer db_path, RustBuffer dest_path, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_CORE_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_CORE_VERSION
 RustBuffer uniffi_oura_core_fn_func_core_version(RustCallStatus *_Nonnull out_status
@@ -340,6 +345,11 @@ RustBuffer uniffi_oura_core_fn_func_core_version(RustCallStatus *_Nonnull out_st
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_DATABASE_INTEGRITY
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_DATABASE_INTEGRITY
 RustBuffer uniffi_oura_core_fn_func_database_integrity(RustBuffer db_path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EVENTS_JSON
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EVENTS_JSON
+RustBuffer uniffi_oura_core_fn_func_events_json(RustBuffer db_path, RustBuffer name_filter, uint32_t limit, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EXPORT_DATABASE
@@ -642,6 +652,12 @@ void ffi_oura_core_rust_future_free_void(uint64_t handle
 void ffi_oura_core_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_BACKUP_DATABASE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_BACKUP_DATABASE
+uint16_t uniffi_oura_core_checksum_func_backup_database(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_CORE_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_CORE_VERSION
 uint16_t uniffi_oura_core_checksum_func_core_version(void
@@ -651,6 +667,12 @@ uint16_t uniffi_oura_core_checksum_func_core_version(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_DATABASE_INTEGRITY
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_DATABASE_INTEGRITY
 uint16_t uniffi_oura_core_checksum_func_database_integrity(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_EVENTS_JSON
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_EVENTS_JSON
+uint16_t uniffi_oura_core_checksum_func_events_json(void
     
 );
 #endif

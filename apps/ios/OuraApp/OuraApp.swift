@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 // The SwiftUI screens for OuraApp. Data types live in Models.swift, the model/FFI
 // orchestration in Core.swift, the reusable charts/cells in Components.swift, and the
@@ -129,7 +130,42 @@ struct SyncView: View {
     @State private var clockReport: String?
     @State private var confirmReset = false
     @State private var confirmWipeRing = false
+    @State private var backupFile: URL?
+    @State private var showRestorePicker = false
+    @State private var restoreNote: String?
     @FocusState private var keyFocused: Bool
+
+    static let backupStamp: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HHmm"; return f
+    }()
+
+    /// Validate the chosen file before it replaces anything: a truncated download or
+    /// the wrong file entirely must not destroy a working database.
+    private func restore(from result: Result<[URL], Error>) -> String {
+        guard case .success(let urls) = result, let picked = urls.first else { return "Restore cancelled." }
+        let scoped = picked.startAccessingSecurityScopedResource()
+        defer { if scoped { picked.stopAccessingSecurityScopedResource() } }
+        let staging = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restore-candidate.db")
+        do {
+            try? FileManager.default.removeItem(at: staging)
+            try FileManager.default.copyItem(at: picked, to: staging)
+        } catch { return "Could not read that file: \(error.localizedDescription)" }
+
+        do {
+            let verdict = try databaseIntegrity(dbPath: staging.path)
+            guard verdict.lowercased().contains("ok") else {
+                return "That file is not a healthy database (\(verdict)). Nothing changed."
+            }
+        } catch { return "That file is not an Open Oura backup. Nothing changed." }
+
+        do {
+            try DB.resetWritableStore()
+            try FileManager.default.copyItem(at: staging, to: DB.url)
+            try? FileManager.default.removeItem(at: staging)
+        } catch { return "Restore failed midway: \(error.localizedDescription)" }
+        return "Restored. The next sync continues from where the backup left off."
+    }
 
     private var validKey: Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -198,6 +234,15 @@ struct SyncView: View {
         // Sync belongs to RingSync and continues when this panel is dismissed.
         .sheet(isPresented: Binding(get: { diagnosticFile != nil }, set: { if !$0 { diagnosticFile = nil } })) {
             if let diagnosticFile { DiagnosticsShare(url: diagnosticFile) }
+        }
+        .sheet(isPresented: Binding(get: { backupFile != nil }, set: { if !$0 { backupFile = nil } })) {
+            if let backupFile { DiagnosticsShare(url: backupFile) }
+        }
+        .fileImporter(isPresented: $showRestorePicker,
+                      allowedContentTypes: [.data],
+                      allowsMultipleSelection: false) { result in
+            restoreNote = restore(from: result)
+            if restoreNote?.hasPrefix("Restored") == true { onReset() }
         }
         .presentationDragIndicator(.visible)
     }
@@ -398,6 +443,37 @@ struct SyncView: View {
                            disabled: ring.busy) {
                     Task { if let url = await ring.exportRawDatabase() { diagnosticFile = url } }
                 }
+                SupportDivider()
+                NavigationLink {
+                    RawDataView()
+                } label: {
+                    SupportRowLabel(icon: "waveform.path.ecg", title: "Raw data & charts",
+                                    detail: "Browse every event the ring sent, and chart any field",
+                                    trailing: "chevron.right")
+                }
+                .buttonStyle(.plain)
+                SupportDivider()
+                SupportRow(icon: "arrow.down.doc", title: "Back up data",
+                           detail: "One consistent file with every event synced from the ring. The pairing key is not in it \u{2014} it stays in this iPhone's Keychain.",
+                           disabled: ring.busy) {
+                    Task {
+                        let made = await Task.detached { () -> URL? in
+                            let name = "oura-backup-\(Self.backupStamp.string(from: Date())).db"
+                            let dest = FileManager.default.temporaryDirectory
+                                .appendingPathComponent(name)
+                            do {
+                                _ = try backupDatabase(dbPath: DB.readPath(), destPath: dest.path)
+                                return dest
+                            } catch { return nil }
+                        }.value
+                        if let made { backupFile = made }
+                        else { restoreNote = "Backup failed \u{2014} nothing written." }
+                    }
+                }
+                SupportDivider()
+                SupportRow(icon: "arrow.up.doc", title: "Restore from a backup",
+                           detail: restoreNote ?? "Replace what this iPhone holds with a backup file",
+                           disabled: ring.busy) { showRestorePicker = true }
                 SupportDivider()
                 NavigationLink {
                     TechnicalReportsView(clockReport: $clockReport)

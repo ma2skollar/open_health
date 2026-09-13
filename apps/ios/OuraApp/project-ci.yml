@@ -45,6 +45,7 @@ targets:
       - path: WorkCoordinator.swift
       - path: Components.swift
       - path: Reports.swift
+      - path: RawData.swift
       - path: Theme.swift
       - path: BLETransport.swift
       - path: RingSync.swift
