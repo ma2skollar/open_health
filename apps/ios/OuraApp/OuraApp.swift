@@ -124,11 +124,8 @@ struct SyncView: View {
     @State private var key = Keychain.loadKey() ?? ""
     @ObservedObject private var diag = RingDiag.shared
     @ObservedObject private var store = DiagStore.shared
-    @State private var copied = false
     @State private var diagnosticFile: URL?
     @State private var showKey = false
-    @State private var showDiagnostics = false
-    @State private var showTechnicalReports = false
     @State private var clockReport: String?
     @State private var confirmReset = false
     @FocusState private var keyFocused: Bool
@@ -332,160 +329,237 @@ struct SyncView: View {
         }
     }
 
+    // Help & diagnostics: one quiet card of grouped rows instead of nested disclosures.
+    // Everyday actions first, the technical transcript one tap deeper, destructive last.
     private var support: some View {
         VStack(alignment: .leading, spacing: 12) {
-            DisclosureGroup(isExpanded: $showDiagnostics) {
-                VStack(alignment: .leading, spacing: 18) {
-                    Text("Check saved data or share a report for help.")
-                        .font(.footnote).foregroundStyle(Obs.ink2)
-                        .fixedSize(horizontal: false, vertical: true)
-                    Button { Task { await ring.checkDatabase() } } label: {
-                        Label("Check saved data", systemImage: "externaldrive")
-                            .frame(minHeight: 44)
-                    }
-                    .disabled(ring.busy)
-                    Button {
-                        Task {
-                            let url = await Task.detached { DiagStore.shared.exportFile() }.value
-                            if let url { diagnosticFile = url }
-                        }
-                    } label: {
-                        Label("Share diagnostic report", systemImage: "square.and.arrow.up")
-                            .frame(minHeight: 44)
-                    }
-                    VStack(alignment: .leading, spacing: 4) {
-                        Button {
-                            Task { if let url = await ring.exportRawDatabase() { diagnosticFile = url } }
-                        } label: {
-                            Label("Export raw ring data", systemImage: "externaldrive.badge.icloud")
-                                .frame(minHeight: 44)
-                        }
-                        .disabled(ring.busy)
-                        Text("A copy of the ring records saved on this iPhone, for reproducing an analysis on a computer. Your ring key is not included.")
-                            .font(.footnote).foregroundStyle(Obs.muted)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    DisclosureGroup(isExpanded: $showTechnicalReports) {
-                        diagnosticHistory.padding(.top, 12)
-                            .task { clockReport = await Task.detached { ClockReport.text() }.value }
-                    } label: {
-                        Label("Technical reports", systemImage: "doc.text.magnifyingglass")
-                            .frame(minHeight: 44)
-                    }
-                    Rectangle().fill(Obs.rule).frame(height: 1)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Button(role: .destructive) { confirmReset = true } label: {
-                            Label("Reset local sync data", systemImage: "trash")
-                                .foregroundStyle(Obs.alert)
-                                .frame(minHeight: 44)
-                        }
-                        .disabled(ring.busy)
-                        Text("Deletes saved data from this iPhone. Your next sync restores the history still on your ring.")
-                            .font(.footnote).foregroundStyle(Obs.muted)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .font(.subheadline)
-                .padding(.top, 16)
-            } label: {
-                HStack(alignment: .center, spacing: 12) {
-                    Image(systemName: "wrench.and.screwdriver")
-                        .font(.body).foregroundStyle(Obs.muted)
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("Help & diagnostics")
-                            .font(.subheadline.weight(.semibold)).foregroundStyle(Obs.ink2)
-                        Text("Troubleshoot sync · review technical reports")
-                            .font(.caption).foregroundStyle(Obs.muted)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                    .frame(minHeight: 44)
+            HStack(alignment: .firstTextBaseline) {
+                Text("Help & diagnostics")
+                    .font(.subheadline.weight(.semibold)).foregroundStyle(Obs.ink)
+                Spacer()
+                Text(appVersion).font(Obs.mono(11)).foregroundStyle(Obs.muted)
             }
+            VStack(spacing: 0) {
+                SupportRow(icon: "externaldrive", title: "Check saved data",
+                           detail: ring.busy ? "Available after sync" : "Verify the records on this iPhone",
+                           disabled: ring.busy) { Task { await ring.checkDatabase() } }
+                SupportDivider()
+                SupportRow(icon: "square.and.arrow.up", title: "Share diagnostic report",
+                           detail: "Logs and clock details, no ring key") {
+                    Task {
+                        let url = await Task.detached { DiagStore.shared.exportFile() }.value
+                        if let url { diagnosticFile = url }
+                    }
+                }
+                SupportDivider()
+                SupportRow(icon: "externaldrive.badge.icloud", title: "Export raw ring data",
+                           detail: "A copy of the ring records, for analysis on a computer",
+                           disabled: ring.busy) {
+                    Task { if let url = await ring.exportRawDatabase() { diagnosticFile = url } }
+                }
+                SupportDivider()
+                NavigationLink {
+                    TechnicalReportsView(clockReport: $clockReport)
+                } label: {
+                    SupportRowLabel(icon: "doc.text.magnifyingglass", title: "Technical reports",
+                                    detail: technicalSummary, trailing: "chevron.right")
+                }
+                .buttonStyle(.plain)
+            }
+            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+
+            VStack(spacing: 0) {
+                SupportRow(icon: "trash", title: "Reset local sync data",
+                           detail: "Removes saved data from this iPhone. The next sync restores what your ring still holds.",
+                           tint: Obs.alert, disabled: ring.busy) { confirmReset = true }
+            }
+            .background(Obs.alert.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
+            .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Obs.alert.opacity(0.18)))
         }
-        .padding(16)
-        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
     }
 
-    private var diagnosticHistory: some View {
-        // live transcript + leftover logs from previous crashes / kills.
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                Text("Saved reports")
-                    .font(.subheadline.weight(.medium)).foregroundStyle(Obs.ink2)
-                Spacer()
-                Button(copied ? "Copied" : "Copy summary") {
-                    Task {
-                        let text = await Task.detached { DiagStore.shared.exportSummary() }.value
-                        UIPasteboard.general.string = text
-                        copied = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { copied = false }
-                    }
-                }
-                .font(.caption.weight(.medium)).foregroundStyle(Obs.ink)
-                .frame(minHeight: 44)
-            }
-            if let clock = clockReport {
-                Text("Ring clock").font(.caption.weight(.medium)).foregroundStyle(Obs.ink)
-                Text(clock).font(.caption.monospaced()).foregroundStyle(Obs.ink2)
+    private var appVersion: String {
+        // The plain swiftc simulator build ships Info.plist with unexpanded $(…) values.
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? ""
+        let build = info?["CFBundleVersion"] as? String ?? ""
+        guard !short.isEmpty, !short.contains("$(") else { return "" }
+        return build.isEmpty || build.contains("$(") ? "v\(short)" : "v\(short) (\(build))"
+    }
+
+    private var technicalSummary: String {
+        var parts: [String] = []
+        if !store.incidents.isEmpty { parts.append("\(store.incidents.count) incidents") }
+        if !store.sessions.isEmpty { parts.append("\(store.sessions.count) sessions") }
+        if diag.totalLines > 0 { parts.append("\(diag.totalLines) log lines") }
+        return parts.isEmpty ? "Ring clock, incidents and the live log" : parts.joined(separator: " · ")
+    }
+}
+
+/// One tappable row of the Help & diagnostics card.
+private struct SupportRow: View {
+    let icon: String
+    let title: String
+    let detail: String
+    var tint: Color = Obs.ink
+    var disabled = false
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            SupportRowLabel(icon: icon, title: title, detail: detail, tint: tint, trailing: nil)
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .opacity(disabled ? 0.45 : 1)
+    }
+}
+
+private struct SupportRowLabel: View {
+    let icon: String
+    let title: String
+    let detail: String
+    var tint: Color = Obs.ink
+    let trailing: String?
+    var body: some View {
+        HStack(alignment: .center, spacing: 14) {
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: .regular))
+                .foregroundStyle(tint == Obs.ink ? Obs.ink2 : tint)
+                .frame(width: 32, height: 32)
+                .background(Obs.paper.opacity(0.7), in: Circle())
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title).font(.subheadline.weight(.medium)).foregroundStyle(tint)
+                Text(detail).font(.footnote).foregroundStyle(Obs.muted)
                     .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            if !store.incidents.isEmpty {
-                Text("\(store.incidents.count) recorded incidents")
-                    .font(.caption).foregroundStyle(Obs.muted)
-                ForEach(store.incidents.prefix(8)) { item in
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(item.title).font(.caption.weight(.medium)).foregroundStyle(Obs.ink)
-                        Text(item.date, format: .dateTime.month(.abbreviated).day().hour().minute())
-                            .font(.caption2).foregroundStyle(Obs.muted)
-                        Text(item.preview).font(.caption.monospaced()).foregroundStyle(Obs.ink2)
-                            .lineLimit(5)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        Button("Copy report") {
-                            UIPasteboard.general.string = item.body
-                        }
-                        .font(.caption.weight(.medium)).foregroundStyle(Obs.ink)
-                        .frame(minHeight: 44)
-                    }
-                    .padding(8)
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(Obs.trace, lineWidth: 0.8))
-                }
-            } else {
-                Text("No incidents recorded.")
-                    .font(Obs.mono(10)).foregroundStyle(Obs.muted)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if !store.sessions.isEmpty {
-                Text("Previous sessions · \(store.sessions.count)")
-                    .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink2)
-                ForEach(store.sessions.prefix(4)) { item in
-                    HStack {
-                        Text(item.title).font(Obs.mono(10)).foregroundStyle(Obs.ink2)
-                        Spacer()
-                        Button("copy") { UIPasteboard.general.string = item.body }
-                            .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink)
-                    }
-                }
-            }
-            if diag.totalLines > 0 {
-                Text("Current session · \(diag.totalLines) lines")
-                    .font(Obs.mono(10, .medium)).foregroundStyle(Obs.ink2)
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 2) {
-                        ForEach(Array(diag.tail.enumerated()), id: \.offset) { _, line in
-                            Text(line).font(Obs.mono(9)).foregroundStyle(Obs.ink2)
-                                .lineLimit(3)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                    .padding(8)
-                }
-                .defaultScrollAnchor(.bottom)
-                .frame(maxHeight: 220)
-                .overlay(RoundedRectangle(cornerRadius: 8).stroke(Obs.trace, lineWidth: 0.8))
+            Spacer(minLength: 8)
+            if let trailing {
+                Image(systemName: trailing).font(.system(size: 12, weight: .semibold)).foregroundStyle(Obs.trace)
             }
         }
+        .padding(.horizontal, 14).padding(.vertical, 12)
+        .frame(minHeight: 56)
+        .contentShape(Rectangle())
+    }
+}
 
+private struct SupportDivider: View {
+    var body: some View { Rectangle().fill(Obs.rule).frame(height: 0.6).padding(.leading, 60) }
+}
+
+/// The technical transcript on its own page: ring clock anchors, recorded incidents,
+/// previous sessions and the live log, each with a copy action.
+private struct TechnicalReportsView: View {
+    @Binding var clockReport: String?
+    @ObservedObject private var diag = RingDiag.shared
+    @ObservedObject private var store = DiagStore.shared
+    @State private var copied: String?
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                section("Ring clock", copy: clockReport) {
+                    Text(clockReport ?? "No summary rendered yet.")
+                        .font(.caption.monospaced()).foregroundStyle(clockReport == nil ? Obs.muted : Obs.ink2)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                section("Incidents · \(store.incidents.count)", copy: nil) {
+                    if store.incidents.isEmpty {
+                        Text("No incidents recorded.").font(.caption).foregroundStyle(Obs.muted)
+                    }
+                    ForEach(store.incidents.prefix(8)) { item in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack(alignment: .firstTextBaseline) {
+                                Text(item.title).font(.caption.weight(.medium)).foregroundStyle(Obs.ink)
+                                Spacer()
+                                Text(item.date, format: .dateTime.month(.abbreviated).day().hour().minute())
+                                    .font(.caption2).foregroundStyle(Obs.muted)
+                            }
+                            Text(item.preview).font(.caption.monospaced()).foregroundStyle(Obs.ink2)
+                                .lineLimit(5).frame(maxWidth: .infinity, alignment: .leading)
+                            copyButton("incident-\(item.id)", text: item.body)
+                        }
+                        .padding(10)
+                        .background(Obs.paper.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                }
+                if !store.sessions.isEmpty {
+                    section("Previous sessions · \(store.sessions.count)", copy: nil) {
+                        ForEach(store.sessions.prefix(4)) { item in
+                            HStack {
+                                Text(item.title).font(Obs.mono(11)).foregroundStyle(Obs.ink2)
+                                Spacer()
+                                copyButton("session-\(item.id)", text: item.body)
+                            }
+                        }
+                    }
+                }
+                section("Current session · \(diag.totalLines) lines", copy: nil) {
+                    HStack {
+                        Spacer()
+                        Button(copied == "summary" ? "Copied" : "Copy summary") {
+                            Task {
+                                let text = await Task.detached { DiagStore.shared.exportSummary() }.value
+                                UIPasteboard.general.string = text
+                                flash("summary")
+                            }
+                        }
+                        .font(.caption.weight(.medium)).foregroundStyle(Obs.ink).frame(minHeight: 32)
+                    }
+                    if diag.totalLines > 0 {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 2) {
+                                ForEach(Array(diag.tail.enumerated()), id: \.offset) { _, line in
+                                    Text(line).font(Obs.mono(9)).foregroundStyle(Obs.ink2)
+                                        .lineLimit(3).frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                            .padding(8)
+                        }
+                        .defaultScrollAnchor(.bottom)
+                        .frame(maxHeight: 260)
+                        .background(Obs.paper.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
+                    } else {
+                        Text("Nothing logged yet.").font(.caption).foregroundStyle(Obs.muted)
+                    }
+                }
+            }
+            .frame(maxWidth: 520)
+            .padding(.horizontal, 24).padding(.vertical, 20)
+            .frame(maxWidth: .infinity)
+        }
+        .background(Obs.paper)
+        .navigationTitle("Technical reports")
+        .navigationBarTitleDisplayMode(.inline)
+        .task { if clockReport == nil { clockReport = await Task.detached { ClockReport.text() }.value } }
+    }
+
+    private func section<Content: View>(_ title: String, copy: String?, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(title.uppercased()).font(Obs.mono(10, .medium)).foregroundStyle(Obs.muted).tracking(0.8)
+                Spacer()
+                if let copy { copyButton(title, text: copy) }
+            }
+            content()
+        }
+        .padding(14)
+        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+    }
+
+    private func copyButton(_ id: String, text: String) -> some View {
+        Button(copied == id ? "Copied" : "Copy") {
+            UIPasteboard.general.string = text
+            flash(id)
+        }
+        .font(.caption.weight(.medium)).foregroundStyle(Obs.ink).frame(minHeight: 32)
+    }
+
+    private func flash(_ id: String) {
+        copied = id
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { if copied == id { copied = nil } }
     }
 }
 
@@ -510,7 +584,7 @@ enum ClockReport {
     }
 }
 
-private struct DiagnosticsShare: UIViewControllerRepresentable {
+struct DiagnosticsShare: UIViewControllerRepresentable {
     let url: URL
     func makeUIViewController(context: Context) -> UIActivityViewController {
         UIActivityViewController(activityItems: [url], applicationActivities: nil)
@@ -564,6 +638,15 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var s: Summary? = SummaryCache.load()
     @State private var report: ReportSel?
+    /// QA hooks for `simctl launch … -openSync` / `-openDay YYYY-MM-DD [activity]`, so
+    /// a screen can be captured without driving the UI. Ignored in normal launches.
+    private func applyLaunchArguments() {
+        let args = CommandLine.arguments
+        if args.contains("-openSync") { showSync = true }
+        if let index = args.firstIndex(of: "-openDay"), index + 1 < args.count {
+            report = ReportSel(day: args[index + 1], sleep: !args.contains("activity"))
+        }
+    }
     @State private var showAllDays = false
     @State private var showSync = false
     @State private var showProfile = false
@@ -611,6 +694,7 @@ struct RootView: View {
         }
         .fullScreenCover(item: $report) { sel in if let s { DayReportView(s: s, day: sel.day, tab: sel.sleep ? .sleep : .activity) } }
         .sheet(isPresented: $showAllDays) { if let s { AllDaysView(s: s) } }
+        .onAppear(perform: applyLaunchArguments)
         .sheet(isPresented: $showSync) {
             SyncView(ring: ring, onSynced: refreshAfterSync, onReset: resetAndReload)
         }

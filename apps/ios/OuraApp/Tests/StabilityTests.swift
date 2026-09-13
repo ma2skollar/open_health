@@ -191,6 +191,152 @@ final class StabilityTests: XCTestCase {
         }
     }
 
+    /// The three shapes seen in real ring history that used to abort the whole pass:
+    /// a channel with no sample inside the MET span, a wear window that collapses to
+    /// minute 0, and duplicate MET minutes. The first two run through the guards in
+    /// ActivityModel; here the FFI itself is pinned on the placeholder position.
+    func testActivityPlaceholderInsideMetWindowRuns() throws {
+        let path = try XCTUnwrap(Bundle.main.path(forResource: "automatic_activity_detection_3_1_11", ofType: "ptl"))
+        let nan = Float.nan
+        var context: [Float] = [2026, 7, 6, 0]
+        var user: [Float] = [30, 1, 1.78, 75] + Array(repeating: nan, count: 10)
+        // MET from 10:00 for 60 minutes, motion and temperature present, no heart rate.
+        var met: [Float] = [], motion: [Float] = [], temp: [Float] = []
+        for minute in 600..<660 {
+            let t = Float(minute)
+            met += [t, 1.2]; motion += [t, 0, 30, 0, 0, 0, nan, 10, 1]; temp += [t, 33]
+        }
+        var step: [Float] = [600] + Array(repeating: nan, count: 11) + [659] + Array(repeating: nan, count: 11)
+        var output = [Float](repeating: 0, count: 512 * 9)
+        // Placeholder at minute 0 falls outside the valid window: the model throws.
+        var hrAtZero: [Float] = [0, nan]
+        let rejected = oura_activity(path, &context, &user, &met, 60, &step, 2, &motion, 60,
+                                     &temp, 60, &hrAtZero, 1, 0.5, 10, &output, 512)
+        XCTAssertLessThan(rejected, 0, "expected the empty-tensor failure this test documents")
+        // Placeholder on the first MET minute keeps the channel present.
+        var hrAtStart: [Float] = [600, nan]
+        let accepted = oura_activity(path, &context, &user, &met, 60, &step, 2, &motion, 60,
+                                     &temp, 60, &hrAtStart, 1, 0.5, 10, &output, 512)
+        XCTAssertEqual(accepted, 0, String(cString: oura_activity_last_error()))
+    }
+
+    func testActivityDegenerateDayIsSkippedNotFatal() throws {
+        let url = try fixture()
+        let file = "test-activity-\(UUID().uuidString).json"
+        let cacheURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(file)
+        defer { try? FileManager.default.removeItem(at: cacheURL) }
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        let calendar = Calendar.current
+        let midnight = calendar.date(from: DateComponents(year: 2026, month: 7, day: 6))!
+        let unix = Int64(midnight.timeIntervalSince1970)
+        // Day 1 (07-06): 13 MET minutes at 17:22 and two motion samples → no wear window.
+        // Day 2 (07-07): a normal 12-hour day. Both must be cached; neither may abort.
+        let sparseMet = String(data: try JSONSerialization.data(withJSONObject: ["met": Array(repeating: 1.2, count: 13)]), encoding: .utf8)!
+        let fullMet = String(data: try JSONSerialization.data(withJSONObject: ["met": Array(repeating: 1.2, count: 720)]), encoding: .utf8)!
+        let motion = "{\"orientation\":0,\"motion_seconds\":5,\"avg_x\":0,\"avg_y\":0,\"avg_z\":0,\"low_intensity\":1,\"high_intensity\":0}"
+        let day1 = unix + 17 * 3600 + 22 * 60
+        let day2 = unix + 86400
+        let sql = """
+        DELETE FROM events;
+        INSERT INTO events VALUES (1,5000000,66,'{"unix_time":\(unix)}',\(unix),NULL);
+        INSERT INTO events VALUES (2,\(5000000 + (day1 - unix) * 10),80,'\(sparseMet)',\(day1),NULL);
+        INSERT INTO events VALUES (3,\(5000000 + (day1 - unix) * 10),71,'\(motion)',\(day1),NULL);
+        INSERT INTO events VALUES (4,\(5000000 + (day1 - unix) * 10 + 600),71,'\(motion)',\(day1 + 60),NULL);
+        INSERT INTO events VALUES (5,\(5000000 + (day2 - unix) * 10),80,'\(fullMet)',\(day2),NULL);
+        """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+        let events = try EventStore.decodedEvents(dbPath: url.path)
+        let clock = EventStore.RingClock(events: events)
+        let result = ActivityModel.run(profile: nil, events: events, clock: clock, force: true, cacheFile: file)
+        XCTAssertNil(result.error, result.error ?? "")
+        let cache: [String: ActivityDayEntry] = ModelCacheStore.load(file, globalKey: ModelCacheStore.globalKey(profile: nil))
+        XCTAssertNotNil(cache["2026-07-06"]); XCTAssertNotNil(cache["2026-07-07"])
+        XCTAssertNil(cache["2026-07-06"]?.failed)
+        XCTAssertEqual(ActivityModel.failureMessage(["2026-07-06", "2026-05-01"]),
+                       "Activity analysis failed for 2026-07-06 (+1 more). See diagnostics for details.")
+    }
+
+    func testIllnessAndCvaCacheFilesSurviveNewInputs() throws {
+        // The file key is the stable global key; the input fingerprint lives in the entry.
+        let file = "test-fp-\(UUID().uuidString).json"
+        let cacheURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent(file)
+        defer { try? FileManager.default.removeItem(at: cacheURL) }
+        let key = ModelCacheStore.globalKey(profile: nil)
+        let first = FingerprintedEntry(fp: "day-1", value: CvaModel.Result(vascularAge: 30, pwv: 6, segments: 10))
+        ModelCacheStore.save(file, globalKey: key, entries: ["result": first])
+        let reloaded: [String: FingerprintedEntry<CvaModel.Result>] = ModelCacheStore.load(file, globalKey: key)
+        XCTAssertEqual(reloaded["result"]?.fp, "day-1")
+        XCTAssertNotEqual(reloaded["result"]?.fp, "day-2")   // a miss is a compare, not a discard
+    }
+
+    /// Parity harness: with `OURA_DUMP_DAY=YYYY-MM-DD` and `OURA_DUMP_PATH` set, writes the
+    /// bundled seed DB's exact model inputs for that day so tools/ can diff them against
+    /// the Python runner. Skipped otherwise.
+    func testDumpActivityInputsForParity() throws {
+        // xcodebuild does not forward TEST_RUNNER_ variables to app-hosted tests, so the
+        // request is a JSON file {"day": "...", "path": "..."} named by OURA_DUMP_REQUEST
+        // or at /tmp/oura-dump-request.json (the simulator shares the host file system).
+        let env = ProcessInfo.processInfo.environment
+        let request = env["OURA_DUMP_REQUEST"] ?? "/tmp/oura-dump-request.json"
+        guard let data = FileManager.default.contents(atPath: request),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: String],
+              let day = object["day"], let path = object["path"] else {
+            throw XCTSkip("write \(request) with day and path to dump a day")
+        }
+        let events = try EventStore.decodedEvents(dbPath: DB.readPath())
+        let clock = EventStore.RingClock(events: events)
+        let inputs = try XCTUnwrap(ActivityModel.debugInputs(profile: nil, events: events, clock: clock, day: day))
+        func sanitized(_ value: Any) -> Any {
+            if let floats = value as? [Float] { return floats.map { $0.isNaN ? "nan" : Double($0) as Any } }
+            if let rows = value as? [[Double]] { return rows.map { $0.map { $0.isNaN ? "nan" : $0 as Any } } }
+            return value
+        }
+        let json = try JSONSerialization.data(withJSONObject: inputs.mapValues(sanitized), options: [.sortedKeys])
+        try json.write(to: URL(fileURLWithPath: path))
+    }
+
+    /// Mirror of the Rust ring_time tests: a counter that ran faster than wall time
+    /// between two anchors is undated; a counter that stalled picks the anchor side
+    /// the download time allows.
+    func testErraticCounterIsUndatedAndStalledCounterPicksAnchorSide() throws {
+        let url = try fixture()
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        let sql = """
+        DELETE FROM events;
+        INSERT INTO events VALUES (1,20000,1,'{}',1783000000,NULL);
+        INSERT INTO events VALUES (2,20928,66,'{"unix_time":1782939604}',1783000000,NULL);
+        INSERT INTO events VALUES (3,500000,1,'{}',1783000000,NULL);
+        INSERT INTO events VALUES (4,1032193,133,'{"unix_time":1782943316}',1783000000,NULL);
+        INSERT INTO events VALUES (5,1100000,1,'{}',1783000000,NULL);
+        INSERT INTO events VALUES (6,1133000,133,'{"unix_time":1782953397}',1783000000,NULL);
+        INSERT INTO events VALUES (7,1200000,1,'{}',1783000000,NULL);
+        INSERT INTO events VALUES (8,47893458,66,'{"unix_time":1787733180}',1787733240,NULL);
+        INSERT INTO events VALUES (9,52000000,1,'{}',1788100000,NULL);
+        INSERT INTO events VALUES (10,61076535,66,'{"unix_time":1789195380}',1789195440,NULL);
+        """
+        XCTAssertEqual(sqlite3_exec(db, sql, nil, nil, nil), SQLITE_OK)
+        sqlite3_close(db)
+        let events = try EventStore.decodedEvents(dbPath: url.path)
+        let clock = EventStore.RingClock(events: events)
+        XCTAssertEqual(clock.resolve(500_000, capturedUnix: 1_783_000_000).source, .undated)
+        XCTAssertNil(clock.datedUnixSeconds(500_000, capturedUnix: 1_783_000_000))
+        let pocket = clock.resolve(1_100_000, capturedUnix: 1_783_000_000)
+        XCTAssertEqual(pocket.source, .anchor)
+        XCTAssertEqual(pocket.unix, 1_782_953_397 - 3_300, accuracy: 0.01)
+        XCTAssertEqual(clock.resolve(1_200_000, capturedUnix: 1_783_000_000).source, .anchor)
+        // Stalled counter (40 h lost between the last two anchors of the same boot).
+        let early = clock.resolve(52_000_000, capturedUnix: 1_788_100_000)
+        XCTAssertEqual(early.source, .anchor)
+        XCTAssertEqual(early.unix, 1_787_733_180 + Double(52_000_000 - 47_893_458) / 10, accuracy: 0.01)
+        let late = clock.resolve(52_000_000, capturedUnix: 1_789_195_440)
+        XCTAssertEqual(late.unix, 1_789_195_380 - Double(61_076_535 - 52_000_000) / 10, accuracy: 0.01)
+    }
+
     func testActivityCompleteDayRunsInMobileRuntime() throws {
         let path = try XCTUnwrap(Bundle.main.path(forResource: "automatic_activity_detection_3_1_11", ofType: "ptl"))
         let nan = Float.nan

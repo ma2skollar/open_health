@@ -46,14 +46,31 @@ enum ActivityModel {
         let hr: (flat: [Float], count: Int)
     }
 
+    /// Bumped whenever the per-day preprocessing (dedup, placeholders, reject rule)
+    /// changes, so cached results — cached failures above all — are recomputed once
+    /// instead of being trusted for inputs the new pipeline would build differently.
+    private static let pipelineVersion = 2
+
     static func run(profile: Profile?, events: EventStore.Events, clock: EventStore.RingClock,
                     onlyDay: String? = nil, force: Bool = false,
                     cacheFile: String = ModelCacheStore.activityFile,
-                    progress: @escaping @Sendable (String) -> Void = { _ in }) -> (sessions: [WorkoutSession], error: String?) {
+                    progress: @escaping @Sendable (String) -> Void = { _ in },
+                    inputsSink: (([String: Any]) -> Void)? = nil) -> (sessions: [WorkoutSession], error: String?) {
         guard let aadPath = Bundle.main.path(forResource: "automatic_activity_detection_3_1_11", ofType: "ptl")
         else { return ([], "activity model file missing from the app bundle") }
 
         guard !events.isEmpty else { return ([], onlyDay == nil ? nil : "No activity data is saved for this day.") }
+        let globalKey = ModelCacheStore.globalKey(profile: profile)
+        // Nothing changed since the last complete pass (same rows, same clock
+        // anchors): the cached days are the answer, without streaming the store.
+        let storeDigest = events.digest().map { "v\(pipelineVersion):\($0)" }
+        if onlyDay == nil, !force, let storeDigest,
+           ModelCacheStore.loadDigest(cacheFile, globalKey: globalKey) == storeDigest {
+            let cache: [String: ActivityDayEntry] = ModelCacheStore.load(cacheFile, globalKey: globalKey)
+            let failed = cache.filter { $0.value.failed == true }.map(\.key).sorted(by: >)
+            dlog("models", "activity cache=digest-hit days=\(cache.count) rejected=\(failed.count)")
+            return (cache.values.flatMap(\.sessions).sorted { $0.start < $1.start }, failureMessage(failed))
+        }
         let nan = Float.nan
         func number(_ value: Any?) -> Float { (value as? NSNumber)?.floatValue ?? 0 }
 
@@ -63,7 +80,9 @@ enum ActivityModel {
         var heartRate: [TimedRow] = []
         for event in events.restricted("tag IN (80,71,70,128)") {
             // These are minute buckets; remove the few-second epoch-anchor jitter.
-            let unixMinute = (clock.unixSeconds(event.ds, capturedUnix: event.cu) / 60).rounded()
+            // Undated data (an untrustworthy boot clock) has no day to belong to.
+            guard let seconds = clock.datedUnixSeconds(event.ds, capturedUnix: event.cu) else { continue }
+            let unixMinute = (seconds / 60).rounded()
             switch event.tag {
             case 0x50:
                 if let values = event.json["met"] as? [NSNumber] {
@@ -110,16 +129,31 @@ enum ActivityModel {
             let nextDay = calendar.date(byAdding: .day, value: 1, to: dayStart)!
             let lo = dayStart.timeIntervalSince1970 / 60
             let hi = nextDay.timeIntervalSince1970 / 60
-            func matrix(_ rows: [TimedRow], columns: Int, required: Bool = true) -> (flat: [Float], count: Int) {
-                let selected = rows.filter { $0.unixMinute >= lo && $0.unixMinute < hi }
-                    .sorted { $0.unixMinute < $1.unixMinute }
-                if selected.isEmpty && required {
-                    return ([0] + Array(repeating: nan, count: columns - 1), 1)
-                }
-                return (selected.flatMap { [Float($0.unixMinute - lo)] + $0.values }, selected.count)
+            func rowsOfDay(_ rows: [TimedRow]) -> [TimedRow] {
+                rows.filter { $0.unixMinute >= lo && $0.unixMinute < hi }.sorted { $0.unixMinute < $1.unixMinute }
             }
-            let metDay = matrix(met, columns: 2)
-            guard metDay.count > 0 else { return nil }
+            // The ring may resend a MET minute; Android's Realm series keeps one value per
+            // timestamp (last write wins). Duplicates make the model's resampler throw.
+            var metByMinute: [Double: TimedRow] = [:]
+            for row in rowsOfDay(met) { metByMinute[row.unixMinute.rounded()] = row }
+            let metRows = metByMinute.keys.sorted().map { metByMinute[$0]! }
+            guard let firstMet = metRows.first?.unixMinute, let lastMet = metRows.last?.unixMinute else { return nil }
+            func flatten(_ rows: [TimedRow]) -> (flat: [Float], count: Int) {
+                (rows.flatMap { [Float($0.unixMinute - lo)] + $0.values }, rows.count)
+            }
+            // A series with no sample inside the MET window is dropped entirely by the
+            // model's valid-time clipping, and it then indexes the empty tensor. A NaN
+            // placeholder at the first MET minute keeps the channel present (and is
+            // ignored as missing data), exactly like tools/run_activity_model.py.
+            func matrix(_ rows: [TimedRow], columns: Int) -> (flat: [Float], count: Int) {
+                var selected = rowsOfDay(rows)
+                if !selected.contains(where: { $0.unixMinute >= firstMet && $0.unixMinute <= lastMet }) {
+                    selected.append(TimedRow(unixMinute: firstMet, values: Array(repeating: nan, count: columns - 1)))
+                    selected.sort { $0.unixMinute < $1.unixMinute }
+                }
+                return flatten(selected)
+            }
+            let metDay = flatten(metRows)
             let motionDay = matrix(motion, columns: 9)
             let tempDay = matrix(temperature, columns: 2)
             let hrDay = matrix(heartRate, columns: 2)
@@ -138,6 +172,7 @@ enum ActivityModel {
         // have produced for those inputs.
         func fingerprint(_ inputs: DayInputs) -> String {
             var h = FNV64()
+            h.combine(pipelineVersion)
             h.combine(inputs.dayStart.timeIntervalSince1970)
             h.combine(inputs.context)
             h.combine(inputs.met.flat); h.combine(inputs.met.count)
@@ -148,7 +183,6 @@ enum ActivityModel {
             h.combine(inputs.hr.flat); h.combine(inputs.hr.count)
             return h.hex
         }
-        let globalKey = ModelCacheStore.globalKey(profile: profile)
         var cache: [String: ActivityDayEntry] = ModelCacheStore.load(cacheFile,
                                                                      globalKey: globalKey)
         let dayKeyFmt = DateFormatter()
@@ -161,6 +195,7 @@ enum ActivityModel {
         var sessions: [WorkoutSession] = []
         var currentKeys = Set<String>()
         var pending: [(key: String, fp: String, inputs: DayInputs)] = []
+        var cachedFailures: [String] = []
         for dayStart in dayStarts {
             guard !AnalysisRun.cancelled, events.error == nil else { return ([], "analysis interrupted") }
             let key = dayKeyFmt.string(from: dayStart)
@@ -168,51 +203,112 @@ enum ActivityModel {
             guard let inputs = dayInputs(dayStart) else { continue }
             let fp = fingerprint(inputs)
             currentKeys.insert(key)
-            if !force, let entry = cache[key], entry.fp == fp { sessions.append(contentsOf: entry.sessions) }
-            else { pending.append((key, fp, inputs)) }
+            if !force, let entry = cache[key], entry.fp == fp {
+                sessions.append(contentsOf: entry.sessions)
+                if entry.failed == true { cachedFailures.append(key) }
+            } else { pending.append((key, fp, inputs)) }
         }
         let staleKeys = pending.filter { cache[$0.key] != nil }.count
         if !pending.isEmpty {
             dlog("models", "activity pending=\(pending.count) of \(currentKeys.count) (inputs changed=\(staleKeys), new=\(pending.count - staleKeys), cached=\(cache.count))")
         }
         // Pass 2: run only the missing days; persist every few days and at the end so a
-        // mid-run kill resumes instead of restarting.
+        // mid-run kill resumes instead of restarting. A day the model rejects is cached
+        // as failed (under its fingerprint) and skipped, so one degenerate day can never
+        // block the days behind it or be retried on every launch; a forced refresh reruns it.
         var recomputed = 0
+        var failedDays: [String] = []
         for (index, day) in pending.enumerated() {
             guard !AnalysisRun.cancelled, events.error == nil else {
                 if recomputed > 0 { ModelCacheStore.save(cacheFile, globalKey: globalKey, entries: cache) }
                 return ([], "analysis interrupted")
             }
             progress(onlyDay == nil ? "Analyzing activity · day \(index + 1) of \(pending.count)" : "Refreshing activity analysis…")
-            let daySessions: [WorkoutSession]
-            do { daySessions = try runDay(day.inputs, user: user, aadPath: aadPath, nan: nan) }
-            catch {
-                if recomputed > 0 { ModelCacheStore.save(cacheFile, globalKey: globalKey, entries: cache) }
-                guard !AnalysisRun.cancelled else { return (sessions, "analysis interrupted") }
-                let inputs = day.inputs
-                dlog("models", "activity day=\(day.key) met=\(inputs.met.count) motion=\(inputs.motion.count) temperature=\(inputs.temp.count) hr=\(inputs.hr.count) stepPackets=\(inputs.rawStep.count) failed: \(error)")
-                return (sessions, "Activity analysis failed for \(day.key). See diagnostics for details.")
+            var daySessions: [WorkoutSession] = []
+            var failed = false
+            if isDegenerate(day.inputs) {
+                dlog("models", "activity day=\(day.key) met=\(day.inputs.met.count) motion=\(day.inputs.motion.count) hr=\(day.inputs.hr.count): no valid wear window for the model, no sessions")
+            } else {
+                do { daySessions = try runDay(day.inputs, user: user, aadPath: aadPath, nan: nan, inputsSink: inputsSink) }
+                catch {
+                    guard !AnalysisRun.cancelled else {
+                        if recomputed > 0 { ModelCacheStore.save(cacheFile, globalKey: globalKey, entries: cache) }
+                        return ([], "analysis interrupted")
+                    }
+                    let inputs = day.inputs
+                    dlog("models", "activity day=\(day.key) met=\(inputs.met.count) motion=\(inputs.motion.count) temperature=\(inputs.temp.count) hr=\(inputs.hr.count) stepPackets=\(inputs.rawStep.count) failed: \(error)")
+                    failed = true
+                    failedDays.append(day.key)
+                }
             }
             sessions.append(contentsOf: daySessions)
-            cache[day.key] = ActivityDayEntry(fp: day.fp, sessions: daySessions)
+            cache[day.key] = ActivityDayEntry(fp: day.fp, sessions: daySessions, failed: failed ? true : nil)
             recomputed += 1
             if recomputed % 5 == 0 { ModelCacheStore.save(cacheFile, globalKey: globalKey, entries: cache) }
         }
         if recomputed > 0 { ModelCacheStore.save(cacheFile, globalKey: globalKey, entries: cache) }
         guard !AnalysisRun.cancelled, events.error == nil else { return ([], "analysis interrupted") }
         if onlyDay != nil && currentKeys.isEmpty { return ([], "No activity data is saved for this day.") }
-        dlog("models", "activity recomputed=\(recomputed) total=\(currentKeys.count)")
+        dlog("models", "activity recomputed=\(recomputed) total=\(currentKeys.count) rejected=\(failedDays.count + cachedFailures.count)")
         // Drop days the current data no longer produces (e.g. re-dated by a clock
-        // re-anchor) so the file tracks the DB instead of growing stale keys.
+        // re-anchor) so the file tracks the DB instead of growing stale keys, and
+        // stamp the complete pass with the store digest for the next early exit.
         let pruned = cache.filter { currentKeys.contains($0.key) }
-        if onlyDay == nil && pruned.count != cache.count {
-            ModelCacheStore.save(cacheFile, globalKey: globalKey, entries: pruned)
+        if onlyDay == nil {
+            ModelCacheStore.save(cacheFile, globalKey: globalKey, entries: pruned, digest: storeDigest)
         }
-        return (sessions.sorted { $0.start < $1.start }, nil)
+        let allFailed = (failedDays + cachedFailures).sorted(by: >)
+        return (sessions.sorted { $0.start < $1.start }, failureMessage(allFailed))
+    }
+
+    /// The user-facing error for days the model rejected; the same text for one day
+    /// is what the refresh path removes from `modelErrors` when a rerun succeeds.
+    static func failureMessage(_ failedDays: [String]) -> String? {
+        guard let first = failedDays.first else { return nil }
+        let more = failedDays.count - 1
+        return "Activity analysis failed for \(first)\(more > 0 ? " (+\(more) more)" : ""). See diagnostics for details."
+    }
+
+    /// Mirror of the model's `get_last_valid_time`: with fewer than `minValidMets`
+    /// worn MET minutes before the last motion sample the valid window collapses to
+    /// minute 0, after which the graph indexes an empty MET tensor and throws. Such a
+    /// day has no evaluable data, so it yields no sessions instead of an error.
+    /// Kept identical to `model_would_reject` in tools/run_activity_model.py.
+    private static let nonWearMetThreshold: Float = 0.2
+    private static let minValidMets = 10
+    private static let acceptableLastHrMissingMinutes: Float = 5
+    private static func isDegenerate(_ inputs: DayInputs) -> Bool {
+        func lastTime(_ series: (flat: [Float], count: Int), columns: Int) -> Float {
+            series.count > 0 ? series.flat[(series.count - 1) * columns] : 0
+        }
+        let lastMotion = lastTime(inputs.motion, columns: 9).rounded(.up)
+        var lastWornMet: Float?
+        var worn = 0
+        for row in 0..<inputs.met.count {
+            let t = inputs.met.flat[row * 2], value = inputs.met.flat[row * 2 + 1]
+            if value > nonWearMetThreshold && t <= lastMotion { worn += 1; lastWornMet = t }
+        }
+        guard worn >= minValidMets, let lastWornMet else { return inputs.met.flat[0] > 0 }
+        let lastHr = lastTime(inputs.hr, columns: 2).rounded(.up) + acceptableLastHrMissingMinutes
+        let lastTemp = lastTime(inputs.temp, columns: 2).rounded(.up)
+        let lastStep = lastTime(inputs.met, columns: 2)   // the step boundary row sits on the last MET minute
+        let lastValid = min(lastWornMet, lastMotion, lastHr, lastStep, lastTemp)
+        return inputs.met.flat[0] > lastValid
+    }
+
+    /// The exact tensors one local day feeds the model (step packets decoded), for
+    /// parity checks against tools/run_activity_model.py. Debug/test use only.
+    static func debugInputs(profile: Profile?, events: EventStore.Events, clock: EventStore.RingClock,
+                            day: String) -> [String: Any]? {
+        var captured: [String: Any]?
+        _ = run(profile: profile, events: events, clock: clock, onlyDay: day, force: true,
+                cacheFile: "debug-activity-\(UUID().uuidString).json", inputsSink: { captured = $0 })
+        return captured
     }
 
     /// One AAD inference over one local day's inputs.
-    private static func runDay(_ inputs: DayInputs, user: [Float], aadPath: String, nan: Float) throws -> [WorkoutSession] {
+    private static func runDay(_ inputs: DayInputs, user: [Float], aadPath: String, nan: Float,
+                               inputsSink: (([String: Any]) -> Void)? = nil) throws -> [WorkoutSession] {
         let decoded = try decodeStepPackets(inputs.rawStep)
         let lo = inputs.dayStart.timeIntervalSince1970 / 60
         let firstMet = inputs.met.flat[0]
@@ -225,6 +321,9 @@ enum ActivityModel {
         let stepFlat = stepRows.flatMap { [Float($0.unixMinute - lo)] + $0.values }
         let stepCount = stepRows.count
 
+        inputsSink?(["context": inputs.context, "user": user, "met": inputs.met.flat, "step": stepFlat,
+                     "motion": inputs.motion.flat, "temp": inputs.temp.flat, "hr": inputs.hr.flat,
+                     "rawStep": inputs.rawStep.map { [$0.unixMinute - lo] + $0.values.map(Double.init) }])
         var context = inputs.context, userVec = user
         var metFlat = inputs.met.flat
         var step = stepFlat
@@ -255,14 +354,16 @@ enum ActivityModel {
     private static func collectStepPackets(events: EventStore.Events, clock: EventStore.RingClock) -> [TimedRow] {
         var secondPackets: [Int64: Data] = [:]
         for event in events.restricted("tag=127") {
-            guard let body = event.body, body.count == 14 else { continue }
-            let wallDecisecond = Int64((clock.unixSeconds(event.ds, capturedUnix: event.cu) * 10).rounded())
+            guard let body = event.body, body.count == 14,
+                  let seconds = clock.datedUnixSeconds(event.ds, capturedUnix: event.cu) else { continue }
+            let wallDecisecond = Int64((seconds * 10).rounded())
             secondPackets[wallDecisecond] = body
         }
         var rows: [TimedRow] = []
         for event in events.restricted("tag=126") {
-            guard let first = event.body, first.count == 14 else { continue }
-            let wallDecisecond = Int64((clock.unixSeconds(event.ds, capturedUnix: event.cu) * 10).rounded())
+            guard let first = event.body, first.count == 14,
+                  let seconds = clock.datedUnixSeconds(event.ds, capturedUnix: event.cu) else { continue }
+            let wallDecisecond = Int64((seconds * 10).rounded())
             guard let second = secondPackets[wallDecisecond + 1] else { continue }
             let values = unpack(first: [UInt8](first), second: [UInt8](second)).map(Float.init)
             rows.append(TimedRow(unixMinute: Double(wallDecisecond) / 10.0 / 60.0, values: values))

@@ -55,5 +55,50 @@ class MobileActivityTests(unittest.TestCase):
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0, equal_nan=True)
 
 
+class DayGuardTests(unittest.TestCase):
+    """The pre-flight checks shared with iOS (ActivityModel.matrix / isDegenerate)."""
+
+    def setUp(self):
+        import run_activity_model as runner
+        self.runner = runner
+
+    def test_placeholder_lands_inside_the_met_window(self):
+        rows = [[30.0, 60.0]]                      # heart rate before the MET span
+        t = self.runner.tensor(rows, 2, window=(600.0, 700.0))
+        self.assertEqual(t.shape, (2, 2))
+        self.assertEqual(t[1, 0].item(), 600.0)   # placeholder sits on the first MET minute
+        self.assertTrue(torch.isnan(t[1, 1]))
+        t = self.runner.tensor([[650.0, 60.0]], 2, window=(600.0, 700.0))
+        self.assertEqual(t.shape, (1, 2))         # nothing added when a sample is inside
+
+    def test_reject_mirrors_model_valid_window(self):
+        reject = self.runner.model_would_reject
+        met = [[600.0 + i, 1.2] for i in range(13)]
+        few = [[600.0, 0, 5, 0, 0, 0, float("nan"), 1, 0], [601.0, 0, 5, 0, 0, 0, float("nan"), 1, 0]]
+        # 13 MET minutes but motion stops after two → fewer than 10 worn minutes → window
+        # collapses to minute 0 while MET starts at 600: the model would throw.
+        self.assertTrue(reject(met, few, [[600.0, 33.0]], [[600.0, 60.0]], [[600.0], [612.0]]))
+        # Same data starting at midnight: window collapses to 0 but MET[0] is at 0 → fine.
+        shifted = [[float(i), 1.2] for i in range(13)]
+        self.assertFalse(reject(shifted, few, [[0.0, 33.0]], [[0.0, 60.0]], [[0.0], [12.0]]))
+        # A full day with every channel covering the span is evaluable.
+        full_motion = [[600.0 + i, 0, 30, 0, 0, 0, float("nan"), 10, 1] for i in range(13)]
+        self.assertFalse(reject(met, full_motion, [[612.0, 33.0]], [[612.0, 60.0]], [[600.0], [612.0]]))
+        # Model agrees: the rejected inputs throw, the accepted ones run.
+        model = torch.jit.load(str(MODELS / "automatic_activity_detection_3_1_11.pt")).eval()
+        nan = float("nan")
+        def run(m, mo, te, hr):
+            steps = [[m[0][0]] + [nan] * 11, [m[-1][0]] + [nan] * 11]
+            return model(torch.tensor([2026, 4, 14, 1], dtype=torch.float32),
+                         torch.tensor([30, 1, 1.78, 75] + [nan] * 10),
+                         torch.tensor(m), torch.tensor(steps), torch.tensor(mo, dtype=torch.float32),
+                         torch.tensor(te), torch.tensor(hr), None, None,
+                         torch.tensor(0.5), torch.tensor(10.0), torch.tensor(0.0))[0]
+        with torch.no_grad():
+            with self.assertRaises(RuntimeError):
+                run(met, few, [[600.0, 33.0]], [[600.0, 60.0]])
+            self.assertEqual(tuple(run(met, full_motion, [[612.0, 33.0]], [[612.0, 60.0]]).shape)[1], 9)
+
+
 if __name__ == "__main__":
     unittest.main()

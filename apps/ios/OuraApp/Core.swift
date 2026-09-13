@@ -136,9 +136,9 @@ enum Core {
                 updated.workouts.removeAll { $0.dayLabel == request.day }
                 updated.workouts.append(contentsOf: result.sessions)
                 updated.workouts.sort { $0.start < $1.start }
-                updated.modelErrors.removeAll {
-                    $0 == "Activity analysis failed for \(request.day). See diagnostics for details."
-                }
+                // The aggregate message names only the first failed day; a successful
+                // rerun of that day means the list is stale either way.
+                updated.modelErrors.removeAll { $0.hasPrefix("Activity analysis failed for") }
             }
             try events.validate()
             try AnalysisRun.check()
@@ -241,7 +241,9 @@ enum Core {
         } else if cvaErr != nil {
             s.cardio = previous?.cardio
         }
-        s.workouts = actErr == nil ? workouts : (previous?.workouts ?? workouts)
+        // Per-day failures leave every other day's sessions valid; only a pass that
+        // produced nothing (interrupted, model missing) falls back to the last result.
+        s.workouts = (actErr == nil || !workouts.isEmpty) ? workouts : (previous?.workouts ?? workouts)
         s.illness = (illErr == nil || illness != nil) ? illness : previous?.illness
         var seen = Set<String>()
         s.modelErrors = [sleepErr, cvaErr, actErr, illErr].compactMap { $0 }

@@ -45,6 +45,22 @@ enum EventStore {
             Events(path: path, predicate: "(\(self.predicate)) AND (\(predicate))", metadata: metadata, parent: self)
         }
         var isEmpty: Bool { makeIterator().next() == nil }
+
+        /// Cheap identity of the store's contents for cache early-exits: row count and
+        /// last id of decoded events, plus the same for clock anchors (a new anchor can
+        /// re-date old rows, so it must invalidate day-bucketed caches too).
+        func digest() -> String? {
+            var db: OpaquePointer?
+            guard sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK else { sqlite3_close(db); return nil }
+            defer { sqlite3_close(db) }
+            sqlite3_busy_timeout(db, 5000)
+            var statement: OpaquePointer?
+            let sql = "SELECT COUNT(*), IFNULL(MAX(id),0), SUM(tag IN (66,133)), IFNULL(MAX(CASE WHEN tag IN (66,133) THEN id END),0) FROM events WHERE decoded_json IS NOT NULL"
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else { return nil }
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+            return (0..<4).map { String(sqlite3_column_int64(statement, Int32($0))) }.joined(separator: ":")
+        }
         var last: Ev? {
             restricted("id=(SELECT id FROM events WHERE decoded_json IS NOT NULL ORDER BY captured_unix DESC,id DESC LIMIT 1)").makeIterator().next()
         }
@@ -127,6 +143,12 @@ enum EventStore {
     struct RingClock {
         private static let epochResetSlackDs: Int64 = 6 * 3600 * 10
         private static let futureSlackSeconds: Int64 = 6 * 3600
+        // Two anchors of one boot must agree on the counter rate (10 ds/s plus drift).
+        // A fresh ring's first days ran the counter erratically — weeks of ds in an
+        // hour — so nothing between two disagreeing anchors has a calendar day.
+        // Mirrors ANCHOR_AGREEMENT_* in crates/oura-summary/src/ring_time.rs.
+        private static let anchorAgreementSeconds = 30.0 * 60.0
+        private static let anchorAgreementFraction = 0.02
 
         /// How a wall-clock time was obtained. Mirrors `ClockSource` in ring_time.rs:
         /// only `anchor`/`projected` are trustworthy; `downloadTime` is off by up to a
@@ -167,6 +189,7 @@ enum EventStore {
                                        fallbackAnchorUnix: event.cu, anchors: anchors))
                 }
             }
+            for index in built.indices { built[index].anchors.sort { $0.ds < $1.ds } }
             epochs = built
             anchorOffsetsDs = built.enumerated()
                 .flatMap { index, epoch in epoch.anchors.map { ($0.unix * 10 - $0.ds, index) } }
@@ -177,6 +200,36 @@ enum EventStore {
         /// `capturedUnix` selects the right boot when ds ranges overlap.
         func unixSeconds(_ ds: Int64, capturedUnix: Int64? = nil) -> Double {
             resolve(ds, capturedUnix: capturedUnix).unix
+        }
+
+        /// Wall-clock seconds only when the boot clock can be trusted for this ds;
+        /// nil for undated data, which the per-day models must leave out.
+        func datedUnixSeconds(_ ds: Int64, capturedUnix: Int64? = nil) -> Double? {
+            let resolved = resolve(ds, capturedUnix: capturedUnix)
+            return resolved.source == .undated ? nil : resolved.unix
+        }
+
+        /// How the anchors on either side of `ds` relate: they agree; the counter
+        /// stalled between them (ring off, wall clock ran ahead) so the later anchor's
+        /// offset applies from the stall on; or the counter ran faster than wall time
+        /// (a fresh ring's erratic first days) and nothing between them is datable.
+        /// Outside the anchored range the nearest anchor extrapolates as usual.
+        private enum Bracket { case consistent, stalled(before: (ds: Int64, unix: Int64), after: (ds: Int64, unix: Int64)), erratic }
+        private static func bracket(_ anchors: [(ds: Int64, unix: Int64)], _ ds: Int64) -> Bracket {
+            var low = 0, high = anchors.count
+            while low < high {
+                let middle = (low + high) / 2
+                if anchors[middle].ds < ds { low = middle + 1 } else { high = middle }
+            }
+            guard low < anchors.count, low > 0 else { return .consistent }
+            let next = anchors[low], prev = anchors[low - 1]
+            if next.ds == ds { return .consistent }
+            let wall = Double(next.unix - prev.unix)
+            let counter = Double(next.ds - prev.ds) / 10.0
+            let tolerance = max(anchorAgreementSeconds, counter * anchorAgreementFraction)
+            if wall < counter - tolerance { return .erratic }
+            if wall > counter + tolerance { return .stalled(before: prev, after: next) }
+            return .consistent
         }
 
         func resolve(_ ds: Int64, capturedUnix: Int64? = nil) -> (unix: Double, source: Source) {
@@ -196,6 +249,17 @@ enum EventStore {
             }
             if let anchor = epoch.anchors.min(by: { abs($0.ds - ds) < abs($1.ds - ds) }) {
                 let predicted = Double(anchor.unix) + Double(ds - anchor.ds) / 10.0
+                switch Self.bracket(epoch.anchors, ds) {
+                case .erratic:
+                    return (predicted, .undated)
+                case .stalled(let before, let after):
+                    let late = Double(after.unix) - Double(after.ds - ds) / 10.0
+                    let early = Double(before.unix) + Double(ds - before.ds) / 10.0
+                    let plausible = capturedUnix.map { late <= Double($0 + Self.futureSlackSeconds) } ?? true
+                    return (plausible ? late : early, .anchor)
+                case .consistent:
+                    break
+                }
                 if capturedUnix == nil
                     || predicted <= Double(capturedUnix! + Self.futureSlackSeconds) {
                     return (predicted, .anchor)

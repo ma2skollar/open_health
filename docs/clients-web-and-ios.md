@@ -42,6 +42,7 @@ metric there once and both clients receive it in the JSON.
 | **Unified day (night + activity)** | `renderDay`, `dayCard` | `TodayCard` | `nights[]`, `activity*` | — |
 | **Full-page sleep report** (polysomnograph + clinical metrics + interpretation) | `openDayPage`→`sleepReport`, `polysomnograph`, `hypnoSvg` | `DayReportView`→`SleepReport`, `Polysomnograph` (Reports.swift) | `nights[].{stages_full,series,metrics}` | SleepNet |
 | **Sleep debt** (14-day card + cumulative debt / total sleep detail) | `renderSleepDebt`→`openSleepDebt` | `SleepDebtCard`→`SleepDebtDetail` | `sleep_debt`, grouped by wake date including naps | SleepNet |
+| **Day JSON export** (the open tab's data: night + metrics + debt, or daily stats + MET profile + workouts) | `openDayPage` "Export JSON" → `exportDayJson` (download) | `DayReportView` export menu → `DayExport` (copy / share sheet) | same sections as the report | — |
 | **Full-page activity report** (24h MET profile + intensity metrics) | `openDayPage`→`activityReport`, `metProfileSvg` | `DayReportView`→`ActivityReport`, `MetProfile` (Reports.swift) | `activity_profile`, `activity_daily`, `activity` | AAD |
 | Stage breakdown | `stageBar` | `StageBreakdown` | `nights[].{deep,light,rem,wake}_pct` | SleepNet |
 | **Autonomic recovery by stage** (mean HR/HRV in deep/light/REM) | `sleepReport` autonomic grid | `SleepReport` `autonomicGrid` | `nights[].autonomic` | SleepNet (needs hypnogram) |
@@ -76,7 +77,8 @@ a nap doesn't shadow the real sleep.
   in their Sleep tab. Automatic runs do not prune the historical model cache.
 - **iOS compact disclosures**: symptom radar initially shows its status and explanation;
   “View details” reveals measurements and personal ranges together. Ring troubleshooting
-  uses a separate support panel with technical reports behind a second disclosure.
+  is a "Help & diagnostics" card of grouped rows (check data, share report, export raw
+  data, technical reports on their own page) with the reset kept apart as a destructive row.
   These phone-layout changes are intentionally iOS-only; the underlying health data is unchanged.
 - **Manual analysis refresh (iOS)**: each day's Sleep and Activity tabs can rerun their
   respective model from saved ring data. Sleep uses the displayed night's bedtime window
@@ -87,6 +89,19 @@ a nap doesn't shadow the real sleep.
   self-contained copy of the phone's SQLite store (`VACUUM INTO`, no auth key) and hands
   it to the share sheet. On a computer it is a normal `oura --db <file> …` input, so any
   on-phone analysis can be reproduced exactly (`oura --db exported.db dashboard --tz-offset 2`).
+- **Ring clock sanity (all three twins)**: two anchors of one boot must agree on the
+  counter rate. A counter that *stalled* between them (ring off; wall clock ran ahead)
+  takes the later anchor's offset from the stall on, using the download time to pick the
+  side. A counter that ran *faster* than wall time (a fresh ring's erratic first days,
+  weeks of ds in an hour) makes everything between the two anchors **undated**: the
+  summary, the Python runners and the iOS models all leave that data out instead of
+  scattering it over months of phantom days.
+- **On-device model caches (iOS)**: every cache file carries a store digest (row count,
+  last id, anchor count, last anchor id). When it matches, activity and illness return
+  their cached results without streaming the store; illness only scans the tags it
+  uses; CVA runs at most once per local day (vascular age moves on a scale of months and
+  every sync adds PPG segments). Activity days the model rejects are cached as failed
+  under their input fingerprint and skipped until a forced refresh or a pipeline bump.
 - **Ring clock diagnostics**: the summary JSON carries a `clock` block (per-boot ds range,
   sync window, anchor count/sources, `undated_nights`, `warnings`) and each night carries
   `wake_ymd`, `start_unix`, `end_unix`, `clock_source`. iOS renders the warnings on Home,

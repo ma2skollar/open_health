@@ -60,6 +60,26 @@ so raw RData is not required. On a retained Ring 5 replay this changes a known h
 from `cycling` 0.45 to `hiking` 0.97, while a known bike remains `cycling` 0.92 and
 an immersion interval is classified `swimming` 0.99.
 
+## Days the model cannot evaluate
+
+Two input shapes make AAD 3.1.11 throw inside its preprocessor instead of returning no
+workouts, so both runners (`tools/run_activity_model.py` and iOS `ActivityModel`) guard
+them identically:
+
+- **A channel with no sample inside the MET span.** The model clips every series to its
+  valid window and then indexes the (now empty) tensor. A NaN placeholder row is placed
+  at the *first MET minute* (not at minute 0) so the channel stays present and is treated
+  as missing data.
+- **Fewer than 10 worn MET minutes before the last motion sample** (`min_valid_mets`,
+  `non_wear_met_threshold = 0.2`). The valid window collapses to minute 0 and `met[0, 0]`
+  is read from an empty tensor when the day's MET starts later. `model_would_reject` /
+  `isDegenerate` mirror `get_last_valid_time` and return no sessions for such a day.
+- **Duplicate MET minutes** (the ring resends a bucket across a clock re-anchor) trip the
+  resampler with `index_copy_()`; both runners keep one value per minute, last write wins.
+
+On iOS a day the model still rejects is cached as failed under its input fingerprint and
+skipped, so one bad day never blocks the rest of the history or reruns on every launch.
+
 ## I/O contract (as implemented)
 
 forward args (TorchScript order): `context, user, met, stepmotion, motion,

@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from epoch_time import build_epochs, make_unix_s
+from epoch_time import build_epochs, is_dated, make_unix_s
 from respiratory_rate import respiratory_rate
 
 REPO = Path(__file__).resolve().parent.parent
@@ -200,6 +200,9 @@ def run(db, tz, profile):
         return {"available": False, "status": "NO_DATA"}
     epochs = build_epochs(rows)
     unix_s = make_unix_s(epochs)
+    # Undated data (an untrustworthy boot clock) belongs to no night or day; mirrors
+    # the shared summary and the iOS IllnessModel.
+    rows = [row for row in rows if is_dated(epochs, row[0], row[3])]
 
     windows = bed_windows(rows, unix_s)
     per_day = nightly_biometrics(rows, unix_s, tz, windows)

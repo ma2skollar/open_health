@@ -579,11 +579,42 @@ function openDayPage(d, ymd, tab = "sleep") {
     return b;
   };
   tabs.append(mk("sleep", "Sleep"), mk("activity", "Activity"));
-  head.append(back, el("div", "rpt-title", dayTitle(ymd)), tabs);
+  const exp = el("button", "rpt-back rpt-export", "Export JSON");
+  exp.type = "button";
+  exp.title = "Download this day's " + tab + " data as JSON (same shape as the iOS export)";
+  exp.addEventListener("click", () => exportDayJson(d, ymd, tab));
+  head.append(back, el("div", "rpt-title", dayTitle(ymd)), tabs, exp);
   const body = el("div", "rpt-body");
   body.append(tab === "activity" ? activityReport(d, ymd) : sleepReport(d, ymd));
   wrap.append(head, body);
   showPage(wrap);
+}
+
+// One day of the report as a JSON download — mirror of iOS `DayExport` (only the
+// selected tab's section, plus a header), so a day can be compared across clients.
+function exportDayJson(d, ymd, tab) {
+  const payload = {
+    day: ymd, kind: tab, generated_at: new Date().toISOString(),
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    app_version: "web", profile: d.profile || null,
+  };
+  if (tab === "sleep") {
+    const n = nightForDay(d, ymd);
+    const debt = ((d.sleep_debt || {}).days || []).find((x) => x.date === ymd) || null;
+    payload.sleep = n ? { night: n, sleep_debt: debt } : null;
+  } else {
+    payload.activity = {
+      daily: (d.activity_daily || {})[ymd] || null,
+      profile_met: (d.activity_profile || {})[ymd] || [],
+      workouts: (Array.isArray(d.activity) ? d.activity : []).filter((w) => String(w.start || "").startsWith(ymd)),
+    };
+  }
+  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `oura-${ymd}-${tab}.json`;
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
 const stageLegend = () => el("div", "legend rpt-legend",

@@ -19,6 +19,15 @@ enum CvaModel {
         guard let modelPath = Bundle.main.path(forResource: "cva_2_1_0", ofType: "ptl")
         else { return (nil, "cardiovascular model file missing from the app bundle") }
 
+        // Vascular age moves on a scale of months; one inference per local day is
+        // plenty, and every sync adds PPG segments that would otherwise trigger a
+        // ~30 s recompute on the phone. A profile change still invalidates (global key).
+        let key = ModelCacheStore.globalKey(profile: nil)
+        let today = localDay()
+        if ModelCacheStore.loadDigest(ModelCacheStore.cvaFile, globalKey: key) == today {
+            let cached: [String: FingerprintedEntry<Result>] = ModelCacheStore.load(ModelCacheStore.cvaFile, globalKey: key)
+            if let entry = cached["result"] { dlog("models", "cva cache=today segments=\(entry.value.segments)"); return (entry.value, nil) }
+        }
         let read = selectedSegments(dbPath: dbPath)
         guard var segments = read.segments else { return (nil, read.error) }
         let nSegs = segments.count / SEG_LEN
@@ -27,17 +36,29 @@ enum CvaModel {
         let sexVal: Float = sex.uppercased() == "F" ? -1 : (sex.uppercased() == "O" ? 0 : 1)
         var demo: [Float] = [sexVal, Float(heightM), Float(age), Float(ringSize), Float(weightKg)]
         guard !AnalysisRun.cancelled else { return (nil, "analysis paused") }
+        // Segments and demographics are fingerprinted inside the entry; the file key
+        // is the stable global key so a newly synced PPG segment never discards the file.
         var fingerprint = FNV64(); fingerprint.combine(segments); fingerprint.combine(demo)
-        let key = ModelCacheStore.globalKey(profile: nil) + fingerprint.hex
-        let cached: [String: Result] = ModelCacheStore.load(ModelCacheStore.cvaFile, globalKey: key)
-        if let result = cached["result"] { dlog("models", "cva cache=hit segments=\(nSegs)"); return (result, nil) }
+        let cached: [String: FingerprintedEntry<Result>] = ModelCacheStore.load(ModelCacheStore.cvaFile, globalKey: key)
+        if let entry = cached["result"], entry.fp == fingerprint.hex {
+            dlog("models", "cva cache=hit segments=\(nSegs)")
+            ModelCacheStore.save(ModelCacheStore.cvaFile, globalKey: key, entries: cached, digest: today)
+            return (entry.value, nil)
+        }
         var vage = 0.0, pwv = 0.0
         let rc = oura_cva(modelPath, &segments, Int32(nSegs), &demo, &vage, &pwv)
         guard rc == 0 else { return (nil, "cardiovascular model failed on \(nSegs) PPG segments") }
         let result = Result(vascularAge: (vage * 10).rounded() / 10, pwv: (pwv * 100).rounded() / 100, segments: nSegs)
-        ModelCacheStore.save(ModelCacheStore.cvaFile, globalKey: key, entries: ["result": result])
+        ModelCacheStore.save(ModelCacheStore.cvaFile, globalKey: key,
+                             entries: ["result": FingerprintedEntry(fp: fingerprint.hex, value: result)],
+                             digest: today)
         dlog("models", "cva cache=miss segments=\(nSegs)")
         return (result, nil)
+    }
+
+    private static func localDay() -> String {
+        let c = Calendar.current.dateComponents([.year, .month, .day], from: Date())
+        return String(format: "%04d-%02d-%02d", c.year ?? 0, c.month ?? 0, c.day ?? 0)
     }
 
     /// Separately testable decoding/selection; closes SQLite before inference.

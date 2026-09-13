@@ -883,6 +883,13 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
     }
     let clock = RingClock::from_events(&events);
     let unix_s_at = |ds: i64, captured_unix: i64| clock.unix_s(ds, captured_unix);
+    // An event whose boot clock cannot be trusted has no calendar day; feeding it to
+    // the aggregations would scatter it over fabricated dates (a fresh ring's first
+    // days used to produce months of phantom history). Bedtime markers are still
+    // collected so those nights are reported as undated instead of vanishing.
+    let is_dated = |ds: i64, captured_unix: i64| {
+        clock.resolve(ds, captured_unix).source != ring_time::ClockSource::Undated
+    };
     let anchor_unix = clock.latest_unix();
     let mut raw_beds: Vec<BedPeriod> = Vec::new();
     let mut sleep_support: Vec<(i64, i64)> = Vec::new();
@@ -895,8 +902,12 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
     let name_of = |tag: u8| oura_protocol::events::event_name(tag);
     for (ds, tag, jstr, cu) in &events {
         let n = name_of(*tag);
-        if unix_s_at(*ds, *cu) >= recent_cut_unix {
+        let dated = is_dated(*ds, *cu);
+        if dated && unix_s_at(*ds, *cu) >= recent_cut_unix {
             present_recent.insert(n);
+        }
+        if !dated && n != "bedtime_period" {
+            continue;
         }
         if n == "bedtime_period" {
             if let Ok(v) = serde_json::from_str::<Value>(jstr) {
@@ -1002,6 +1013,9 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
             .map(|(idx, _)| idx)
     };
     for (ds, tag, jstr, cu) in &events {
+        if !is_dated(*ds, *cu) {
+            continue;
+        }
         let Some(idx) = find_night(*ds, *cu, &nights) else {
             continue;
         };
@@ -1224,6 +1238,9 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
         oura_analysis::ported::metabolic::vo2max_jackson(demo.age, demo.sex == 'F', weight);
     for (ds, tag, jstr, cu) in &events {
         if name_of(*tag) != "activity_information" || !jstr.contains("\"met\"") {
+            continue;
+        }
+        if !is_dated(*ds, *cu) {
             continue;
         }
         if let Ok(v) = serde_json::from_str::<Value>(jstr) {

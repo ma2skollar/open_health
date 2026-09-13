@@ -30,6 +30,14 @@ struct FNV64 {
 struct ActivityDayEntry: Codable {
     var fp: String
     var sessions: [WorkoutSession]
+    /// Set when the model rejected these exact inputs; absent in older files.
+    var failed: Bool?
+}
+
+/// A single cached model result keyed by the fingerprint of its inputs (illness, CVA).
+struct FingerprintedEntry<Value: Codable>: Codable {
+    var fp: String
+    var value: Value
 }
 
 struct StagedNightEntry: Codable {
@@ -41,6 +49,16 @@ private struct ModelCacheFile<Entry: Codable>: Codable {
     var version: Int
     var globalKey: String
     var entries: [String: Entry]
+    /// Cheap identity of the inputs the entries were computed from (e.g. the event
+    /// store's row count and last id). When it still matches, a model can return its
+    /// cached results without streaming the store at all.
+    var digest: String?
+}
+
+private struct ModelCacheDigest: Codable {
+    var version: Int
+    var globalKey: String
+    var digest: String?
 }
 
 /// Mirrors SummaryCache: Application Support, serial queue, atomic writes.
@@ -67,19 +85,35 @@ enum ModelCacheStore {
                 dlog("models", "\(file): cache unreadable, recomputing everything")
                 return [:]
             }
-            guard decoded.version == version, decoded.globalKey == globalKey else {
-                dlog("models", "\(file): cache discarded (schema v\(decoded.version)→v\(version) or global key changed), recomputing everything")
+            guard decoded.version == version else {
+                dlog("models", "\(file): cache discarded (schema v\(decoded.version)→v\(version)), recomputing everything")
+                return [:]
+            }
+            guard decoded.globalKey == globalKey else {
+                dlog("models", "\(file): cache discarded (global key \(decoded.globalKey.prefix(8))→\(globalKey.prefix(8)): profile, timezone or store changed), recomputing everything")
                 return [:]
             }
             return decoded.entries
         }
     }
 
+    /// The digest a complete run stored, or nil when the file is missing, stale or
+    /// was last written mid-run.
+    static func loadDigest(_ file: String, globalKey: String) -> String? {
+        queue.sync {
+            guard let data = try? Data(contentsOf: url(file)),
+                  let decoded = try? JSONDecoder().decode(ModelCacheDigest.self, from: data),
+                  decoded.version == version, decoded.globalKey == globalKey else { return nil }
+            return decoded.digest
+        }
+    }
+
     /// Every entry is a finished, input-fingerprinted result, so it is worth keeping
     /// even when the run around it is being cancelled (backgrounding mid-history
     /// used to throw away every day computed so far and redo them on relaunch).
-    static func save<E: Codable>(_ file: String, globalKey: String, entries: [String: E]) {
-        let payload = ModelCacheFile(version: version, globalKey: globalKey, entries: entries)
+    /// `digest` is only passed by a run that finished every entry.
+    static func save<E: Codable>(_ file: String, globalKey: String, entries: [String: E], digest: String? = nil) {
+        let payload = ModelCacheFile(version: version, globalKey: globalKey, entries: entries, digest: digest)
         queue.async {
             guard let data = try? JSONEncoder().encode(payload) else { return }
             try? data.write(to: url(file), options: .atomic)

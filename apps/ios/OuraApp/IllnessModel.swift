@@ -83,7 +83,16 @@ enum IllnessModel {
         guard let modelPath = Bundle.main.path(forResource: "illness_detection_0_5_1", ofType: "ptl")
         else { return (nil, "illness model file missing from the app bundle") }
         guard !events.isEmpty else { return (nil, nil) }
+        // Same rows and anchors as the last complete run: the answer cannot differ,
+        // so skip the full-history IBI ingest (the slowest stage of a launch).
+        let cacheKey = ModelCacheStore.globalKey(profile: profile)
+        let storeDigest = events.digest()
+        if let storeDigest, ModelCacheStore.loadDigest(ModelCacheStore.illnessFile, globalKey: cacheKey) == storeDigest {
+            let cached: [String: FingerprintedEntry<IllnessResult>] = ModelCacheStore.load(ModelCacheStore.illnessFile, globalKey: cacheKey)
+            if let entry = cached["result"] { dlog("models", "illness cache=digest-hit"); return (entry.value, nil) }
+        }
         func u(_ ds: Int64, _ cu: Int64) -> Double { clock.unixSeconds(ds, capturedUnix: cu) }
+        func dated(_ ds: Int64, _ cu: Int64) -> Bool { clock.datedUnixSeconds(ds, capturedUnix: cu) != nil }
         let tz = Double(TimeZone.current.secondsFromGMT())
 
         let ibi: IBIWorkspace
@@ -95,7 +104,26 @@ enum IllnessModel {
         var windows: [(start: Double, end: Double)] = []
         var sed: [Int: Double] = [:], rest: [Int: Double] = [:]
 
-        for e in events {
+        // The model looks at the last 30 wake days. Find that window first from the
+        // (few) bedtime markers so the full-history IBI stream — millions of beats —
+        // is only ingested for the days that can matter.
+        var latestWake: Int?
+        for e in events.restricted("tag=118") where dated(e.ds, e.cu) {
+            if let s = (e.json["bedtime_start_ds"] as? NSNumber)?.int64Value,
+               let en = (e.json["bedtime_end_ds"] as? NSNumber)?.int64Value, en > s,
+               u(en, e.cu) - u(s, e.cu) >= 3600 {
+                latestWake = max(latestWake ?? .min, Int((u(en, e.cu) + tz) / self.day))
+            }
+        }
+        guard let latestWake else { return (nil, nil) }
+        let cutoff = Double(latestWake - nDays - 1) * self.day - tz
+        // Only the tags below feed the model; letting SQLite skip the rest avoids
+        // decoding two million rows of unrelated JSON.
+        let relevant = events.restricted("tag IN (68,96,113,93,70,105,117,118,80)")
+        for e in relevant {
+            // Undated data (an untrustworthy boot clock) belongs to no night or day,
+            // and anything before the window cannot change the result.
+            guard dated(e.ds, e.cu), u(e.ds, e.cu) >= cutoff else { continue }
             switch e.tag {
             case let t where ibiTags.contains(t):
                 guard let values = e.json["ibi_ms"] as? [Any] else { continue }
@@ -231,10 +259,15 @@ enum IllnessModel {
         var series = breath + avgHr + lowHr + hrv + tempDev + sedC + restC  // 7×30 row-major
         var scal = scalars
         guard !AnalysisRun.cancelled, events.error == nil else { return (nil, "analysis interrupted") }
+        // Inputs are fingerprinted inside the entry; the file key stays the stable
+        // profile/timezone key so a new day never discards the whole file.
         var fingerprint = FNV64(); fingerprint.combine(series); fingerprint.combine(scal); fingerprint.combine(anchor)
-        let cacheKey = ModelCacheStore.globalKey(profile: profile) + fingerprint.hex
-        let cached: [String: IllnessResult] = ModelCacheStore.load(ModelCacheStore.illnessFile, globalKey: cacheKey)
-        if let result = cached["result"] { dlog("models", "illness cache=hit"); return (result, nil) }
+        let cached: [String: FingerprintedEntry<IllnessResult>] = ModelCacheStore.load(ModelCacheStore.illnessFile, globalKey: cacheKey)
+        if let entry = cached["result"], entry.fp == fingerprint.hex {
+            dlog("models", "illness cache=hit")
+            ModelCacheStore.save(ModelCacheStore.illnessFile, globalKey: cacheKey, entries: cached, digest: storeDigest)
+            return (entry.value, nil)
+        }
         var score = 0.0, decision: Int32 = 0
         var bio = [Float](repeating: 0, count: 16)
         let rc = oura_illness(modelPath, &series, &scal, &score, &decision, &bio)
@@ -259,7 +292,9 @@ enum IllnessModel {
             score: score, decision: Int(decision),
             date: String(format: "%04d-%02d-%02d", y, mo, dd),
             daysWithData: daysWithData, biomarkers: biomarkers)
-        ModelCacheStore.save(ModelCacheStore.illnessFile, globalKey: cacheKey, entries: ["result": result])
+        ModelCacheStore.save(ModelCacheStore.illnessFile, globalKey: cacheKey,
+                             entries: ["result": FingerprintedEntry(fp: fingerprint.hex, value: result)],
+                             digest: storeDigest)
         dlog("models", "illness cache=miss")
         return (result, nil)
     }

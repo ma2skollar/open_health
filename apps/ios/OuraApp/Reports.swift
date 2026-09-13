@@ -755,6 +755,8 @@ struct DayReportView: View {
     @Environment(\.dayAnalysis) private var analysis
     @State private var refreshing: Tab?
     @State private var refreshMessages: [String: String] = [:]
+    @State private var exportFile: URL?
+    @State private var exportNote: String?
     typealias Tab = DayAnalysisKind
 
     var body: some View {
@@ -774,6 +776,7 @@ struct DayReportView: View {
                         ForEach(Tab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                     }
                     .pickerStyle(.segmented).fixedSize()
+                    exportMenu
                 }
                 .padding(.horizontal, 20).padding(.vertical, 12)
                 .overlay(alignment: .bottom) { Rectangle().fill(Obs.trace.opacity(0.3)).frame(height: 0.5) }
@@ -819,6 +822,55 @@ struct DayReportView: View {
             }
         }
         .toolbar(.hidden, for: .navigationBar)
+        .sheet(isPresented: Binding(get: { exportFile != nil }, set: { if !$0 { exportFile = nil } })) {
+            if let exportFile { DiagnosticsShare(url: exportFile) }
+        }
+    }
+
+    /// The day's data as JSON — copy for a quick paste, or share as a file. Built off
+    /// the main thread: a night carries its full signal series.
+    private var exportMenu: some View {
+        Menu {
+            Button { export(share: false) } label: { Label("Copy JSON", systemImage: "doc.on.doc") }
+            Button { export(share: true) } label: { Label("Share JSON…", systemImage: "square.and.arrow.up") }
+        } label: {
+            Image(systemName: exportNote == nil ? "square.and.arrow.up" : "checkmark")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Obs.ink2)
+                .frame(width: 34, height: 34)
+                .contentShape(Rectangle())
+                .contentTransition(.symbolEffect(.replace))
+        }
+        .accessibilityLabel(exportNote ?? "Export \(tab.rawValue.lowercased()) data as JSON")
+    }
+
+    private func export(share: Bool) {
+        let summary = analysis?.summary ?? s
+        let selected = tab
+        Task {
+            let payload = DayExport(summary: summary, day: day, kind: selected)
+            let result: Result<URL?, Error> = await Task.detached {
+                Result {
+                    if payload.isEmpty { return nil }
+                    if share { return try payload.writeTemporaryFile() }
+                    DayExport.copyToPasteboard(try payload.json())
+                    return nil
+                }
+            }.value
+            switch result {
+            case .success(let url):
+                if payload.isEmpty { exportNote = "Nothing to export for this day."; refreshMessages[selected.rawValue] = exportNote }
+                else if let url { exportFile = url }
+                else { exportNote = "Copied" }
+            case .failure(let error):
+                dlog("export", "day \(day) \(selected.rawValue): \(error)")
+                refreshMessages[selected.rawValue] = "Couldn’t build the JSON export."
+            }
+            if exportNote != nil {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                exportNote = nil
+            }
+        }
     }
 }
 

@@ -32,6 +32,35 @@ class RingClockTests(unittest.TestCase):
                             1_788_800_000 + (300_000 - 5_000_000) / 10.0)
         self.assertTrue(is_dated(epochs, 5_100_000, 1_788_800_000))
 
+    def test_erratic_counter_between_disagreeing_anchors_is_undated(self):
+        # 28 hours of ds in one wall-clock hour between the first two anchors, then a
+        # healthy pocket between the next two (mirror of the Rust test).
+        epochs = build_epochs([
+            (20_000, 1, '{}', 1_783_000_000),
+            (20_928, 0x42, '{"unix_time":1782939604}', 1_783_000_000),
+            (500_000, 1, '{}', 1_783_000_000),
+            (1_032_193, 0x85, '{"unix_time":1782943316}', 1_783_000_000),
+            (1_100_000, 1, '{}', 1_783_000_000),
+            (1_133_000, 0x85, '{"unix_time":1782953397}', 1_783_000_000),
+            (1_200_000, 1, '{}', 1_783_000_000),
+        ])
+        self.assertFalse(is_dated(epochs, 500_000, 1_783_000_000))
+        self.assertTrue(is_dated(epochs, 1_100_000, 1_783_000_000))
+        self.assertTrue(is_dated(epochs, 1_200_000, 1_783_000_000))
+        self.assertTrue(is_dated(epochs, 20_000, 1_783_000_000))
+
+    def test_stalled_counter_uses_download_time_to_pick_the_anchor_side(self):
+        before, after = (47_893_458, 1_787_733_180), (61_076_535, 1_789_195_380)
+        epochs = build_epochs([
+            (before[0], 0x42, '{"unix_time":%d}' % before[1], before[1] + 60),
+            (52_000_000, 1, '{}', 1_788_100_000),
+            (after[0], 0x42, '{"unix_time":%d}' % after[1], after[1] + 60),
+        ])
+        unix_s = make_unix_s(epochs)
+        self.assertTrue(is_dated(epochs, 52_000_000, 1_788_100_000))
+        self.assertAlmostEqual(unix_s(52_000_000, 1_788_100_000), before[1] + (52_000_000 - before[0]) / 10.0)
+        self.assertAlmostEqual(unix_s(52_000_000, after[1] + 60), after[1] - (after[0] - 52_000_000) / 10.0)
+
     def test_phone_anchor_dates_new_boot(self):
         epochs = build_epochs([
             (5_000_000, 0x42, '{"unix_time":1788800000}', 1_788_800_000),

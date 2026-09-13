@@ -4,6 +4,35 @@ import json
 
 EPOCH_RESET_SLACK_DS = 6 * 3600 * 10
 FUTURE_SLACK_S = 6 * 3600
+# Two anchors of one boot must agree on the counter rate (10 ds/s plus drift). A fresh
+# ring's first days ran the counter erratically (weeks of ds in an hour), so nothing
+# between two disagreeing anchors has a calendar day. Mirrors ANCHOR_AGREEMENT_* in
+# crates/oura-summary/src/ring_time.rs and EventStore.RingClock on iOS.
+ANCHOR_AGREEMENT_S = 30 * 60
+ANCHOR_AGREEMENT_FRACTION = 0.02
+
+
+def bracket(anchors, ds):
+    """How the anchors on either side of `ds` relate: `("consistent", None)`, `("stalled",
+    (before, after))` when the counter lost time between them (ring off; the later
+    anchor's offset applies from the stall on), or `("erratic", None)` when the counter
+    ran faster than wall time (nothing between them is datable). Outside the anchored
+    range the nearest anchor extrapolates as usual."""
+    anchors = sorted(anchors)
+    idx = next((i for i, (a, _) in enumerate(anchors) if a >= ds), len(anchors))
+    if idx == 0 or idx >= len(anchors):
+        return "consistent", None
+    prev, nxt = anchors[idx - 1], anchors[idx]
+    if nxt[0] == ds:
+        return "consistent", None
+    wall_s = nxt[1] - prev[1]
+    counter_s = (nxt[0] - prev[0]) / 10.0
+    tolerance = max(ANCHOR_AGREEMENT_S, counter_s * ANCHOR_AGREEMENT_FRACTION)
+    if wall_s < counter_s - tolerance:
+        return "erratic", None
+    if wall_s > counter_s + tolerance:
+        return "stalled", (prev, nxt)
+    return "consistent", None
 
 
 def build_epochs(rows):
@@ -61,8 +90,17 @@ def make_unix_s(epochs):
         if e[5]:
             anchor_ds, anchor_unix = min(e[5], key=lambda a: abs(a[0] - ds))
             predicted = anchor_unix + (ds - anchor_ds) / 10.0
-            if captured_unix is None or predicted <= captured_unix + FUTURE_SLACK_S:
+            kind, pair = bracket(e[5], ds)
+            if kind == "stalled":
+                before, after = pair
+                late = after[1] - (after[0] - ds) / 10.0
+                if captured_unix is None or late <= captured_unix + FUTURE_SLACK_S:
+                    return late
+                return before[1] + (ds - before[0]) / 10.0
+            if kind == "consistent" and (captured_unix is None or predicted <= captured_unix + FUTURE_SLACK_S):
                 return predicted
+            if kind == "erratic":
+                return predicted  # undated; callers check is_dated()
         if captured_unix is not None:
             # Only borrow a boot's clock when this ds continues that boot's counter;
             # a rebooted ring restarts near zero and must not be projected through an
@@ -93,6 +131,11 @@ def is_dated(epochs, ds, captured_unix):
         return 0
     e = min(candidates, key=capture_distance)
     if e[5]:
+        kind, _ = bracket(e[5], ds)
+        if kind == "erratic":
+            return False
+        if kind == "stalled":
+            return True
         anchor_ds, anchor_unix = min(e[5], key=lambda a: abs(a[0] - ds))
         if anchor_unix + (ds - anchor_ds) / 10.0 <= captured_unix + FUTURE_SLACK_S:
             return True

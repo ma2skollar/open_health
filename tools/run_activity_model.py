@@ -18,7 +18,7 @@ import torch
 
 from _common import resolve_db, resolve_models_dir
 from activity_features import decoder_to_aad, unpack_real_step
-from epoch_time import build_epochs, make_unix_s
+from epoch_time import build_epochs, is_dated, make_unix_s
 
 warnings.filterwarnings("ignore", message=".*searchsorted.*")
 
@@ -73,16 +73,70 @@ def parse_args():
     return args
 
 
-def tensor(rows, columns, required=True):
+def tensor(rows, columns, window=None):
+    """Rows as float32; `window=(lo, hi)` is the MET span of the day.
+
+    A series with no sample inside that span is dropped entirely by the model's
+    valid-time clipping, after which it indexes the empty tensor and throws. A NaN
+    placeholder at the first MET minute keeps the channel present (it is treated as
+    missing data). Mirror of ActivityModel.matrix on iOS.
+    """
+    if window is not None:
+        lo, hi = window
+        if not any(lo <= row[0] <= hi for row in rows):
+            rows = sorted(rows + [[lo] + [float("nan")] * (columns - 1)], key=lambda row: row[0])
     if rows:
         return torch.tensor(rows, dtype=torch.float32)
-    if required:
-        return torch.tensor([[0.0] + [float("nan")] * (columns - 1)], dtype=torch.float32)
     return torch.empty((0, columns), dtype=torch.float32)
 
 
-def decode_stepmotion(db, unix_seconds, enabled):
-    if not enabled or not STEP_MODEL.exists():
+NON_WEAR_MET_THRESHOLD = 0.2
+MIN_VALID_METS = 10
+ACCEPTABLE_LAST_HR_MISSING_MINUTES = 5
+
+
+def model_would_reject(met, motion, temperature, heart_rate, step_rows):
+    """Mirror of the model's `get_last_valid_time` (AAD 3.1.11 preprocessor).
+
+    With fewer than MIN_VALID_METS worn MET minutes before the last motion sample the
+    valid window collapses to minute 0 and the graph indexes an empty MET tensor.
+    Such a day has no evaluable data: skip it instead of catching the exception.
+    Kept identical to ActivityModel.isDegenerate on iOS.
+    """
+    import math
+    last = lambda rows: rows[-1][0] if rows else 0.0
+    last_motion = math.ceil(last(motion))
+    worn = [row[0] for row in met if row[1] > NON_WEAR_MET_THRESHOLD and row[0] <= last_motion]
+    if len(worn) < MIN_VALID_METS:
+        return met[0][0] > 0
+    last_valid = min(worn[-1], last_motion, math.ceil(last(heart_rate)) + ACCEPTABLE_LAST_HR_MISSING_MINUTES,
+                     math.ceil(last(step_rows)), math.ceil(last(temperature)))
+    return met[0][0] > last_valid
+
+
+STEP_MODEL_MOBILE = MODEL.parent / "mobile" / "steps_motion_decoder_2_0_0.ptl"
+
+
+def load_step_decoder():
+    """The gait decoder: the full TorchScript when installed, else the mobile export
+    (same weights, lite-interpreter bytecode) that ships in the iOS app. Without it
+    the model runs on MET/motion alone and finds far fewer sessions than the app."""
+    if STEP_MODEL.exists():
+        return torch.jit.load(str(STEP_MODEL), map_location="cpu").eval()
+    if STEP_MODEL_MOBILE.exists():
+        from torch.jit.mobile import _load_for_lite_interpreter
+        return _load_for_lite_interpreter(str(STEP_MODEL_MOBILE))
+    return None
+
+
+def decode_stepmotion(db, unix_seconds, enabled, epochs):
+    if not enabled:
+        return []
+    decoder = load_step_decoder()
+    if decoder is None:
+        print(f"warning: step decoder not found ({STEP_MODEL} or {STEP_MODEL_MOBILE}); "
+              "running without gait features, expect fewer and differently labelled sessions",
+              file=sys.stderr)
         return []
     packets = db.execute(
         "SELECT ring_timestamp, tag, body, captured_unix FROM events "
@@ -90,12 +144,12 @@ def decode_stepmotion(db, unix_seconds, enabled):
     ).fetchall()
     seconds = {}
     for ds, tag, body, captured in packets:
-        if tag == 0x7F and len(body) == 14:
+        if tag == 0x7F and len(body) == 14 and is_dated(epochs, ds, captured):
             wall_ds = round(unix_seconds(ds, captured) * 10)
             seconds[wall_ds] = body
     raw, timestamps = [], []
     for ds, tag, body, captured in packets:
-        if tag != 0x7E or len(body) != 14:
+        if tag != 0x7E or len(body) != 14 or not is_dated(epochs, ds, captured):
             continue
         wall_ds = round(unix_seconds(ds, captured) * 10)
         second = seconds.get(wall_ds + 1)
@@ -105,7 +159,10 @@ def decode_stepmotion(db, unix_seconds, enabled):
         timestamps.append(wall_ds * 100)
     if not raw:
         return []
-    decoder = torch.jit.load(str(STEP_MODEL), map_location="cpu").eval()
+    # The decoder windows consecutive packets: feed them in time order (the DB is in
+    # capture order, which interleaves boots after a re-anchor), as the iOS app does.
+    order = sorted(range(len(raw)), key=lambda i: timestamps[i])
+    raw, timestamps = [raw[i] for i in order], [timestamps[i] for i in order]
     with torch.no_grad():
         out_ts, out_data = decoder(torch.tensor(timestamps, dtype=torch.int64),
                                    torch.tensor(raw, dtype=torch.float32))
@@ -129,15 +186,17 @@ def run_day(model, day, day_start_min, signals, steps, args):
     motion, temperature, heart_rate = select("motion"), select("temperature"), select("heart_rate")
     step_rows = [[t - day_start_min] + values for t, values in steps
                  if day_start_min <= t < day_end_min]
+    if model_would_reject(met, motion, temperature, heart_rate, step_rows):
+        return []
     lo, hi = met[0][0], met[-1][0]
     step_rows = [[lo] + [float("nan")] * 11] + step_rows + [[hi] + [float("nan")] * 11]
 
     context = torch.tensor([day.year, day.month, day.day, day.weekday()], dtype=torch.float32)
-    user = torch.tensor([30, 1, 1.78, 78] + [float("nan")] * 10, dtype=torch.float32)
+    user = torch.tensor(args.user_vector + [float("nan")] * 10, dtype=torch.float32)
     with torch.no_grad():
         workouts, _, _ = model(
-            context, user, tensor(met, 2), tensor(step_rows, 12), tensor(motion, 9),
-            tensor(temperature, 2), tensor(heart_rate, 2), None, None,
+            context, user, tensor(met, 2), tensor(step_rows, 12), tensor(motion, 9, (lo, hi)),
+            tensor(temperature, 2, (lo, hi)), tensor(heart_rate, 2, (lo, hi)), None, None,
             torch.tensor(args.threshold), torch.tensor(args.min_duration), torch.tensor(0.0),
         )
 
@@ -168,13 +227,17 @@ def main():
     ).fetchall()
     if not rows:
         sys.exit(f"error: no decoded events in {db_path}")
-    unix_seconds = make_unix_s(build_epochs(rows))
+    epochs = build_epochs(rows)
+    unix_seconds = make_unix_s(epochs)
     signals = {name: [] for name in ("met", "motion", "temperature", "heart_rate")}
     scale = float(os.environ.get("ACM_SCALE", "1"))
     for ds, tag, payload, captured in rows:
         try:
             value = json.loads(payload)
         except Exception:
+            continue
+        # Undated data (an untrustworthy boot clock) belongs to no calendar day.
+        if not is_dated(epochs, ds, captured):
             continue
         # Ring summaries are minute buckets. Epoch reconstruction can leave them a
         # few seconds off the boundary; Android stores the bucket timestamp itself.
@@ -196,7 +259,16 @@ def main():
     if not signals["met"]:
         sys.exit("no MET events in DB — cannot run activity model")
 
-    steps = decode_stepmotion(db, unix_seconds, not args.no_stepmotion)
+    steps = decode_stepmotion(db, unix_seconds, not args.no_stepmotion, epochs)
+    # Demographics from profile.json next to the DB (what the iOS app and the CVA
+    # runner use); the model takes [age, sex(M=1), height_m, weight_kg].
+    profile = {}
+    try:
+        profile = json.loads((Path(db_path).parent / "profile.json").read_text())
+    except Exception:
+        pass
+    args.user_vector = [float(profile.get("age") or 30), 1.0 if str(profile.get("sex", "M")).upper() == "M" else 0.0,
+                        float(profile.get("height_m") or 1.78), float(profile.get("weight_kg") or 75)]
     offset_minutes = args.tz * 60
     dates = sorted({datetime.datetime.utcfromtimestamp(t * 60 + args.tz * 3600).date()
                     for t, _ in signals["met"]})

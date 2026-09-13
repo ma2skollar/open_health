@@ -436,6 +436,7 @@ body.page-open { overflow: hidden; }
 .rpt-tabs { margin-left: auto; display: flex; gap: 3px; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-sm); padding: 3px; }
 .rpt-tab { font-family: var(--sans); font-size: 13px; color: var(--muted); cursor: pointer; background: none; border: 0; border-radius: 2px; padding: 6px 16px; }
 .rpt-tab.on { background: var(--surface); color: var(--text); box-shadow: var(--sheen); }
+.rpt-export { margin-left: 10px; }
 .rpt-legend { margin: 0 0 18px; }
 .rpt-body .subhead { margin: 30px 0 12px; font-size: 11px; letter-spacing: 0.08em; }
 

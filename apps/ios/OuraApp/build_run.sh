@@ -27,8 +27,8 @@ xcrun -sdk iphonesimulator swiftc \
     "$GEN/oura_core.swift" "$APPDIR/Theme.swift" "$APPDIR/OuraApp.swift" \
     "$APPDIR/Models.swift" "$APPDIR/Core.swift" "$APPDIR/Components.swift" "$APPDIR/Reports.swift" \
     "$APPDIR/BLETransport.swift" "$APPDIR/RingSync.swift" "$APPDIR/ProfileSettings.swift" \
-    "$APPDIR/ModelProgress.swift" "$APPDIR/Diagnostics.swift" "$APPDIR/HealthExport.swift" "$APPDIR/WorkCoordinator.swift" "$BUILD/CrashCatch.o" \
-    -L "$XCF" -loura_core \
+    "$APPDIR/ModelProgress.swift" "$APPDIR/Diagnostics.swift" "$APPDIR/HealthExport.swift" "$APPDIR/DayExport.swift" "$APPDIR/WorkCoordinator.swift" "$BUILD/CrashCatch.o" \
+    -L "$XCF" -loura_core -lsqlite3 \
     -o "$APP/OuraApp"
 # Xcode expands $(PRODUCT_BUNDLE_IDENTIFIER) at build time; the raw-swiftc path doesn't,
 # so substitute it here or LaunchServices registers the app under the literal variable

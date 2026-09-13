@@ -15,6 +15,15 @@ struct Epoch {
 }
 
 const RESET_SLACK_DS: i64 = 6 * 3600 * 10;
+// Two anchors of one boot normally agree on the counter rate (10 ds per second, plus
+// drift). When the counter *stalled* between them (the ring lost hours while off), the
+// wall clock advanced more than the counter and the later anchor's offset applies from
+// the stall on; the download time tells which side of the stall an event sits on. When
+// the counter ran *faster* than wall time — a fresh ring's first days jumped weeks of ds
+// in an hour — nothing between the two anchors can be placed on the calendar.
+// Half an hour absorbs RTC drift and the second-granular anchors; 2 % covers long gaps.
+const ANCHOR_AGREEMENT_S: f64 = 30.0 * 60.0;
+const ANCHOR_AGREEMENT_FRACTION: f64 = 0.02;
 // A history event cannot legitimately occur well after the phone captured it.
 // A few hours tolerate clock corrections/timezone setup without allowing a replayed
 // pre-reboot high ds value to fabricate weeks of future data.
@@ -43,6 +52,14 @@ impl ClockSource {
             ClockSource::Undated => "undated",
         }
     }
+}
+
+enum Bracket {
+    Consistent,
+    /// The counter lost time between the two anchors (ring powered off).
+    Stalled { before: (i64, i64), after: (i64, i64) },
+    /// The counter advanced faster than wall time: untrustworthy.
+    Erratic,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -107,6 +124,9 @@ impl RingClock {
                 }
             }
         }
+        for epoch in &mut epochs {
+            epoch.anchors.sort_unstable();
+        }
         let mut anchor_offsets_ds = epochs
             .iter()
             .enumerate()
@@ -137,6 +157,29 @@ impl RingClock {
             .min_by_key(|(a, _)| (*a as i128 - ds as i128).unsigned_abs())
         {
             let predicted = *anchor_unix as f64 + (ds - *anchor_ds) as f64 / 10.0;
+            match Self::bracket(&epoch.anchors, ds) {
+                Bracket::Erratic => {
+                    // Any prediction would scatter the data across fabricated days.
+                    return Resolved {
+                        unix: predicted,
+                        source: ClockSource::Undated,
+                    };
+                }
+                Bracket::Stalled { before, after } => {
+                    let late = after.1 as f64 - (after.0 - ds) as f64 / 10.0;
+                    let early = before.1 as f64 + (ds - before.0) as f64 / 10.0;
+                    let unix = if late <= captured_unix as f64 + FUTURE_SLACK_S {
+                        late
+                    } else {
+                        early
+                    };
+                    return Resolved {
+                        unix,
+                        source: ClockSource::Anchor,
+                    };
+                }
+                Bracket::Consistent => {}
+            }
             if predicted <= captured_unix as f64 + FUTURE_SLACK_S {
                 return Resolved {
                     unix: predicted,
@@ -219,6 +262,33 @@ impl RingClock {
         serde_json::json!({ "epochs": epochs })
     }
 
+    /// How the anchors on either side of `ds` (sorted by ds) relate. Outside the
+    /// anchored range the single nearest anchor extrapolates as usual — that is how
+    /// an ordinary boot's first hours are dated.
+    fn bracket(anchors: &[(i64, i64)], ds: i64) -> Bracket {
+        let idx = anchors.partition_point(|(a, _)| *a < ds);
+        let (Some(&next), Some(prev)) = (anchors.get(idx), idx.checked_sub(1).map(|i| anchors[i]))
+        else {
+            return Bracket::Consistent;
+        };
+        if next.0 == ds {
+            return Bracket::Consistent;
+        }
+        let wall_s = (next.1 - prev.1) as f64;
+        let counter_s = (next.0 - prev.0) as f64 / 10.0;
+        let tolerance = ANCHOR_AGREEMENT_S.max(counter_s * ANCHOR_AGREEMENT_FRACTION);
+        if wall_s < counter_s - tolerance {
+            Bracket::Erratic
+        } else if wall_s > counter_s + tolerance {
+            Bracket::Stalled {
+                before: prev,
+                after: next,
+            }
+        } else {
+            Bracket::Consistent
+        }
+    }
+
     fn epoch_for(&self, ds: i64, captured_unix: i64) -> &Epoch {
         self.epochs
             .iter()
@@ -261,6 +331,50 @@ mod tests {
 
     fn event(ds: i64, tag: u8, json: &str, captured: i64) -> (i64, u8, String, i64) {
         (ds, tag, json.into(), captured)
+    }
+
+    #[test]
+    fn erratic_counter_between_disagreeing_anchors_is_undated() {
+        // A fresh ring: the counter advanced 28 hours of ds in one wall-clock hour
+        // between two time syncs, then ran normally between the next two.
+        let clock = RingClock::from_events(&[
+            event(20_000, 1, "{}", 1_783_000_000),
+            event(20_928, 0x42, r#"{"unix_time":1782939604}"#, 1_783_000_000),
+            event(500_000, 1, "{}", 1_783_000_000),
+            event(1_032_193, 0x85, r#"{"unix_time":1782943316}"#, 1_783_000_000),
+            event(1_100_000, 1, "{}", 1_783_000_000),
+            event(1_133_000, 0x85, r#"{"unix_time":1782953397}"#, 1_783_000_000),
+            event(1_200_000, 1, "{}", 1_783_000_000),
+        ]);
+        assert_eq!(clock.resolve(500_000, 1_783_000_000).source, ClockSource::Undated);
+        // Inside the healthy pocket the nearest anchor dates the event as usual.
+        let inside = clock.resolve(1_100_000, 1_783_000_000);
+        assert_eq!(inside.source, ClockSource::Anchor);
+        assert!((inside.unix - (1_782_953_397.0 - 3_300.0)).abs() < 0.01);
+        // Past the last anchor, extrapolation from that anchor still applies.
+        assert_eq!(clock.resolve(1_200_000, 1_783_000_000).source, ClockSource::Anchor);
+        assert_eq!(clock.resolve(20_000, 1_783_000_000).source, ClockSource::Anchor);
+    }
+
+    #[test]
+    fn stalled_counter_uses_download_time_to_pick_the_anchor_side() {
+        // The ring lost 40 h while off between two syncs: anchors 15 days apart in ds,
+        // 17 days apart in wall time. An event downloaded before the later anchor's
+        // projection would allow keeps the earlier offset; one downloaded later takes
+        // the later offset.
+        let before = (47_893_458_i64, 1_787_733_180_i64); // 08-26 08:33
+        let after = (61_076_535_i64, 1_789_195_380_i64); // 09-12 06:43
+        let clock = RingClock::from_events(&[
+            event(before.0, 0x42, &format!(r#"{{"unix_time":{}}}"#, before.1), before.1 + 60),
+            event(52_000_000, 1, "{}", 1_788_100_000),
+            event(after.0, 0x42, &format!(r#"{{"unix_time":{}}}"#, after.1), after.1 + 60),
+        ]);
+        let early = clock.resolve(52_000_000, 1_788_100_000);
+        assert_eq!(early.source, ClockSource::Anchor);
+        assert!((early.unix - (before.1 as f64 + (52_000_000 - before.0) as f64 / 10.0)).abs() < 0.01);
+        let late = clock.resolve(52_000_000, after.1 + 60);
+        assert_eq!(late.source, ClockSource::Anchor);
+        assert!((late.unix - (after.1 as f64 - (after.0 - 52_000_000) as f64 / 10.0)).abs() < 0.01);
     }
 
     #[test]
