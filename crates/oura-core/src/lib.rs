@@ -656,11 +656,21 @@ impl RingSession {
             .await
             .map_err(|e| fail(e.to_string()))?;
         // Push the phone's clock to the ring so this boot logs a `time_sync` anchor.
-        // Without one, a rebooted ring's nights have no bridge to wall-clock time.
+        // Without one, a rebooted ring's nights have no bridge to wall-clock time:
+        // `time_sync` is the only wall-clock anchor in the event stream, and it is
+        // retroactive — one of them dates every event in the same boot epoch.
         progress.on_progress("time".into(), 0, 0);
         if let Err(error) = client.sync_time_app().await {
             progress.on_progress(format!("time_sync skipped: {error}"), 0, 0);
+            // The app-layer command is refused by some firmware; the plain one is not.
+            let _ = client.sync_time().await;
         }
+        // Ask the ring to run its sleep analysis before draining. Bedtime periods are
+        // the ONLY thing build_summary turns into nights, and the ring writes one when
+        // it postprocesses a sleep — not while it is recording one. Triggering it here
+        // gives the ring the whole drain to finish, so a fast postprocess lands in this
+        // sync rather than the next. Fire-and-forget: a refusal is not a sync failure.
+        let _ = client.check_sleep_analysis(false).await;
         let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
         let info = client.firmware().await.ok();
 
