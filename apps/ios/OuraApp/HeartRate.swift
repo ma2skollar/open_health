@@ -5,8 +5,10 @@ import SwiftUI
 /// rate cell.
 ///
 /// The nightly RHR trend says how the last few weeks of sleep went; it says nothing
-/// about the day you are in. One bar per local-clock hour does: it spans the lowest
-/// and highest beat measured in that hour, with a tick at the hour's mean. No
+/// about the day you are in. One bar per local-clock hour does: it spans that hour's
+/// 5th-to-95th percentile band, with a tick at the median. Percentiles, not raw
+/// extremes — a single misdetected beat is not "your peak heart rate", and the ring's
+/// beat streams do emit them. The true min/max ride along for the touch readout. No
 /// open/close — that is a stock-chart habit, and a heart rate has no opening price.
 /// Aggregation happens in Rust (`oura-summary::hourly_hr`) because it walks the whole
 /// event table — the same read the summary does, not a second decoding of the
@@ -16,9 +18,11 @@ enum HourlyHR {
         let unix: Double        // UTC start of the local hour
         let ymd: String
         let hour: Int
-        let low: Double
-        let high: Double
-        let mean: Double
+        let low: Double         // 5th percentile of the hour's beats
+        let high: Double        // 95th percentile
+        let median: Double
+        let min: Double         // true extremes, for the readout only
+        let max: Double
         let count: Int
         var id: Double { unix }
     }
@@ -56,7 +60,9 @@ enum HourlyHR {
                        ymd: row["ymd"] as? String ?? "",
                        hour: (row["hour"] as? NSNumber)?.intValue ?? 0,
                        low: low, high: high,
-                       mean: (row["mean"] as? NSNumber)?.doubleValue ?? (low + high) / 2,
+                       median: (row["median"] as? NSNumber)?.doubleValue ?? (low + high) / 2,
+                       min: (row["min"] as? NSNumber)?.doubleValue ?? low,
+                       max: (row["max"] as? NSNumber)?.doubleValue ?? high,
                        count: (row["count"] as? NSNumber)?.intValue ?? 0)
         }
         let latest = (root["latest"] as? [String: Any]).flatMap { l -> Reading? in
@@ -140,7 +146,7 @@ struct HourlyHeartRateSection: View {
                         .font(Obs.mono(30, .medium)).foregroundStyle(Obs.ink).monospacedDigit()
                     Text("bpm").font(Obs.mono(13)).foregroundStyle(Obs.ink2)
                 }
-                Text("\(Self.dayLabel(bar)) · \(String(format: "%02d:00", bar.hour)) · avg \(Int(bar.mean.rounded())) · \(bar.count) beats")
+                Text("\(Self.dayLabel(bar)) · \(String(format: "%02d:00", bar.hour)) · median \(Int(bar.median.rounded())) · range \(Int(bar.min.rounded()))–\(Int(bar.max.rounded())) · \(bar.count) beats")
                     .font(Obs.mono(10)).foregroundStyle(Obs.muted)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -176,11 +182,11 @@ struct HourlyHeartRateSection: View {
     private var stats: some View {
         let lows = visible.map(\.low), highs = visible.map(\.high)
         let beats = visible.reduce(0) { $0 + $1.count }
-        let weighted = visible.reduce(0.0) { $0 + $1.mean * Double($1.count) }
+        let weighted = visible.reduce(0.0) { $0 + $1.median * Double($1.count) }
         return VStack(spacing: 10) {
-            if let lo = lows.min() { ObsStat(label: "lowest", value: "\(Int(lo.rounded())) bpm") }
-            if let hi = highs.max() { ObsStat(label: "highest", value: "\(Int(hi.rounded())) bpm") }
-            if beats > 0 { ObsStat(label: "average", value: "\(Int((weighted / Double(beats)).rounded())) bpm") }
+            if let lo = lows.min() { ObsStat(label: "quietest hour", value: "\(Int(lo.rounded())) bpm") }
+            if let hi = highs.max() { ObsStat(label: "busiest hour", value: "\(Int(hi.rounded())) bpm") }
+            if beats > 0 { ObsStat(label: "typical", value: "\(Int((weighted / Double(beats)).rounded())) bpm") }
             ObsStat(label: "hours with data", value: "\(visible.count)/\(window.hours)")
         }
         .padding(.top, 2)
@@ -205,8 +211,8 @@ struct HourlyHeartRateSection: View {
 }
 
 /// Range bars on a real-time axis: every hour of the window gets a slot, so a gap in
-/// the data is a gap in the chart. Each bar spans that hour's lowest to highest beat,
-/// with a tick at the mean — the three numbers an hour of heart rate actually has.
+/// the data is a gap in the chart. Each bar spans that hour's 5th–95th percentile band,
+/// with a tick at the median — where the hour actually sat, undisturbed by one bad beat.
 private struct HourlyRangeChart: View {
     let bars: [HourlyHR.Bar]
     let window: HourlyWindow
@@ -275,9 +281,9 @@ private struct HourlyRangeChart: View {
                         let shape = Path(roundedRect: rect, cornerRadius: min(2.5, barWidth / 2))
                         ctx.fill(shape, with: .color(tint.opacity(isSelected ? 0.55 : 0.32)))
 
-                        // the mean, where an hour spent most of its beats
+                        // the median, where an hour spent most of its beats
                         var tick = Path()
-                        let my = y(bar.mean)
+                        let my = y(bar.median)
                         tick.move(to: CGPoint(x: cx - barWidth / 2, y: my))
                         tick.addLine(to: CGPoint(x: cx + barWidth / 2, y: my))
                         ctx.stroke(tick, with: .color(tint), lineWidth: isSelected ? 2 : 1.4)
@@ -292,7 +298,7 @@ private struct HourlyRangeChart: View {
                             selected = byHour[slots[i]]
                         }
                 )
-                .accessibilityLabel("Hourly heart rate range, \(bars.count) hours with data")
+                .accessibilityLabel("Hourly heart rate band, \(bars.count) hours with data")
             }
         }
     }

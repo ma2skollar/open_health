@@ -1,12 +1,25 @@
 //! Hourly heart-rate candles — the day-shaped view of HR the nightly RHR trend
 //! cannot give.
 //!
-//! The ring never reports "heart rate" as a series: it reports beats. Three decoded
-//! streams carry a `hr_bpm` array (see `crates/README.md` in open_oura):
+//! The ring never reports "heart rate" as a series: it reports beats. Two streams are
+//! trustworthy enough to show a person:
 //!
-//! * `green_ibi_quality_event` (`0x80`) — daytime, quality-gated pulse estimates,
-//! * `ibi_and_amplitude_event` (`0x60`) — overnight beats (6 per 14-byte packet),
-//! * `hrv_event` — `interval_min`-minute averages, overnight.
+//! * `green_ibi_quality_event` (`0x80`) — only the pulse estimates the firmware's own
+//!   quality gate accepted (`quality == 1`),
+//! * `hrv_event` — the firmware's `interval_min`-minute averages.
+//!
+//! `ibi_and_amplitude_event` (`0x60`) is deliberately NOT used. It is the raw
+//! beat-to-beat stream with no quality flag, and on this Gen 3 (fw 3.4.3) 13% of its
+//! beats land above 100 bpm during sleep, topping out at 176 — the bit layout was
+//! ported from a Ring 5 native parser and has never been validated here. Measured over
+//! a real night it added nothing: `green_ibi_quality` already covered every hour it
+//! appeared in. `build_summary` distrusts the same stream for the same reason.
+//!
+//! Even a quality-gated beat stream has the odd bad estimate, so an hour's band is the
+//! 5th–95th percentile of its beats, not the raw extremes — one misdetected beat must
+//! not become "your peak heart rate". True `min`/`max` ride along for the detail
+//! readout. Percentiles come from a per-hour histogram, so memory stays flat no matter
+//! how many beats an hour holds.
 //!
 //! Grouping those into local-clock hours gives one bar per hour: the lowest and
 //! highest beat actually measured, and the mean of every beat in between. There is no
@@ -37,25 +50,47 @@ const MAX_BPM: f64 = 240.0;
 
 const HOUR: i64 = 3600;
 
-#[derive(Default)]
+/// One bin per whole bpm from 0 to [`MAX_BPM`], so an hour costs a fixed ~1 KB
+/// whether it holds ten beats or ten thousand.
+const BINS: usize = MAX_BPM as usize + 1;
+
 struct Bar {
-    low: f64,
-    high: f64,
-    sum: f64,
+    hist: Vec<u32>,
+    min: f64,
+    max: f64,
     count: u64,
+}
+
+impl Default for Bar {
+    fn default() -> Self {
+        Bar {
+            hist: vec![0; BINS],
+            min: f64::MAX,
+            max: f64::MIN,
+            count: 0,
+        }
+    }
 }
 
 impl Bar {
     fn add(&mut self, bpm: f64) {
-        if self.count == 0 {
-            self.low = bpm;
-            self.high = bpm;
-        } else {
-            self.low = self.low.min(bpm);
-            self.high = self.high.max(bpm);
-        }
-        self.sum += bpm;
+        self.min = self.min.min(bpm);
+        self.max = self.max.max(bpm);
+        self.hist[(bpm.round() as usize).min(BINS - 1)] += 1;
         self.count += 1;
+    }
+
+    /// Nearest-rank percentile over the histogram (`p` in 0..=100).
+    fn percentile(&self, p: f64) -> f64 {
+        let rank = ((p / 100.0) * self.count as f64).ceil().max(1.0) as u64;
+        let mut seen = 0u64;
+        for (bpm, n) in self.hist.iter().enumerate() {
+            seen += *n as u64;
+            if seen >= rank {
+                return bpm as f64;
+            }
+        }
+        self.max
     }
 }
 
@@ -66,9 +101,11 @@ impl Bar {
 ///
 /// ```text
 /// { "tz_offset": 3, "hours": [ { "unix": 1757714400, "ymd": "2026-09-12", "hour": 21,
-///                                "low": 48, "high": 71, "mean": 54.2, "count": 812 } ],
+///                                "low": 48, "high": 71, "median": 54, "min": 46,
+///                                "max": 96, "count": 812 } ],
 ///   "latest": { "bpm": 61, "unix": 1757800000 } }
 /// ```
+/// `low`/`high` are the 5th/95th percentiles — the band the hour actually lived in.
 pub fn hourly_hr(db: &Path, tz: i64, days: u32) -> Result<Value> {
     let store = Store::open_read_only(db).context("opening DB")?;
     let events = store.decoded_events().context("reading events")?;
@@ -82,10 +119,7 @@ pub fn hourly_hr(db: &Path, tz: i64, days: u32) -> Result<Value> {
 
     for (ds, tag, jstr, cu) in &events {
         let name = oura_protocol::events::event_name(*tag);
-        if !matches!(
-            name,
-            "green_ibi_quality_event" | "ibi_and_amplitude_event" | "hrv_event"
-        ) {
+        if !matches!(name, "green_ibi_quality_event" | "hrv_event") {
             continue;
         }
         let Ok(v) = serde_json::from_str::<Value>(jstr) else {
@@ -131,9 +165,11 @@ pub fn hourly_hr(db: &Path, tz: i64, days: u32) -> Result<Value> {
                 "unix": start,
                 "ymd": ymd,
                 "hour": hour,
-                "low": bar.low,
-                "high": bar.high,
-                "mean": (bar.sum / bar.count as f64 * 10.0).round() / 10.0,
+                "low": bar.percentile(5.0),
+                "high": bar.percentile(95.0),
+                "median": bar.percentile(50.0),
+                "min": bar.min,
+                "max": bar.max,
                 "count": bar.count,
             })
         })
@@ -201,15 +237,29 @@ mod tests {
     }
 
     #[test]
-    fn bar_tracks_extremes_and_mean() {
+    fn percentile_band_ignores_a_lone_bad_beat() {
         let mut bar = Bar::default();
-        for bpm in [60.0, 80.0, 40.0] {
-            bar.add(bpm);
+        for _ in 0..99 {
+            bar.add(60.0);
         }
-        assert_eq!(bar.low, 40.0);
-        assert_eq!(bar.high, 80.0);
-        assert_eq!(bar.sum / bar.count as f64, 60.0);
-        assert_eq!(bar.count, 3);
+        bar.add(176.0); // one misdetected beat, exactly what the raw IBI stream emits
+        assert_eq!(bar.max, 176.0, "the outlier is still recorded");
+        assert_eq!(bar.percentile(95.0), 60.0, "but it must not become the band top");
+        assert_eq!(bar.percentile(50.0), 60.0);
+        assert_eq!(bar.count, 100);
+    }
+
+    #[test]
+    fn percentiles_split_a_known_spread() {
+        let mut bar = Bar::default();
+        for bpm in 1..=100 {
+            bar.add(bpm as f64);
+        }
+        assert_eq!(bar.percentile(5.0), 5.0);
+        assert_eq!(bar.percentile(50.0), 50.0);
+        assert_eq!(bar.percentile(95.0), 95.0);
+        assert_eq!(bar.min, 1.0);
+        assert_eq!(bar.max, 100.0);
     }
 
     /// End to end over a real store: three sources, three hours, one bar each.
@@ -261,26 +311,36 @@ mod tests {
                 72_000,
                 json!({ "hr_bpm": [50, 500] }),
             );
-            // +3 h: overnight 5-minute averages — both land in the same hour
+            // +3 h: firmware 5-minute averages — both land in the same hour
             push(
                 0x5d,
                 "hrv_event",
                 108_000,
                 json!({ "interval_min": 5, "hr_bpm": [40, 45] }),
             );
+            // +3 h: raw beat-to-beat, deliberately ignored — a 170 bpm "beat" during
+            // sleep is what this stream produces and what must never reach the chart
+            push(
+                0x60,
+                "ibi_and_amplitude_event",
+                108_100,
+                json!({ "hr_bpm": [170, 172] }),
+            );
         }
 
         let v = hourly_hr(&db, 0, 0).unwrap();
         let hours = v["hours"].as_array().unwrap();
         assert_eq!(hours.len(), 3, "{v}");
-        assert_eq!(hours[0]["low"], 60.0);
-        assert_eq!(hours[0]["high"], 70.0);
-        assert_eq!(hours[0]["mean"], 65.0);
+        assert_eq!(hours[0]["min"], 60.0);
+        assert_eq!(hours[0]["max"], 70.0);
         assert_eq!(hours[0]["count"], 2);
-        assert_eq!(hours[1]["low"], 50.0, "500 bpm must be gated out: {v}");
-        assert_eq!(hours[1]["high"], 50.0);
-        assert_eq!(hours[2]["low"], 40.0);
-        assert_eq!(hours[2]["high"], 45.0);
+        assert_eq!(hours[1]["min"], 50.0, "500 bpm must be gated out: {v}");
+        assert_eq!(hours[1]["max"], 50.0);
+        assert_eq!(hours[2]["min"], 40.0);
+        assert_eq!(
+            hours[2]["max"], 45.0,
+            "raw ibi_and_amplitude beats must not reach the chart: {v}"
+        );
         assert_eq!(hours[2]["count"], 2);
         // consecutive hours, one slot apart
         let starts: Vec<i64> = hours.iter().map(|h| h["unix"].as_i64().unwrap()).collect();
