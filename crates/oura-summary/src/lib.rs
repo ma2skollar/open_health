@@ -384,6 +384,8 @@ const PULSE_BURST_GAP_DS: i64 = 2 * 60 * 10;
 const MAX_PULSE_CONTINUATION_GAP_DS: i64 = 15 * 60 * 10;
 const MIN_ACCEPTED_BEATS_PER_BURST: usize = 2;
 const MIN_LONG_SLEEP_DS: i64 = 3 * 60 * 60 * 10;
+/// A run of nocturnal-only events shorter than this is not called a night on its own.
+const MIN_DERIVED_BED_DS: i64 = 60 * 60 * 10;
 const MIN_PREMATURE_END_EVIDENCE_DS: i64 = 30 * 60 * 10;
 
 /// Return the end of a continuous sequence of pulse-measurement bursts after the
@@ -462,6 +464,72 @@ fn pulse_continuation_end(
 /// marker can be followed by hours of sleep-only sensor packets. SleepNet cannot
 /// recover either case because bedtime is an input boundary, so normalize that
 /// boundary before both the summary and model runners consume it.
+/// Nights the ring recorded but never declared.
+///
+/// `bedtime_period` is the ring's own verdict and is trusted first, but it is not
+/// always complete: a Gen 3 (fw 3.4.3) analysed a single **15-minute** bedtime period
+/// for a night whose `sleep_period_information_2` stream ran 10.6 hours. A 15-minute
+/// seed plus the 3-hour signal extension is a 3-hour "night" — the rest of the sleep
+/// is in the database, fully decoded, and simply never rendered.
+///
+/// So the nocturnal streams also seed beds on their own. They are emitted only while
+/// the ring believes it is asleep (`sleep_acm_period`, `sleep_temp_event`,
+/// `spo2_r_pi_event`, `sleep_period_information_2` — none has a daytime counterpart),
+/// so a contiguous run of them IS a sleep period. Runs are split on a gap longer than
+/// a normal in-bed break and must last at least [`MIN_DERIVED_BED_DS`] before they
+/// count, which keeps a stray sample from inventing a night. Derived periods are then
+/// merged with the explicit ones by the normal path, so a ring that does declare its
+/// bedtime still wins — this only fills what it left out.
+fn beds_from_sleep_signal(
+    explicit: &[BedPeriod],
+    sleep_support: &[(i64, i64)],
+    unix_s_at: impl Fn(i64, i64) -> f64 + Copy,
+) -> Vec<BedPeriod> {
+    if sleep_support.is_empty() {
+        return Vec::new();
+    }
+    let mut samples: Vec<(i64, i64)> = sleep_support.to_vec();
+    samples.sort_by(|a, b| unix_s_at(a.0, a.1).total_cmp(&unix_s_at(b.0, b.1)));
+
+    let mut derived: Vec<BedPeriod> = Vec::new();
+    let mut run_start = samples[0];
+    let mut run_end = samples[0];
+    let mut flush = |start: (i64, i64), end: (i64, i64), out: &mut Vec<BedPeriod>| {
+        if end.0 - start.0 < MIN_DERIVED_BED_DS {
+            return;
+        }
+        // Never invent a period the ring already described; merging handles overlap.
+        let covered = explicit
+            .iter()
+            .any(|bed| bed.start_ds <= start.0 && end.0 <= bed.end_ds);
+        if covered {
+            return;
+        }
+        out.push(BedPeriod {
+            start_ds: start.0,
+            end_ds: end.0,
+            raw_start_ds: start.0,
+            raw_end_ds: end.0,
+            captured_unix: end.1,
+        });
+    };
+
+    for sample in samples.into_iter().skip(1) {
+        let raw_gap_ds = sample.0 - run_end.0;
+        let wall_gap_s = unix_s_at(sample.0, sample.1) - unix_s_at(run_end.0, run_end.1);
+        let same_epoch = (wall_gap_s - raw_gap_ds as f64 / 10.0).abs() <= EPOCH_ALIGNMENT_SLACK_S;
+        if same_epoch && (0..=MAX_BED_BREAK_DS).contains(&raw_gap_ds) {
+            run_end = sample;
+        } else {
+            flush(run_start, run_end, &mut derived);
+            run_start = sample;
+            run_end = sample;
+        }
+    }
+    flush(run_start, run_end, &mut derived);
+    derived
+}
+
 fn normalize_bed_periods(
     mut periods: Vec<BedPeriod>,
     sleep_support: &[(i64, i64)],
@@ -939,7 +1007,10 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
         }
         if matches!(
             n,
-            "sleep_acm_period" | "sleep_temp_event" | "spo2_r_pi_event"
+            "sleep_acm_period"
+                | "sleep_temp_event"
+                | "spo2_r_pi_event"
+                | "sleep_period_information_2"
         ) {
             sleep_support.push((*ds, *cu));
         }
@@ -970,6 +1041,7 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
             }
         }
     }
+    raw_beds.extend(beds_from_sleep_signal(&raw_beds, &sleep_support, unix_s_at));
     let beds = normalize_bed_periods(raw_beds, &sleep_support, &pulse_support, unix_s_at);
     // A night whose boot has no time anchor cannot be placed on the calendar. Showing
     // it dated to the download would put a 23:00→08:00 sleep at 07:00→15:00 on the
