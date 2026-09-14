@@ -464,6 +464,114 @@ fn pulse_continuation_end(
 /// marker can be followed by hours of sleep-only sensor packets. SleepNet cannot
 /// recover either case because bedtime is an input boundary, so normalize that
 /// boundary before both the summary and model runners consume it.
+/// One `sleep_phase_data` stage epoch, in the codes the rest of the pipeline speaks:
+/// 1=deep 2=light 3=rem 4=wake (anything unrecognised counts as wake).
+fn stage_code(phase: &str) -> i64 {
+    match phase {
+        "deep" => 1,
+        "light" => 2,
+        "rem" => 3,
+        _ => 4,
+    }
+}
+
+/// Seconds of sleep per `sleep_phase_data` epoch.
+const RING_STAGE_EPOCH_S: f64 = 30.0;
+
+/// The ring's OWN hypnogram, assembled from `sleep_phase_data` (tag `0x5a`).
+///
+/// Upstream lists this event as "not emitted yet"; a Gen 3 on fw 3.4.3 emits it — 52
+/// epochs per 14-byte page, pages numbered by the `header` byte, the whole set written
+/// in one burst when the ring finishes analysing a sleep. So Oura's own staging is
+/// available with no model at all, and this is what fills the hypnogram in a
+/// model-free build.
+///
+/// **Placing it in time.** The pages carry no timestamp of their own — their `ds` is
+/// when the ring emitted them, not when you slept. Anchoring the run to END at the
+/// last page's emission and running back at 30 s an epoch was checked against the
+/// ring's independent per-window record for the night in question:
+///
+/// | | median HR | median motion | `sleep_state`=1 |
+/// |---|---|---|---|
+/// | inside the inferred window | 58.5 | 0 | 79% |
+/// | in bed before it | 76.8 | 5 | 20% |
+///
+/// Asleep versus awake-in-bed, from data the hypnogram never touched. The anchor holds.
+///
+/// The returned stage array spans the night's whole in-bed window so the existing
+/// uniform tiling stays honest: time in bed the ring did not analyse is filled with
+/// wake, which is what it is — you were in bed and the ring did not think you slept.
+/// That keeps sleep onset, efficiency and stage percentages measured against time in
+/// bed rather than against the sleep the ring chose to score.
+fn ring_hypnograms(
+    pages: &[(i64, i64, Vec<i64>)],
+    nights: &[Night],
+) -> Vec<(i64, Value)> {
+    // Pages arrive as a burst with `header` counting up from zero; a header that does
+    // not follow the previous one starts a new analysed sleep.
+    let mut runs: Vec<(i64, Vec<i64>)> = Vec::new();
+    let mut previous_page = -1i64;
+    for (ds, page, codes) in pages {
+        if *page == previous_page + 1 && !runs.is_empty() {
+            let run = runs.last_mut().unwrap();
+            run.0 = *ds;
+            run.1.extend_from_slice(codes);
+        } else {
+            runs.push((*ds, codes.clone()));
+        }
+        previous_page = *page;
+    }
+
+    let mut out = Vec::new();
+    for night in nights {
+        let span_ds = night.end_ds - night.start_ds;
+        if span_ds <= 0 {
+            continue;
+        }
+        let epoch_ds = (RING_STAGE_EPOCH_S * 10.0) as i64;
+        let cells = (span_ds / epoch_ds).max(1) as usize;
+        let mut stages = vec![4i64; cells];
+        let mut painted = false;
+        for (end_ds, codes) in &runs {
+            let start_ds = end_ds - codes.len() as i64 * epoch_ds;
+            // keep a run that lies within this night's window (either end may hang over)
+            if *end_ds <= night.start_ds || start_ds >= night.end_ds {
+                continue;
+            }
+            for (i, code) in codes.iter().enumerate() {
+                let at = start_ds + i as i64 * epoch_ds;
+                if at < night.start_ds || at >= night.end_ds {
+                    continue;
+                }
+                stages[(((at - night.start_ds) / epoch_ds) as usize).min(cells - 1)] = *code;
+                painted = true;
+            }
+        }
+        if !painted {
+            continue;
+        }
+        let share = |code: i64| {
+            let n = stages.iter().filter(|&&c| c == code).count();
+            (n as f64 / stages.len() as f64 * 1000.0).round() / 10.0
+        };
+        let asleep = stages.iter().filter(|&&c| c != 4).count();
+        out.push((
+            night.start_ds,
+            json!({
+                "start_ds": night.start_ds,
+                "stages": stages,
+                "deep_pct": share(1),
+                "light_pct": share(2),
+                "rem_pct": share(3),
+                "wake_pct": share(4),
+                "efficiency_pct": (asleep as f64 / stages.len() as f64 * 1000.0).round() / 10.0,
+                "source": "ring",
+            }),
+        ));
+    }
+    out
+}
+
 /// Nights the ring recorded but never declared.
 ///
 /// `bedtime_period` is the ring's own verdict and is trusted first, but it is not
@@ -962,6 +1070,7 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
     let anchor_unix = clock.latest_unix();
     let mut raw_beds: Vec<BedPeriod> = Vec::new();
     let mut sleep_support: Vec<(i64, i64)> = Vec::new();
+    let mut ring_hypnogram_pages: Vec<(i64, i64, Vec<i64>)> = Vec::new();
     let mut pulse_support: Vec<(i64, i64, usize)> = Vec::new();
     let mut latest_hr: Option<(f64, f64)> = None; // (wall-clock unix, bpm)
     let mut present_recent = std::collections::HashSet::new();
@@ -1002,6 +1111,22 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
                             captured_unix: *cu,
                         }),
                     }
+                }
+            }
+        }
+        if n == "sleep_phase_data" {
+            if let Ok(v) = serde_json::from_str::<Value>(jstr) {
+                if let (Some(page), Some(phases)) =
+                    (v["header"].as_i64(), v["phases"].as_array())
+                {
+                    ring_hypnogram_pages.push((
+                        *ds,
+                        page,
+                        phases
+                            .iter()
+                            .filter_map(|p| p.as_str().map(stage_code))
+                            .collect::<Vec<i64>>(),
+                    ));
                 }
             }
         }
@@ -1180,7 +1305,7 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
         sleep_ranges: &sleep_ranges,
     });
 
-    let hyps: std::collections::HashMap<i64, Value> = sleep_batch
+    let mut hyps: std::collections::HashMap<i64, Value> = sleep_batch
         .as_ref()
         .and_then(|v| v.as_array())
         .map(|arr| {
@@ -1189,6 +1314,11 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
                 .collect()
         })
         .unwrap_or_default();
+    // The ring scores its own hypnogram; use it for any night the model runner did not
+    // cover — which, in a model-free build, is every night.
+    for (start_ds, hypnogram) in ring_hypnograms(&ring_hypnogram_pages, &nights) {
+        hyps.entry(start_ds).or_insert(hypnogram);
+    }
 
     nights.sort_by(|a, b| {
         unix_s_at(a.start_ds, a.captured_unix)
