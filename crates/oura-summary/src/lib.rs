@@ -14,6 +14,8 @@
 
 pub mod hourly_hr;
 pub mod ring_time;
+pub mod sleep_score;
+pub mod symptoms;
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -336,6 +338,22 @@ fn mean(v: &[f64]) -> Option<f64> {
 /// Nightly skin temperature (°C) via ecore's `nightly_temperature` (7-sample median
 /// → 30-sample windows → minimum of the window maxima). Falls back to the plain mean
 /// when there aren't enough valid windows, so sparse nights still report a value.
+/// Median of a sample, or `None` when empty. Used for the night's respiratory rate,
+/// where a median shrugs off the handful of windows the ring gets wrong.
+fn median_of(values: &[f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut sorted: Vec<f64> = values.to_vec();
+    sorted.sort_by(f64::total_cmp);
+    let mid = sorted.len() / 2;
+    Some(if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    })
+}
+
 fn nightly_skin_temp(temps_c: &[f64]) -> Option<f64> {
     let centi: Vec<u16> = temps_c
         .iter()
@@ -366,6 +384,10 @@ struct Night {
     // hypnogram stage.
     hrv_t: Vec<(i64, f64)>,
     hr_t: Vec<(i64, f64)>,
+    /// Respiratory rate, breaths per minute, from the ring's own per-window estimate
+    /// (`sleep_period_information_2.breath`) — only windows it scored as sleep, since
+    /// an awake breath rate is not the biomarker. One of the four Symptom Radar inputs.
+    breath: Vec<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1442,6 +1464,17 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
                     }
                 }
             }
+            "sleep_period_information_2" => {
+                // The ring's own per-window sleep sample. Breathing while awake is
+                // faster and more variable, so only sleep windows count.
+                if v["sleep_state"].as_i64() == Some(1) {
+                    if let Some(breath) = v["breath"].as_f64() {
+                        if (4.0..=40.0).contains(&breath) {
+                            nights[idx].breath.push(breath);
+                        }
+                    }
+                }
+            }
             "sleep_temp_event" => {
                 // Only the dedicated nocturnal stream is calibrated as skin
                 // temperature. Generic `temp_event` contains several device/ambient
@@ -1532,6 +1565,32 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
 
     let mut nights_json = Vec::new();
     let mut asleep_by_day: std::collections::BTreeMap<i64, i32> = Default::default();
+    // (wake date, biomarkers) per night, oldest first — the Symptom Radar input.
+    let mut nightly_biomarkers: Vec<(String, symptoms::NightBiomarkers)> = Vec::new();
+    // Personal baselines for the sleep score's physiology component: mean and SD of
+    // every night BEFORE the newest, so tonight is judged against your normal rather
+    // than against itself.
+    let history_stats = |values: &[f64]| -> Option<(f64, f64)> {
+        if values.len() < 3 {
+            return None;
+        }
+        let mean = values.iter().sum::<f64>() / values.len() as f64;
+        let variance =
+            values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64;
+        Some((mean, variance.sqrt().max(f64::EPSILON)))
+    };
+    let rhr_baseline = history_stats(
+        &nights
+            .iter()
+            .filter_map(|nt| {
+                let lowest = nt.hr.iter().cloned().fold(f64::INFINITY, f64::min);
+                lowest.is_finite().then_some(lowest)
+            })
+            .collect::<Vec<_>>(),
+    );
+    let hrv_baseline = history_stats(
+        &nights.iter().filter_map(|nt| mean(&nt.rmssd)).collect::<Vec<_>>(),
+    );
     for nt in &nights {
         let hyp = hyps.get(&nt.start_ds);
         let raw_stages: Vec<i64> = hyp
@@ -1560,6 +1619,13 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
             let wake_day = (end_unix as i64 + tz * 3600).div_euclid(86_400);
             *asleep_by_day.entry(wake_day).or_default() += asleep_s;
         }
+        let night_rhr = {
+            let lowest = nt.hr.iter().cloned().fold(f64::INFINITY, f64::min);
+            lowest.is_finite().then(|| lowest.round())
+        };
+        let night_hrv = mean(&nt.rmssd).map(|x| x.round());
+        let night_breath = median_of(&nt.breath);
+        let wake_ymd = Some(ymd_label(end_unix, tz));
         nights_json.push(json!({
             "date": date_label(start_unix, tz),
             "ymd": ymd_label(start_unix, tz),
@@ -1579,8 +1645,8 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
             "start": hm(start_unix, tz),
             "end": hm(end_unix, tz),
             "in_bed_h": ((nt.end_ds - nt.start_ds) as f64 / 10.0 / 3600.0 * 10.0).round() / 10.0,
-            "hrv_ms": mean(&nt.rmssd).map(|x| x.round()),
-            "rhr": nt.hr.iter().cloned().fold(f64::INFINITY, f64::min).is_finite().then(|| nt.hr.iter().cloned().fold(f64::INFINITY, f64::min).round()),
+            "hrv_ms": night_hrv,
+            "rhr": night_rhr,
             "skin_temp": nightly_skin_temp(&nt.temp).map(|x| (x * 10.0).round() / 10.0),
             "spo2_mean": mean(&nt.spo2).map(|x| x.round()),
             "deep_pct": hyp.map(|h| h["deep_pct"].clone()),
@@ -1604,11 +1670,51 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
             // mean HR/HRV per sleep stage (deep/light/rem) — deep-sleep HRV is the
             // recovery-relevant number; null when there's no hypnogram.
             "autonomic": autonomic,
+            // A score whose every threshold traces to a paper rather than to a fit
+            // against Oura's own number. See `sleep_score`.
+            "sleep_score": sleep_score::score_night(sleep_score::NightInput {
+                asleep_min: (asleep_s > 0).then(|| asleep_s as f64 / 60.0),
+                efficiency_pct: hyp.and_then(|h| h["efficiency_pct"].as_f64()),
+                onset_latency_min: metrics["sol_min"].as_f64(),
+                waso_min: metrics["waso_min"].as_f64(),
+                awakenings: metrics["awakenings"].as_f64(),
+                deep_pct: hyp.and_then(|h| h["deep_pct"].as_f64()),
+                rem_pct: hyp.and_then(|h| h["rem_pct"].as_f64()),
+                rhr: night_rhr,
+                rhr_baseline: rhr_baseline,
+                hrv_ms: night_hrv,
+                hrv_baseline: hrv_baseline,
+                age: demo.age,
+            }),
+            "breath_rate": night_breath.map(|b| (b * 10.0).round() / 10.0),
         }));
+        if let Some(day) = wake_ymd.clone() {
+            nightly_biomarkers.push((
+                day,
+                symptoms::NightBiomarkers {
+                    skin_temp: nightly_skin_temp(&nt.temp),
+                    lowest_hr: night_rhr,
+                    hrv_ms: night_hrv,
+                    breath_rate: night_breath,
+                },
+            ));
+        }
     }
     nights_json.reverse();
 
     let sleep_debt = sleep_debt_summary(&asleep_by_day);
+
+    // Symptom signs for the most recent night, judged against the nights before it.
+    // `nights` is oldest-first, so the last entry is tonight and everything before it
+    // is the baseline — tonight is deliberately excluded from its own comparison.
+    let symptoms = match nightly_biomarkers.split_last() {
+        Some(((date, tonight), history)) => {
+            let history: Vec<symptoms::NightBiomarkers> =
+                history.iter().map(|(_, marks)| *marks).collect();
+            symptoms::symptom_signs(*tonight, &history, date)
+        }
+        None => Value::Null,
+    };
 
     let mut activity = activity_raw
         .as_ref()
@@ -1906,6 +2012,10 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
         "profile": demo.to_json(),
         "nights": nights_json,
         "sleep_debt": sleep_debt,
+        // Model-free Symptom Radar: the same four biomarkers the torch illness model
+        // eats, judged against the wearer's own baseline. Same JSON shape as
+        // IllnessResult so one card renders either source.
+        "symptoms": symptoms,
         "illness": illness,
         "cardio": cva,
         "fitness": { "vo2max": (vo2max * 10.0).round() / 10.0 },
