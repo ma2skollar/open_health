@@ -1061,8 +1061,10 @@ struct RootView: View {
                             SleepDebtCard(debt: debt) { showSleepDebt = true }
                         }
 
-                        if let illness = s.illness {
-                            IllnessCard(illness: illness)
+                        // Torch build: Oura's own illness model. Otherwise the shared
+                        // core's baseline comparison over the same four biomarkers.
+                        if let radar = s.symptomRadar, radar.available {
+                            IllnessCard(illness: radar)
                         }
 
                         // Cardiovascular estimates belong together: vascular age/PWV

@@ -55,6 +55,10 @@ struct Marker {
     label: &'static str,
     /// true when a HIGH value is the worrying direction
     high_is_bad: bool,
+    /// Report the value as a change from baseline rather than as an absolute. Skin
+    /// temperature only means something as a deviation — 34.9 °C is a number, "+0.6 °C
+    /// above your normal" is a signal — and it is what the card labels it.
+    as_deviation: bool,
     value: Option<f64>,
     history: Vec<f64>,
 }
@@ -91,6 +95,7 @@ pub fn symptom_signs(tonight: NightBiomarkers, history: &[NightBiomarkers], date
             key: "TemperatureDeviation",
             label: "skin temperature",
             high_is_bad: true,
+            as_deviation: true,
             value: tonight.skin_temp,
             history: history.iter().filter_map(|n| n.skin_temp).collect(),
         },
@@ -98,6 +103,7 @@ pub fn symptom_signs(tonight: NightBiomarkers, history: &[NightBiomarkers], date
             key: "LowestHeartRate",
             label: "resting heart rate",
             high_is_bad: true,
+            as_deviation: false,
             value: tonight.lowest_hr,
             history: history.iter().filter_map(|n| n.lowest_hr).collect(),
         },
@@ -105,6 +111,7 @@ pub fn symptom_signs(tonight: NightBiomarkers, history: &[NightBiomarkers], date
             key: "AverageHrv",
             label: "HRV",
             high_is_bad: false,
+            as_deviation: false,
             value: tonight.hrv_ms,
             history: history.iter().filter_map(|n| n.hrv_ms).collect(),
         },
@@ -112,6 +119,7 @@ pub fn symptom_signs(tonight: NightBiomarkers, history: &[NightBiomarkers], date
             key: "AverageBreath",
             label: "respiratory rate",
             high_is_bad: true,
+            as_deviation: false,
             value: tonight.breath_rate,
             history: history.iter().filter_map(|n| n.breath_rate).collect(),
         },
@@ -163,13 +171,14 @@ pub fn symptom_signs(tonight: NightBiomarkers, history: &[NightBiomarkers], date
             }
         }
         worst_z = worst_z.max(bad_z);
+        let origin = if marker.as_deviation { center } else { 0.0 };
         biomarkers.push(json!({
             "type": marker.key,
             "label": marker.label,
-            "value": (value * 100.0).round() / 100.0,
+            "value": ((value - origin) * 100.0).round() / 100.0,
             // the band a normal night for you falls in
-            "lower": ((center - DEVIATION_Z * sd) * 100.0).round() / 100.0,
-            "upper": ((center + DEVIATION_Z * sd) * 100.0).round() / 100.0,
+            "lower": ((center - origin - DEVIATION_Z * sd) * 100.0).round() / 100.0,
+            "upper": ((center - origin + DEVIATION_Z * sd) * 100.0).round() / 100.0,
             "indicatesSymptoms": deviating,
             "reason": if !deviating {
                 Value::Null
@@ -299,6 +308,8 @@ mod tests {
             .find(|b| b["type"] == "TemperatureDeviation")
             .unwrap();
         assert_eq!(temp["indicatesSymptoms"], true, "{v}");
-        assert!(temp["upper"].as_f64().unwrap() < 36.0, "baseline must ignore tonight: {v}");
+        // reported as a change from baseline, so the band straddles zero
+        assert!(temp["upper"].as_f64().unwrap() < 1.0, "baseline must ignore tonight: {v}");
+        assert!(temp["value"].as_f64().unwrap() > 1.0, "should read as +1.5 C, not 36.5: {v}");
     }
 }

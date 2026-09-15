@@ -498,6 +498,77 @@ struct SleepDebtCard: View {
 }
 
 // A readable summary first; personal ranges are available on demand.
+/// The literature-based sleep score, with its components opened up.
+///
+/// The number matters less than the breakdown: every component names the paper its
+/// thresholds came from, so a bad score can be argued with rather than believed.
+struct SleepScoreCard: View {
+    let score: SleepScore
+    var breathRate: Double? = nil
+    @State private var expanded = false
+
+    private var tint: Color {
+        switch score.score {
+        case 85...: return Obs.good
+        case 70..<85: return Obs.chart
+        default: return Obs.bad
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("\(Int(score.score))")
+                    .font(Obs.mono(38, .medium)).foregroundStyle(tint).monospacedDigit()
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("/ 100").font(Obs.mono(12)).foregroundStyle(Obs.ink2)
+                    Text(score.basis ?? "published norms")
+                        .font(Obs.mono(9)).foregroundStyle(Obs.muted)
+                }
+                Spacer()
+                if let breathRate {
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(String(format: "%.1f", breathRate))
+                            .font(Obs.mono(15, .medium)).foregroundStyle(Obs.ink).monospacedDigit()
+                        Text("br/min").font(Obs.mono(9)).foregroundStyle(Obs.muted)
+                    }
+                }
+            }
+
+            ForEach(score.components) { component in
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack {
+                        Text(component.label).font(Obs.mono(11)).foregroundStyle(Obs.ink2)
+                        Spacer()
+                        Text("\(Int(component.score))")
+                            .font(Obs.mono(11, .medium)).foregroundStyle(Obs.ink).monospacedDigit()
+                    }
+                    // bar width is the component score; opacity is how much it counted
+                    GeometryReader { geo in
+                        ZStack(alignment: .leading) {
+                            Rectangle().fill(Obs.rule).frame(height: 3)
+                            Rectangle()
+                                .fill(Obs.chart.opacity(0.35 + 0.65 * min(1, component.weight * 3)))
+                                .frame(width: geo.size.width * component.score / 100, height: 3)
+                        }
+                    }
+                    .frame(height: 3)
+                    if expanded, let source = component.source {
+                        Text(source).font(Obs.mono(9)).foregroundStyle(Obs.muted)
+                    }
+                }
+            }
+
+            Button { expanded.toggle() } label: {
+                Text(expanded ? "hide sources" : "show sources")
+                    .font(Obs.mono(10)).foregroundStyle(Obs.ink2)
+            }
+            .buttonStyle(.plain)
+        }
+        .obsCard()
+    }
+}
+
 struct IllnessCard: View {
     let illness: IllnessResult
     @State private var showDetails = false
@@ -902,6 +973,11 @@ struct SleepReport: View {
                 Readout(value: asleepH.map { String(format: "%.1f h", $0) } ?? "–", caption: "asleep")
                 Readout(value: n.efficiency.map { "\(Int($0))%" } ?? "–", caption: "efficiency")
                 Readout(value: "\(n.start ?? "–")–\(n.end ?? "–")", caption: "bedtime")
+            }
+
+            if let score = n.sleep_score {
+                Rule("sleep score")
+                SleepScoreCard(score: score, breathRate: n.breath_rate)
             }
 
             if n.hasHypnogram {
