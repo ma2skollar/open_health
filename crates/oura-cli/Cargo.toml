@@ -11,9 +11,9 @@ name = "oura"
 path = "src/main.rs"
 
 [dependencies]
-oura-protocol = { git = "https://github.com/Th0rgal/open_oura", rev = "b1b52a0da36a592d5fe8967b0024dcc40d5c746f" }
-oura-link = { git = "https://github.com/Th0rgal/open_oura", rev = "b1b52a0da36a592d5fe8967b0024dcc40d5c746f" }
-oura-store = { git = "https://github.com/Th0rgal/open_oura", rev = "b1b52a0da36a592d5fe8967b0024dcc40d5c746f" }
+oura-protocol = { git = "https://github.com/Th0rgal/open_oura", rev = "bd2f1508fbd571b7742b56c0bfd32d8f16e29585" }
+oura-link = { git = "https://github.com/Th0rgal/open_oura", rev = "bd2f1508fbd571b7742b56c0bfd32d8f16e29585" }
+oura-store = { git = "https://github.com/Th0rgal/open_oura", rev = "bd2f1508fbd571b7742b56c0bfd32d8f16e29585" }
 oura-summary = { path = "../oura-summary" }
 oura-dna = { path = "../oura-dna" }
 clap = { version = "4", features = ["derive"] }

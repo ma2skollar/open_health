@@ -1,13 +1,11 @@
 # App screenshots
 
-`overview.png`, `sleep.png`, and `activity.png` were captured from the SwiftUI
-app at `9f21660` on the iPhone 17 Pro simulator
-(iOS 26.5, light appearance). The screens use deterministic synthetic data;
-no personal health records or ring identifiers are included.
-
-A temporary capture build supplies the demo summary, disables automatic sync
-and opens the existing overview, sleep and activity views. The production app
-is unchanged. Images are unretouched simulator screenshots.
+`overview.png`, `sleep.png`, and `activity.png` were captured on September 16,
+2026 from the production SwiftUI app on the iPhone 17 Pro simulator (iOS 26.5,
+dark appearance), running against the author's own Ring 4 data as synced to
+the local store (last sync July 17, 2026). No ring identifiers or keys are
+shown. Images are unretouched simulator screenshots, opened with the
+`-openDay` launch argument.
 
 ## Pairing and symptom radar — September 8, 2026
 
