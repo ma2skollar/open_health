@@ -763,56 +763,35 @@ struct DayReportView: View {
         ZStack {
             Obs.canvas.ignoresSafeArea()
             VStack(spacing: 0) {
-                HStack(spacing: 14) {
+                HStack(spacing: 10) {
                     Button { dismiss() } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "chevron.left").font(.system(size: 12, weight: .semibold))
-                            Text("Back").font(Obs.mono(13))
-                        }.foregroundStyle(Obs.ink2)
+                        Image(systemName: "chevron.left").font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Obs.ink2)
+                            .frame(width: 34, height: 34)
+                            .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Back")
                     Text(day).font(Obs.mono(13, .medium)).foregroundStyle(Obs.ink)
-                    Spacer()
+                        .lineLimit(1).fixedSize()
+                    Spacer(minLength: 6)
                     Picker("", selection: $tab) {
                         ForEach(Tab.allCases, id: \.self) { Text($0.rawValue).tag($0) }
                     }
                     .pickerStyle(.segmented).fixedSize()
+                    if let analysis { refreshButton(analysis) }
                     exportMenu
                 }
-                .padding(.horizontal, 20).padding(.vertical, 12)
+                .padding(.leading, 12).padding(.trailing, 14).padding(.vertical, 10)
                 .overlay(alignment: .bottom) { Rectangle().fill(Obs.trace.opacity(0.3)).frame(height: 0.5) }
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 26) {
-                        if let analysis {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Button {
-                                    let selected = tab
-                                    refreshing = selected
-                                    refreshMessages[selected.rawValue] = nil
-                                    Task {
-                                        let error = await analysis.refresh(DayAnalysisRequest(day: day, kind: selected))
-                                        refreshMessages[selected.rawValue] = error ?? "Analysis updated."
-                                        refreshing = nil
-                                    }
-                                } label: {
-                                    HStack(spacing: 8) {
-                                        if refreshing == tab { ProgressView().controlSize(.small) }
-                                        else { Image(systemName: "arrow.clockwise") }
-                                        Text(refreshing == tab ? "Refreshing analysis…" : "Refresh analysis")
-                                    }
-                                    .font(.subheadline.weight(.medium))
-                                    .frame(minHeight: 44)
-                                }
-                                .buttonStyle(.plain).foregroundStyle(Obs.ink2)
-                                .disabled(refreshing != nil || analysis.isBusy)
-                                Text(refreshMessages[tab.rawValue]
-                                     ?? (refreshing == tab ? "Keep the app open while analysis runs."
-                                         : analysis.isBusy ? "Available when sync and analysis finish."
-                                         : "Rerun \(tab.rawValue.lowercased()) analysis for this day using saved ring data."))
-                                    .font(.footnote).foregroundStyle(Obs.muted)
-                                    .fixedSize(horizontal: false, vertical: true)
-                                    .accessibilityAddTraits(.updatesFrequently)
-                            }
+                        if let analysis, let note = refreshNote(analysis) {
+                            Text(note)
+                                .font(.footnote).foregroundStyle(Obs.muted)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityAddTraits(.updatesFrequently)
                         }
                         if tab == .sleep { SleepReport(s: analysis?.summary ?? s, day: day) }
                         else { ActivityReport(s: analysis?.summary ?? s, day: day) }
@@ -825,6 +804,41 @@ struct DayReportView: View {
         .sheet(isPresented: Binding(get: { exportFile != nil }, set: { if !$0 { exportFile = nil } })) {
             if let exportFile { DiagnosticsShare(url: exportFile) }
         }
+    }
+
+    /// Rerun the selected analysis for this day. Lives in the header as an icon so the
+    /// report itself starts right under the title.
+    private func refreshButton(_ analysis: DayAnalysisContext) -> some View {
+        Button {
+            let selected = tab
+            refreshing = selected
+            refreshMessages[selected.rawValue] = nil
+            Task {
+                let error = await analysis.refresh(DayAnalysisRequest(day: day, kind: selected))
+                refreshMessages[selected.rawValue] = error ?? "Analysis updated."
+                refreshing = nil
+            }
+        } label: {
+            Group {
+                if refreshing == tab { ProgressView().controlSize(.small) }
+                else { Image(systemName: "arrow.clockwise").font(.system(size: 15, weight: .medium)) }
+            }
+            .foregroundStyle(Obs.ink2)
+            .frame(width: 34, height: 34)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(refreshing != nil || analysis.isBusy)
+        .opacity(analysis.isBusy && refreshing == nil ? 0.4 : 1)
+        .accessibilityLabel(refreshing == tab ? "Refreshing \(tab.rawValue.lowercased()) analysis"
+                            : "Refresh \(tab.rawValue.lowercased()) analysis")
+    }
+
+    /// Only shown while a refresh runs or right after one, so the report keeps its space.
+    private func refreshNote(_ analysis: DayAnalysisContext) -> String? {
+        if let message = refreshMessages[tab.rawValue] { return message }
+        if refreshing == tab { return "Keep the app open while analysis runs." }
+        return nil
     }
 
     /// The day's data as JSON — copy for a quick paste, or share as a file. Built off
@@ -908,7 +922,7 @@ struct SleepReport: View {
                 let auto = Sleep.autonomic(hr: n.series?.hr ?? [], hrv: n.series?.hrv ?? [],
                                            stages: Sleep.smooth(n.stages ?? [], 5))
                 if auto.any {
-                    Rule("Heart rate & HRV by stage")
+                    Rule("HR & HRV by stage")
                     autonomicGrid(auto)
                 }
 
@@ -973,35 +987,62 @@ struct SleepReport: View {
         }
     }
 
+    /// One row per finding: an icon in the stage colour, a plain label and a mono value.
+    /// Same vocabulary as the summary strip at the top of the report.
     @ViewBuilder private func interpretation(_ n: NightRow, _ m: SleepMetrics?) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(sentences(n, m), id: \.self) { t in
-                Text(t).font(Obs.prose(14)).foregroundStyle(Obs.ink2).fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(findings(n, m), id: \.label) { f in
+                summaryRow(icon: f.icon, tint: f.tint, label: f.label, value: f.value, detail: f.detail)
             }
             if let d = s.sleepDebt, d.valid {
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    Text(debtDuration(d.debt_min)).font(Obs.mono(20, .medium)).foregroundStyle(Obs.debt(d.state))
-                    Text("accumulated sleep debt vs your \(debtDuration(d.need_h * 60)) nightly need" + (d.recent_shortfall_min > 0 ? " · last sleep day \(Int(d.recent_shortfall_min)) min short" : ""))
-                        .font(Obs.mono(11)).foregroundStyle(Obs.ink2).fixedSize(horizontal: false, vertical: true)
-                }
-                .padding(.top, 6)
+                summaryRow(icon: "bed.double", tint: Obs.debt(d.state), label: "Sleep debt",
+                           value: debtDuration(d.debt_min),
+                           detail: "vs \(debtDuration(d.need_h * 60)) nightly need"
+                               + (d.recent_shortfall_min > 0 ? " · last day \(Int(d.recent_shortfall_min)) min short" : ""))
             }
         }
     }
 
-    private func sentences(_ n: NightRow, _ m: SleepMetrics?) -> [String] {
-        var out: [String] = []
+    private func summaryRow(icon: String, tint: Color, label: String, value: String, detail: String?) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .medium)).foregroundStyle(tint)
+                .frame(width: 20, alignment: .center)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(label).font(Obs.prose(14)).foregroundStyle(Obs.ink2)
+                if let detail {
+                    Text(detail).font(Obs.mono(11)).foregroundStyle(Obs.muted)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 12)
+            Text(value).font(Obs.mono(15, .medium)).foregroundStyle(tint).monospacedDigit()
+        }
+        .padding(.vertical, 9)
+        .overlay(alignment: .bottom) { Rectangle().fill(Obs.trace.opacity(0.5)).frame(height: 0.5) }
+    }
+
+    private struct Finding { let icon: String; let tint: Color; let label: String; let value: String; let detail: String? }
+
+    private func findings(_ n: NightRow, _ m: SleepMetrics?) -> [Finding] {
+        var out: [Finding] = []
         if let e = n.efficiency {
-            out.append("You spent \(Int(e))% of your time in bed asleep.")
+            let tint: Color = e >= 85 ? Obs.good : e < 75 ? Obs.bad : Obs.ink
+            out.append(Finding(icon: "moon.zzz", tint: tint, label: "Asleep while in bed", value: "\(Int(e))%", detail: nil))
         }
         if let dp = n.deep_pct {
-            out.append("Deep sleep made up \(Int(dp))% of recorded sleep.")
+            out.append(Finding(icon: "waveform.path", tint: Obs.deep, label: "Deep sleep", value: "\(Int(dp))%", detail: nil))
         }
-        if let rp = n.rem_pct, let rl = m?.remLatencyMin {
-            out.append("REM was \(Int(rp))% with first REM \(Int(rl.rounded())) min after onset.")
+        if let rp = n.rem_pct {
+            let detail = m?.remLatencyMin.map { "first REM \(Int($0.rounded())) min after onset" }
+            out.append(Finding(icon: "eye", tint: Obs.rem, label: "REM sleep", value: "\(Int(rp))%", detail: detail))
         }
         if let m {
-            out.append("You spent \(Int(m.wasoMin.rounded())) min awake across \(m.awakenings) awakening\(m.awakenings == 1 ? "" : "s") after first falling asleep.")
+            let n = m.awakenings
+            out.append(Finding(icon: "sun.max", tint: Obs.wake, label: "Awake after falling asleep",
+                               value: "\(Int(m.wasoMin.rounded())) min",
+                               detail: "\(n) awakening\(n == 1 ? "" : "s")"))
         }
         return out
     }

@@ -366,7 +366,7 @@ struct SyncView: View {
                 }
                 .buttonStyle(.plain)
             }
-            .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+            .background(Obs.rule.opacity(0.3), in: RoundedRectangle(cornerRadius: 16))
 
             VStack(spacing: 0) {
                 SupportRow(icon: "trash", title: "Reset local sync data",
@@ -426,7 +426,7 @@ private struct SupportRowLabel: View {
                 .font(.system(size: 15, weight: .regular))
                 .foregroundStyle(tint == Obs.ink ? Obs.ink2 : tint)
                 .frame(width: 32, height: 32)
-                .background(Obs.paper.opacity(0.7), in: Circle())
+                .background(Obs.paper.opacity(0.85), in: Circle())
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 Text(title).font(.subheadline.weight(.medium)).foregroundStyle(tint)
@@ -546,7 +546,7 @@ private struct TechnicalReportsView: View {
             content()
         }
         .padding(14)
-        .background(Color(uiColor: .secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16))
+        .background(Obs.rule.opacity(0.3), in: RoundedRectangle(cornerRadius: 16))
     }
 
     private func copyButton(_ id: String, text: String) -> some View {

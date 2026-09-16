@@ -29,3 +29,7 @@ apps/ios/OuraApp/build/
 apps/ios/build/
 apps/ios/DerivedData/
 local/
+
+# Runtime state the CLI writes next to the DB (personal profile, ring feature modes).
+profile.json
+feature_modes.json
