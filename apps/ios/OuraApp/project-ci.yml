@@ -45,6 +45,7 @@ targets:
       - path: WorkCoordinator.swift
       - path: Components.swift
       - path: Reports.swift
+      - path: DayExport.swift
       - path: RawData.swift
       - path: HeartRate.swift
       - path: Theme.swift
