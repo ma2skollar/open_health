@@ -590,6 +590,37 @@ public protocol RingSessionProtocol : AnyObject {
     func cancel(reason: String) 
     
     /**
+     * **DESTRUCTIVE.** Wipe the ring back to factory state: the installed auth key,
+     * every BLE bond, the on-ring event buffer and the anthropometric profile are
+     * erased. Sync first — anything still only on the ring is lost.
+     *
+     * `confirm_serial` must equal the serial of the ring that actually answers, so a
+     * tap can never wipe a different ring that happened to win the scan (a partner's
+     * ring on the same charger, say). A mismatch aborts before anything is sent.
+     *
+     * The ring normally drops the link before replying, so an empty response is the
+     * expected success path. Afterwards the ring is pairable again — `pair` mints a
+     * new key — and its event counter keeps running, so start a fresh database
+     * rather than resuming the old cursor.
+     */
+    func factoryReset(keyHex: String, confirmSerial: String) async throws  -> String
+    
+    /**
+     * Pair with a **factory-reset** ring: install a 16-byte app-auth key over the
+     * already-connected link and verify it authenticates. This is the on-device
+     * equivalent of the desktop `oura pair`, so a ring can be adopted from the phone
+     * alone — no computer, and the key never leaves the device.
+     *
+     * `existing_key_hex` re-installs a key the caller already holds (keeping a
+     * re-paired ring's history attributable to the same key); `None` mints a fresh
+     * one from the system CSPRNG.
+     *
+     * Only valid on a reset ring: one that still holds a key answers `set_auth_key`
+     * with a non-zero status and the call fails without changing anything.
+     */
+    func pair(existingKeyHex: String?) async throws  -> PairReport
+    
+    /**
      * Swift pushes each inbound BLE notification frame here.
      */
     func pushFrame(data: Data) 
@@ -679,6 +710,67 @@ open func cancel(reason: String) {try! rustCall() {
 }
     
     /**
+     * **DESTRUCTIVE.** Wipe the ring back to factory state: the installed auth key,
+     * every BLE bond, the on-ring event buffer and the anthropometric profile are
+     * erased. Sync first — anything still only on the ring is lost.
+     *
+     * `confirm_serial` must equal the serial of the ring that actually answers, so a
+     * tap can never wipe a different ring that happened to win the scan (a partner's
+     * ring on the same charger, say). A mismatch aborts before anything is sent.
+     *
+     * The ring normally drops the link before replying, so an empty response is the
+     * expected success path. Afterwards the ring is pairable again — `pair` mints a
+     * new key — and its event counter keeps running, so start a fresh database
+     * rather than resuming the old cursor.
+     */
+open func factoryReset(keyHex: String, confirmSerial: String)async throws  -> String {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_oura_core_fn_method_ringsession_factory_reset(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(keyHex),FfiConverterString.lower(confirmSerial)
+                )
+            },
+            pollFunc: ffi_oura_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_oura_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_oura_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeSyncError.lift
+        )
+}
+    
+    /**
+     * Pair with a **factory-reset** ring: install a 16-byte app-auth key over the
+     * already-connected link and verify it authenticates. This is the on-device
+     * equivalent of the desktop `oura pair`, so a ring can be adopted from the phone
+     * alone — no computer, and the key never leaves the device.
+     *
+     * `existing_key_hex` re-installs a key the caller already holds (keeping a
+     * re-paired ring's history attributable to the same key); `None` mints a fresh
+     * one from the system CSPRNG.
+     *
+     * Only valid on a reset ring: one that still holds a key answers `set_auth_key`
+     * with a non-zero status and the call fails without changing anything.
+     */
+open func pair(existingKeyHex: String?)async throws  -> PairReport {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_oura_core_fn_method_ringsession_pair(
+                    self.uniffiClonePointer(),
+                    FfiConverterOptionString.lower(existingKeyHex)
+                )
+            },
+            pollFunc: ffi_oura_core_rust_future_poll_rust_buffer,
+            completeFunc: ffi_oura_core_rust_future_complete_rust_buffer,
+            freeFunc: ffi_oura_core_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePairReport.lift,
+            errorHandler: FfiConverterTypeSyncError.lift
+        )
+}
+    
+    /**
      * Swift pushes each inbound BLE notification frame here.
      */
 open func pushFrame(data: Data) {try! rustCall() {
@@ -765,6 +857,95 @@ public func FfiConverterTypeRingSession_lift(_ pointer: UnsafeMutableRawPointer)
 #endif
 public func FfiConverterTypeRingSession_lower(_ value: RingSession) -> UnsafeMutableRawPointer {
     return FfiConverterTypeRingSession.lower(value)
+}
+
+
+/**
+ * What a successful [`RingSession::pair`] installed.
+ *
+ * `key_hex` is the ONLY copy of the ring's auth key: the ring stores it but never
+ * reads it back, and losing it can only be undone by another factory reset. Persist
+ * it (Keychain) before doing anything else with this value.
+ */
+public struct PairReport {
+    public var serial: String
+    public var keyHex: String
+    /**
+     * True when the key was freshly minted here, false when `existing_key_hex`
+     * re-installed a key the caller already held.
+     */
+    public var minted: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(serial: String, keyHex: String, 
+        /**
+         * True when the key was freshly minted here, false when `existing_key_hex`
+         * re-installed a key the caller already held.
+         */minted: Bool) {
+        self.serial = serial
+        self.keyHex = keyHex
+        self.minted = minted
+    }
+}
+
+
+
+extension PairReport: Equatable, Hashable {
+    public static func ==(lhs: PairReport, rhs: PairReport) -> Bool {
+        if lhs.serial != rhs.serial {
+            return false
+        }
+        if lhs.keyHex != rhs.keyHex {
+            return false
+        }
+        if lhs.minted != rhs.minted {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(serial)
+        hasher.combine(keyHex)
+        hasher.combine(minted)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePairReport: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PairReport {
+        return
+            try PairReport(
+                serial: FfiConverterString.read(from: &buf), 
+                keyHex: FfiConverterString.read(from: &buf), 
+                minted: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PairReport, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.serial, into: &buf)
+        FfiConverterString.write(value.keyHex, into: &buf)
+        FfiConverterBool.write(value.minted, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePairReport_lift(_ buf: RustBuffer) throws -> PairReport {
+    return try FfiConverterTypePairReport.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePairReport_lower(_ value: PairReport) -> RustBuffer {
+    return FfiConverterTypePairReport.lower(value)
 }
 
 
@@ -1155,6 +1336,30 @@ extension FfiConverterCallbackInterfaceSyncProgressListener : FfiConverter {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceUInt16: FfiConverterRustBuffer {
     typealias SwiftType = [UInt16]
 
@@ -1223,6 +1428,26 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
     }
 }
 /**
+ * Write a clean single-file copy of the database to `dest_path` — the export half of
+ * backup/restore.
+ *
+ * Uses `VACUUM INTO`, not a file copy: the store runs in WAL mode, so the `.db` on its
+ * own can be missing the most recent events, and `VACUUM INTO` folds the write-ahead
+ * log in and produces one consistent, defragmented file. It reads the source without
+ * modifying it, so it is safe while the app is otherwise idle.
+ *
+ * The result carries ring data only. The auth key lives in the Keychain and is NOT in
+ * here — restoring onto a fresh phone still needs the key entered separately.
+ */
+public func backupDatabase(dbPath: String, destPath: String)throws  -> UInt64 {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeSyncError.lift) {
+    uniffi_oura_core_fn_func_backup_database(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(destPath),$0
+    )
+})
+}
+/**
  * Build/version string — a trivial call to validate the FFI round-trip.
  */
 public func coreVersion() -> String {
@@ -1239,6 +1464,32 @@ public func databaseIntegrity(dbPath: String)throws  -> String {
 })
 }
 /**
+ * Every decoded event the ring has sent, newest first — the raw-data browser and
+ * the debug charts behind it.
+ *
+ * `name_filter` limits to one event type (`hrv_event`, `green_ibi_quality_event`, …);
+ * empty means all. `limit` caps the rows returned — the table reaches six figures on
+ * a real ring, so the UI pages rather than loading everything.
+ *
+ * Each event carries `unix_s`, resolved through the same boot-epoch [`RingClock`] the
+ * summary uses, so points land on the right day even across a ring reboot; the raw
+ * `ring_timestamp` and the phone's `captured_unix` are passed through unchanged for
+ * when that resolution is itself what you're debugging. `decoded` is the decoder's own
+ * JSON object, so a chart can plot any numeric field in it without the FFI knowing
+ * what the field means.
+ *
+ * Returns `{ counts: [{name, total, decoded}], events: [...] }`, or `{ "error": … }`.
+ */
+public func eventsJson(dbPath: String, nameFilter: String, limit: UInt32) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_oura_core_fn_func_events_json(
+        FfiConverterString.lower(dbPath),
+        FfiConverterString.lower(nameFilter),
+        FfiConverterUInt32.lower(limit),$0
+    )
+})
+}
+/**
  * Copy the synced database to `out_path` as one self-contained SQLite file
  * (`VACUUM INTO`), so the exact on-phone ring records can be replayed on the
  * desktop with `oura --db <file> …`. The auth key lives in the Keychain and is
@@ -1250,6 +1501,26 @@ public func exportDatabase(dbPath: String, outPath: String)throws  {try rustCall
         FfiConverterString.lower(outPath),$0
     )
 }
+}
+/**
+ * Hourly heart-rate bars for the HR detail screen — one bar per local-clock
+ * hour, `{low, high, mean, count}`, plus the newest quality-gated
+ * reading as `latest`.
+ *
+ * The nightly RHR trend answers "how have I been sleeping"; this answers "what did
+ * my heart do today". `tz_offset` is whole hours from UTC (same as [`summary_json`]),
+ * `days` caps the window to that many days back from the newest sample (0 = all).
+ *
+ * Returns the JSON string, or `{ "error": "…" }`.
+ */
+public func hourlyHrJson(dbPath: String, tzOffset: Int64, days: UInt32) -> String {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_oura_core_fn_func_hourly_hr_json(
+        FfiConverterString.lower(dbPath),
+        FfiConverterInt64.lower(tzOffset),
+        FfiConverterUInt32.lower(days),$0
+    )
+})
 }
 /**
  * A lightweight, model-free summary (device + data-health only) — kept as a fast
@@ -1309,13 +1580,22 @@ private var initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_oura_core_checksum_func_backup_database() != 40677) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_oura_core_checksum_func_core_version() != 24695) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_database_integrity() != 19533) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_oura_core_checksum_func_events_json() != 22398) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_oura_core_checksum_func_export_database() != 46626) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_func_hourly_hr_json() != 21410) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_func_quick_summary_json() != 19199) {
@@ -1328,6 +1608,12 @@ private var initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_method_ringsession_cancel() != 11635) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_method_ringsession_factory_reset() != 9780) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_oura_core_checksum_method_ringsession_pair() != 40653) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_oura_core_checksum_method_ringsession_push_frame() != 19557) {

@@ -44,6 +44,141 @@ pub fn summary_json(db_path: String, tz_offset: i64) -> String {
     }
 }
 
+/// Hourly heart-rate bars for the HR detail screen — one bar per local-clock
+/// hour, `{low, high, mean, count}`, plus the newest quality-gated
+/// reading as `latest`.
+///
+/// The nightly RHR trend answers "how have I been sleeping"; this answers "what did
+/// my heart do today". `tz_offset` is whole hours from UTC (same as [`summary_json`]),
+/// `days` caps the window to that many days back from the newest sample (0 = all).
+///
+/// Returns the JSON string, or `{ "error": "…" }`.
+#[uniffi::export]
+pub fn hourly_hr_json(db_path: String, tz_offset: i64, days: u32) -> String {
+    match oura_summary::hourly_hr::hourly_hr(std::path::Path::new(&db_path), tz_offset, days) {
+        Ok(v) => v.to_string(),
+        Err(e) => json!({ "error": e.to_string() }).to_string(),
+    }
+}
+
+/// Write a clean single-file copy of the database to `dest_path` — the export half of
+/// backup/restore.
+///
+/// Uses `VACUUM INTO`, not a file copy: the store runs in WAL mode, so the `.db` on its
+/// own can be missing the most recent events, and `VACUUM INTO` folds the write-ahead
+/// log in and produces one consistent, defragmented file. It reads the source without
+/// modifying it, so it is safe while the app is otherwise idle.
+///
+/// The result carries ring data only. The auth key lives in the Keychain and is NOT in
+/// here — restoring onto a fresh phone still needs the key entered separately.
+#[uniffi::export]
+pub fn backup_database(db_path: String, dest_path: String) -> Result<u64, SyncError> {
+    let _ = std::fs::remove_file(&dest_path); // VACUUM INTO refuses an existing target
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| SyncError::Failed(format!("opening {db_path}: {e}")))?;
+    conn.execute("VACUUM INTO ?1", [&dest_path])
+        .map_err(|e| SyncError::Failed(format!("writing the backup: {e}")))?;
+    std::fs::metadata(&dest_path)
+        .map(|m| m.len())
+        .map_err(|e| SyncError::Failed(format!("backup written but unreadable: {e}")))
+}
+
+/// Every decoded event the ring has sent, newest first — the raw-data browser and
+/// the debug charts behind it.
+///
+/// `name_filter` limits to one event type (`hrv_event`, `green_ibi_quality_event`, …);
+/// empty means all. `limit` caps the rows returned — the table reaches six figures on
+/// a real ring, so the UI pages rather than loading everything.
+///
+/// Each event carries `unix_s`, resolved through the same boot-epoch [`RingClock`] the
+/// summary uses, so points land on the right day even across a ring reboot; the raw
+/// `ring_timestamp` and the phone's `captured_unix` are passed through unchanged for
+/// when that resolution is itself what you're debugging. `decoded` is the decoder's own
+/// JSON object, so a chart can plot any numeric field in it without the FFI knowing
+/// what the field means.
+///
+/// Returns `{ counts: [{name, total, decoded}], events: [...] }`, or `{ "error": … }`.
+#[uniffi::export]
+pub fn events_json(db_path: String, name_filter: String, limit: u32) -> String {
+    match raw_events(&db_path, &name_filter, limit) {
+        Ok(v) => v.to_string(),
+        Err(e) => json!({ "error": e }).to_string(),
+    }
+}
+
+fn raw_events(db_path: &str, name_filter: &str, limit: u32) -> Result<serde_json::Value, String> {
+    use rusqlite::OpenFlags;
+    let conn = rusqlite::Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|e| e.to_string())?;
+
+    let mut counts = Vec::new();
+    {
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, COUNT(*), SUM(decoded_json IS NOT NULL) \
+                 FROM events GROUP BY name ORDER BY COUNT(*) DESC",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(json!({
+                    "name": r.get::<_, String>(0)?,
+                    "total": r.get::<_, i64>(1)?,
+                    "decoded": r.get::<_, i64>(2)?,
+                }))
+            })
+            .map_err(|e| e.to_string())?;
+        for row in rows {
+            counts.push(row.map_err(|e| e.to_string())?);
+        }
+    }
+
+    // The clock needs the WHOLE decoded history to find boot epochs and their
+    // time_sync anchors — resolving against a filtered slice would misdate events.
+    let store = oura_store::storage::Store::open_read_only(db_path).map_err(|e| e.to_string())?;
+    let all = store.decoded_events().map_err(|e| e.to_string())?;
+    let clock = oura_summary::ring_time::RingClock::from_events(&all);
+
+    let filtered = !name_filter.trim().is_empty();
+    let sql = if filtered {
+        "SELECT name, tag, ring_timestamp, captured_unix, decoded_json, LENGTH(body) \
+         FROM events WHERE name = ?1 ORDER BY captured_unix DESC, id DESC LIMIT ?2"
+    } else {
+        "SELECT name, tag, ring_timestamp, captured_unix, decoded_json, LENGTH(body) \
+         FROM events ORDER BY captured_unix DESC, id DESC LIMIT ?2"
+    };
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let mut events = Vec::new();
+    let rows = stmt
+        .query_map(rusqlite::params![name_filter.trim(), limit as i64], |r| {
+            let ds: i64 = r.get(2)?;
+            let captured: i64 = r.get(3)?;
+            let decoded: Option<String> = r.get(4)?;
+            Ok(json!({
+                "name": r.get::<_, String>(0)?,
+                "tag": r.get::<_, i64>(1)?,
+                "ring_timestamp": ds,
+                "captured_unix": captured,
+                "unix_s": clock.unix_s(ds, captured),
+                "body_len": r.get::<_, i64>(5)?,
+                "decoded": decoded
+                    .and_then(|d| serde_json::from_str::<serde_json::Value>(&d).ok()),
+            }))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        events.push(row.map_err(|e| e.to_string())?);
+    }
+
+    Ok(json!({ "counts": counts, "events": events }))
+}
+
 /// A lightweight, model-free summary (device + data-health only) — kept as a fast
 /// path / fallback. Returns `{ serials, device, event_counts, decoded_events }`.
 #[uniffi::export]
@@ -128,6 +263,20 @@ pub struct SyncReport {
     pub events_synced: u32,
     pub inserted: u32,
     pub next_cursor: u32,
+}
+
+/// What a successful [`RingSession::pair`] installed.
+///
+/// `key_hex` is the ONLY copy of the ring's auth key: the ring stores it but never
+/// reads it back, and losing it can only be undone by another factory reset. Persist
+/// it (Keychain) before doing anything else with this value.
+#[derive(uniffi::Record)]
+pub struct PairReport {
+    pub serial: String,
+    pub key_hex: String,
+    /// True when the key was freshly minted here, false when `existing_key_hex`
+    /// re-installed a key the caller already held.
+    pub minted: bool,
 }
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -337,9 +486,150 @@ impl RingSession {
             result = self.sync_inner(db_path, key_hex, progress) => result,
         }
     }
+
+    /// Pair with a **factory-reset** ring: install a 16-byte app-auth key over the
+    /// already-connected link and verify it authenticates. This is the on-device
+    /// equivalent of the desktop `oura pair`, so a ring can be adopted from the phone
+    /// alone — no computer, and the key never leaves the device.
+    ///
+    /// `existing_key_hex` re-installs a key the caller already holds (keeping a
+    /// re-paired ring's history attributable to the same key); `None` mints a fresh
+    /// one from the system CSPRNG.
+    ///
+    /// Only valid on a reset ring: one that still holds a key answers `set_auth_key`
+    /// with a non-zero status and the call fails without changing anything.
+    pub async fn pair(&self, existing_key_hex: Option<String>) -> Result<PairReport, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.pair_inner(existing_key_hex) => result,
+        }
+    }
+
+    /// **DESTRUCTIVE.** Wipe the ring back to factory state: the installed auth key,
+    /// every BLE bond, the on-ring event buffer and the anthropometric profile are
+    /// erased. Sync first — anything still only on the ring is lost.
+    ///
+    /// `confirm_serial` must equal the serial of the ring that actually answers, so a
+    /// tap can never wipe a different ring that happened to win the scan (a partner's
+    /// ring on the same charger, say). A mismatch aborts before anything is sent.
+    ///
+    /// The ring normally drops the link before replying, so an empty response is the
+    /// expected success path. Afterwards the ring is pairable again — `pair` mints a
+    /// new key — and its event counter keeps running, so start a fresh database
+    /// rather than resuming the old cursor.
+    pub async fn factory_reset(
+        &self,
+        key_hex: String,
+        confirm_serial: String,
+    ) -> Result<String, SyncError> {
+        let mut stop = self.stop.subscribe();
+        if let Some(reason) = stop.borrow().clone() {
+            return Err(SyncError::Interrupted { reason });
+        }
+        tokio::select! {
+            biased;
+            _ = stop.changed() => Err(SyncError::Interrupted {
+                reason: stop.borrow().clone().unwrap_or_else(|| "cancelled".into()) }),
+            result = self.factory_reset_inner(key_hex, confirm_serial) => result,
+        }
+    }
 }
 
 impl RingSession {
+    /// The wipe opcode is assembled here, at the call site, rather than in
+    /// `oura-protocol` — upstream deliberately keeps it out of the shared protocol
+    /// crate so nothing that merely links the decoder can emit it.
+    const FACTORY_RESET_REQUEST: [u8; 2] = [0x1a, 0x00];
+
+    async fn factory_reset_inner(
+        &self,
+        key_hex: String,
+        confirm_serial: String,
+    ) -> Result<String, SyncError> {
+        let fail = SyncError::Failed;
+        let key = parse_key(&key_hex)
+            .ok_or_else(|| fail("auth key must be 32 hex chars".into()))?;
+        let transport = FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        };
+        let client = OuraClient::new(transport);
+
+        let serial = client
+            .serial()
+            .await
+            .map_err(|e| fail(format!("reading the ring serial: {e}")))?;
+        let expected = confirm_serial.trim();
+        if !expected.eq_ignore_ascii_case(&serial) {
+            return Err(fail(format!(
+                "refusing to wipe: the ring that answered is {serial}, not {expected}"
+            )));
+        }
+        client
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(format!("authenticating before wipe: {e}")))?;
+
+        // An empty reply is the expected outcome: the ring resets and drops the link
+        // faster than it answers. A transport error here is therefore not a failure.
+        let _ = oura_link::transport::transact(
+            client.transport(),
+            &Self::FACTORY_RESET_REQUEST,
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        Ok(serial)
+    }
+
+    async fn pair_inner(
+        &self,
+        existing_key_hex: Option<String>,
+    ) -> Result<PairReport, SyncError> {
+        let fail = SyncError::Failed;
+        let (key, minted) = match existing_key_hex
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(hex) => (
+                parse_key(hex).ok_or_else(|| fail("auth key must be 32 hex chars".into()))?,
+                false,
+            ),
+            None => (random_key().map_err(fail)?, true),
+        };
+        let transport = FfiTransport {
+            tx: self.tx.clone(),
+            writer: self.writer.clone(),
+        };
+        let client = OuraClient::new(transport);
+
+        // Read the serial first: it needs no auth, so a dead link or a charging case
+        // that won the scan fails here rather than after a key is already installed.
+        let serial = client
+            .serial()
+            .await
+            .map_err(|e| fail(format!("reading the ring serial: {e}")))?;
+        client
+            .set_auth_key(&key)
+            .await
+            .map_err(|e| fail(format!("{e} — is the ring factory-reset?")))?;
+        client
+            .authenticate(&key)
+            .await
+            .map_err(|e| fail(format!("key installed on {serial} but verification failed: {e}")))?;
+        Ok(PairReport {
+            serial,
+            key_hex: to_hex(&key),
+            minted,
+        })
+    }
+
     async fn sync_inner(
         &self,
         db_path: String,
@@ -366,11 +656,21 @@ impl RingSession {
             .await
             .map_err(|e| fail(e.to_string()))?;
         // Push the phone's clock to the ring so this boot logs a `time_sync` anchor.
-        // Without one, a rebooted ring's nights have no bridge to wall-clock time.
+        // Without one, a rebooted ring's nights have no bridge to wall-clock time:
+        // `time_sync` is the only wall-clock anchor in the event stream, and it is
+        // retroactive — one of them dates every event in the same boot epoch.
         progress.on_progress("time".into(), 0, 0);
         if let Err(error) = client.sync_time_app().await {
             progress.on_progress(format!("time_sync skipped: {error}"), 0, 0);
+            // The app-layer command is refused by some firmware; the plain one is not.
+            let _ = client.sync_time().await;
         }
+        // Ask the ring to run its sleep analysis before draining. Bedtime periods are
+        // the ONLY thing build_summary turns into nights, and the ring writes one when
+        // it postprocesses a sleep — not while it is recording one. Triggering it here
+        // gives the ring the whole drain to finish, so a fast postprocess lands in this
+        // sync rather than the next. Fire-and-forget: a refusal is not a sync failure.
+        let _ = client.check_sleep_analysis(false).await;
         let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
         let info = client.firmware().await.ok();
 
@@ -500,6 +800,17 @@ fn phone_anchor_event(events_synced: u32, next_cursor: u32, now: u64) -> Option<
     })
 }
 
+/// A fresh 16-byte auth key from the system CSPRNG (`SecRandomCopyBytes` on Apple).
+fn random_key() -> Result<[u8; 16], String> {
+    let mut key = [0u8; 16];
+    getrandom::getrandom(&mut key).map_err(|e| format!("system CSPRNG unavailable: {e}"))?;
+    Ok(key)
+}
+
+fn to_hex(key: &[u8; 16]) -> String {
+    key.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn parse_key(hex: &str) -> Option<[u8; 16]> {
     let hex = hex.trim();
     if hex.len() != 32 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -515,6 +826,20 @@ fn parse_key(hex: &str) -> Option<[u8; 16]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minted_keys_round_trip_through_hex() {
+        let key = random_key().expect("system CSPRNG");
+        let hex = to_hex(&key);
+        assert_eq!(hex.len(), 32);
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert_eq!(parse_key(&hex), Some(key));
+    }
+
+    #[test]
+    fn minted_keys_are_not_constant() {
+        assert_ne!(random_key().unwrap(), random_key().unwrap());
+    }
 
     struct SilentWriter;
     impl BleWriter for SilentWriter {
@@ -634,5 +959,56 @@ mod tests {
             "protocol error: extended history request failed with result code 0xff"
         ));
         assert!(!is_rejected_history_cursor("BLE link lost mid-batch"));
+    }
+}
+
+#[cfg(test)]
+mod raw_event_tests {
+    use super::*;
+
+    #[test]
+    fn backup_round_trips_through_vacuum_into() {
+        let dir = std::env::temp_dir().join(format!("oura-core-backup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("oura.db");
+        let dst = dir.join("backup.db");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+        drop(oura_store::storage::Store::open(src.to_str().unwrap()).unwrap());
+
+        let bytes = backup_database(src.to_str().unwrap().into(), dst.to_str().unwrap().into())
+            .expect("backup");
+        assert!(bytes > 0);
+        // the copy must be a usable store, not just bytes on disk
+        assert!(database_integrity(dst.to_str().unwrap().into())
+            .expect("integrity")
+            .contains("ok"));
+        // and re-running must overwrite rather than fail on an existing file
+        backup_database(src.to_str().unwrap().into(), dst.to_str().unwrap().into())
+            .expect("second backup");
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dst);
+    }
+
+    #[test]
+    fn missing_database_reports_an_error_object() {
+        let out = events_json("/nonexistent/oura.db".into(), String::new(), 10);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("error").is_some(), "{out}");
+    }
+
+    #[test]
+    fn empty_database_yields_empty_lists() {
+        let dir = std::env::temp_dir().join(format!("oura-core-raw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("oura.db");
+        let _ = std::fs::remove_file(&db);
+        // Store::open creates the schema.
+        drop(oura_store::storage::Store::open(db.to_str().unwrap()).unwrap());
+        let out = events_json(db.to_str().unwrap().into(), String::new(), 10);
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["counts"].as_array().unwrap().len(), 0, "{out}");
+        assert_eq!(v["events"].as_array().unwrap().len(), 0, "{out}");
+        let _ = std::fs::remove_file(&db);
     }
 }

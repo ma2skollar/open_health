@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 // The SwiftUI screens for OuraApp. Data types live in Models.swift, the model/FFI
 // orchestration in Core.swift, the reusable charts/cells in Components.swift, and the
@@ -128,7 +129,43 @@ struct SyncView: View {
     @State private var showKey = false
     @State private var clockReport: String?
     @State private var confirmReset = false
+    @State private var confirmWipeRing = false
+    @State private var backupFile: URL?
+    @State private var showRestorePicker = false
+    @State private var restoreNote: String?
     @FocusState private var keyFocused: Bool
+
+    static let backupStamp: DateFormatter = {
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HHmm"; return f
+    }()
+
+    /// Validate the chosen file before it replaces anything: a truncated download or
+    /// the wrong file entirely must not destroy a working database.
+    private func restore(from result: Result<[URL], Error>) -> String {
+        guard case .success(let urls) = result, let picked = urls.first else { return "Restore cancelled." }
+        let scoped = picked.startAccessingSecurityScopedResource()
+        defer { if scoped { picked.stopAccessingSecurityScopedResource() } }
+        let staging = FileManager.default.temporaryDirectory
+            .appendingPathComponent("restore-candidate.db")
+        do {
+            try? FileManager.default.removeItem(at: staging)
+            try FileManager.default.copyItem(at: picked, to: staging)
+        } catch { return "Could not read that file: \(error.localizedDescription)" }
+
+        do {
+            let verdict = try databaseIntegrity(dbPath: staging.path)
+            guard verdict.lowercased().contains("ok") else {
+                return "That file is not a healthy database (\(verdict)). Nothing changed."
+            }
+        } catch { return "That file is not an Open Oura backup. Nothing changed." }
+
+        do {
+            try DB.resetWritableStore()
+            try FileManager.default.copyItem(at: staging, to: DB.url)
+            try? FileManager.default.removeItem(at: staging)
+        } catch { return "Restore failed midway: \(error.localizedDescription)" }
+        return "Restored. The next sync continues from where the backup left off."
+    }
 
     private var validKey: Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -147,6 +184,7 @@ struct SyncView: View {
                     if !ring.busy { pairingKey }
                     connection
                     support
+                    BuildStamp()
                 }
                 .frame(maxWidth: 520)
                 .padding(.horizontal, 24)
@@ -176,11 +214,35 @@ struct SyncView: View {
             } message: {
                 Text("This removes the synced data on this iPhone. Your next sync will download the history still available on your ring.")
             }
+            .alert("Factory-reset \(ring.knownSerial ?? "the ring")?", isPresented: $confirmWipeRing) {
+                Button("Cancel", role: .cancel) {}
+                Button("Erase the ring", role: .destructive) {
+                    let serial = ring.knownSerial ?? ""
+                    let current = key
+                    Task {
+                        if await ring.factoryReset(keyHex: current, confirmSerial: serial) {
+                            key = ""
+                            showKey = false
+                        }
+                    }
+                }
+            } message: {
+                Text("Erases the ring's pairing key, its Bluetooth bonds, any events it hasn't sent yet, and your stored body profile. Sync first if you want those events. This cannot be undone — but the ring stays yours: pair it again right here afterwards.")
+            }
         }
         .tint(Obs.ink)
         // Sync belongs to RingSync and continues when this panel is dismissed.
         .sheet(isPresented: Binding(get: { diagnosticFile != nil }, set: { if !$0 { diagnosticFile = nil } })) {
             if let diagnosticFile { DiagnosticsShare(url: diagnosticFile) }
+        }
+        .sheet(isPresented: Binding(get: { backupFile != nil }, set: { if !$0 { backupFile = nil } })) {
+            if let backupFile { DiagnosticsShare(url: backupFile) }
+        }
+        .fileImporter(isPresented: $showRestorePicker,
+                      allowedContentTypes: [.data],
+                      allowsMultipleSelection: false) { result in
+            restoreNote = restore(from: result)
+            if restoreNote?.hasPrefix("Restored") == true { onReset() }
         }
         .presentationDragIndicator(.visible)
     }
@@ -255,11 +317,35 @@ struct SyncView: View {
             .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(keyFocused ? Obs.muted : Obs.rule))
             Text(!key.isEmpty && !validKey
                  ? "Use all 32 characters: numbers 0–9 and letters A–F."
-                 : "Paste the 32-character key exported on your computer.")
+                 : "Paste the 32-character key exported on your computer, or pair a reset ring below.")
+                .font(.footnote)
+                .foregroundStyle(Obs.ink2)
+                .fixedSize(horizontal: false, vertical: true)
+            pairReset
+        }
+    }
+
+    /// Adopt a factory-reset ring without a computer: mint the key on this iPhone.
+    private var pairReset: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Button {
+                keyFocused = false
+                Task { if let minted = await ring.pair() { key = minted } }
+            } label: {
+                Label("Pair a factory-reset ring", systemImage: "key")
+                    .font(.subheadline.weight(.medium))
+                    .frame(maxWidth: .infinity, minHeight: 48)
+                    .foregroundStyle(Obs.ink)
+                    .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Obs.rule))
+            }
+            .buttonStyle(.plain)
+            .disabled(ring.busy)
+            Text("Mints a new key on this iPhone and installs it on the ring. Only works on a ring that has been factory-reset — it replaces nothing on a ring that already has a key. Reveal and write the key down afterwards: it cannot be read back off the ring.")
                 .font(.footnote)
                 .foregroundStyle(Obs.ink2)
                 .fixedSize(horizontal: false, vertical: true)
         }
+        .padding(.top, 4)
     }
 
     @ViewBuilder
@@ -359,6 +445,37 @@ struct SyncView: View {
                 }
                 SupportDivider()
                 NavigationLink {
+                    RawDataView()
+                } label: {
+                    SupportRowLabel(icon: "waveform.path.ecg", title: "Raw data & charts",
+                                    detail: "Browse every event the ring sent, and chart any field",
+                                    trailing: "chevron.right")
+                }
+                .buttonStyle(.plain)
+                SupportDivider()
+                SupportRow(icon: "arrow.down.doc", title: "Back up data",
+                           detail: "One consistent file with every event synced from the ring. The pairing key is not in it \u{2014} it stays in this iPhone's Keychain.",
+                           disabled: ring.busy) {
+                    Task {
+                        let made = await Task.detached { () -> URL? in
+                            let name = "oura-backup-\(Self.backupStamp.string(from: Date())).db"
+                            let dest = FileManager.default.temporaryDirectory
+                                .appendingPathComponent(name)
+                            do {
+                                _ = try backupDatabase(dbPath: DB.readPath(), destPath: dest.path)
+                                return dest
+                            } catch { return nil }
+                        }.value
+                        if let made { backupFile = made }
+                        else { restoreNote = "Backup failed \u{2014} nothing written." }
+                    }
+                }
+                SupportDivider()
+                SupportRow(icon: "arrow.up.doc", title: "Restore from a backup",
+                           detail: restoreNote ?? "Replace what this iPhone holds with a backup file",
+                           disabled: ring.busy) { showRestorePicker = true }
+                SupportDivider()
+                NavigationLink {
                     TechnicalReportsView(clockReport: $clockReport)
                 } label: {
                     SupportRowLabel(icon: "doc.text.magnifyingglass", title: "Technical reports",
@@ -372,6 +489,13 @@ struct SyncView: View {
                 SupportRow(icon: "trash", title: "Reset local sync data",
                            detail: "Removes saved data from this iPhone. The next sync restores what your ring still holds.",
                            tint: Obs.alert, disabled: ring.busy) { confirmReset = true }
+                SupportDivider()
+                SupportRow(icon: "exclamationmark.triangle", title: "Factory-reset the ring",
+                           detail: ring.knownSerial == nil
+                               ? "Available once this iPhone has talked to your ring."
+                               : "Wipes the ring itself, not just this phone. Pair it again afterwards \u{2014} no computer needed.",
+                           tint: Obs.alert,
+                           disabled: ring.busy || ring.knownSerial == nil || !validKey) { confirmWipeRing = true }
             }
             .background(Obs.alert.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
             .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(Obs.alert.opacity(0.18)))
@@ -937,8 +1061,10 @@ struct RootView: View {
                             SleepDebtCard(debt: debt) { showSleepDebt = true }
                         }
 
-                        if let illness = s.illness {
-                            IllnessCard(illness: illness)
+                        // Torch build: Oura's own illness model. Otherwise the shared
+                        // core's baseline comparison over the same four biomarkers.
+                        if let radar = s.symptomRadar, radar.available {
+                            IllnessCard(illness: radar)
                         }
 
                         // Cardiovascular estimates belong together: vascular age/PWV
@@ -1009,10 +1135,63 @@ struct RootView: View {
                             ObsStat(label: "nights", value: "\(s.device?.nights ?? s.nights.count)")
                         }
                         .obsCard()
+                        BuildStamp()
                     }
                 }
                 .padding(24).padding(.top, 8)
             }
+    }
+}
+
+/// Which build is actually on this phone. A sideloaded app has no App Store version
+/// to compare against, and a failed install looks exactly like a successful one — so
+/// show the version, when this binary was signed, and when its free-account
+/// certificate stops launching (7 days).
+struct BuildStamp: View {
+    private static let signedAt: Date? = {
+        guard let path = Bundle.main.executableURL?.path,
+              let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return nil }
+        return attrs[.modificationDate] as? Date
+    }()
+
+    private static let stampFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d HH:mm"
+        return f
+    }()
+
+    private static let dayFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d"
+        return f
+    }()
+
+    private var line: String {
+        let info = Bundle.main.infoDictionary
+        let short = info?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = info?["CFBundleVersion"] as? String ?? "?"
+        var out = "Open Oura \(short) (\(build)) · \(coreVersion())"
+        if let signed = Self.signedAt {
+            out += " · built \(Self.stampFormat.string(from: signed))"
+            if let expiry = Calendar.current.date(byAdding: .day, value: 7, to: signed) {
+                let days = Calendar.current.dateComponents([.day], from: Date(), to: expiry).day ?? 0
+                out += days < 0
+                    ? " · signing expired"
+                    : " · signing good to \(Self.dayFormat.string(from: expiry))"
+            }
+        }
+        return out
+    }
+
+    var body: some View {
+        Text(line)
+            .font(Obs.mono(10))
+            .foregroundStyle(Obs.ink2)
+            .multilineTextAlignment(.center)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .padding(.top, 6)
+            .textSelection(.enabled)
     }
 }
 

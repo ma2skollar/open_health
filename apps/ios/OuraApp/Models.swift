@@ -45,9 +45,79 @@ struct NightRow: Codable, Identifiable {
     var wake_pct: Double?; var efficiency: Double?
     var stages: [Int]? = nil
     var series: NightSeries? = nil
+    /// Nightly respiratory rate (breaths/min), the ring's own per-window estimate.
+    var breath_rate: Double? = nil
+    var sleep_score: SleepScore? = nil
     var id: String { (date ?? "") + (start ?? "") }
     var hasHypnogram: Bool { (stages?.count ?? 0) > 1 }
 }
+/// One component of the literature-based sleep score, with the paper behind it.
+struct SleepScoreComponent: Codable, Identifiable {
+    var key: String
+    var score: Double
+    var weight: Double
+    var detail: [String: JSONValue]?
+    var id: String { key }
+    var label: String {
+        switch key {
+        case "duration": return "duration"
+        case "efficiency": return "efficiency"
+        case "onset_latency": return "time to fall asleep"
+        case "waso": return "awake during the night"
+        case "awakenings": return "awakenings"
+        case "architecture": return "stage balance"
+        case "physiology": return "heart & HRV"
+        default: return key
+        }
+    }
+    var source: String? {
+        if case .string(let text)? = detail?["source"] { return text }
+        return nil
+    }
+}
+
+/// A sleep score computed from published norms rather than from Oura's model — every
+/// threshold in it traces to a paper. See `oura-summary/src/sleep_score.rs`.
+struct SleepScore: Codable {
+    var score: Double
+    var components: [SleepScoreComponent] = []
+    var basis: String?
+}
+
+/// Minimal JSON value, so a component's `detail` can be carried through and read
+/// without the app needing to know every key the Rust side might add.
+enum JSONValue: Codable {
+    case string(String), number(Double), bool(Bool), array([JSONValue]), null
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if c.decodeNil() { self = .null }
+        else if let v = try? c.decode(Bool.self) { self = .bool(v) }
+        else if let v = try? c.decode(Double.self) { self = .number(v) }
+        else if let v = try? c.decode(String.self) { self = .string(v) }
+        else if let v = try? c.decode([JSONValue].self) { self = .array(v) }
+        else { self = .null }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        switch self {
+        case .string(let v): try c.encode(v)
+        case .number(let v): try c.encode(v)
+        case .bool(let v): try c.encode(v)
+        case .array(let v): try c.encode(v)
+        case .null: try c.encodeNil()
+        }
+    }
+    var text: String {
+        switch self {
+        case .string(let v): return v
+        case .number(let v): return v == v.rounded() ? String(Int(v)) : String(format: "%.1f", v)
+        case .bool(let v): return v ? "yes" : "no"
+        case .array(let v): return v.map(\.text).joined(separator: "–")
+        case .null: return "—"
+        }
+    }
+}
+
 struct DailyStat: Codable { var active_kcal: Double?; var total_kcal: Double?; var steps: Double?; var distance_m: Double? }
 struct Profile: Codable { var sex: String?; var age: Double?; var height_m: Double?; var weight_kg: Double?; var ring_size: Double? }
 // a detected activity session (on-device automatic_activity_detection)
@@ -132,7 +202,10 @@ struct Summary: Codable {
     var cardio: Cardio?
     var fitness: Fitness?
     var sleepDebt: SleepDebtSummary?
-    var illness: IllnessResult?           // on-device only (Symptom Radar; not in the JSON)
+    var illness: IllnessResult?           // on-device only (torch Symptom Radar; not in the JSON)
+    /// Model-free Symptom Radar from the shared core — same biomarkers, same shape,
+    /// judged against your own baseline. Used when the torch model is not present.
+    var symptoms: IllnessResult?
     var workouts: [WorkoutSession] = []   // on-device only (not in the JSON)
     var modelErrors: [String] = []        // on-device model failures (not in the JSON)
     var error: String?
@@ -140,6 +213,7 @@ struct Summary: Codable {
     // out of decoding.
     enum CodingKeys: String, CodingKey {
         case digest, device, nights, vitals, activity_profile, activity_daily, profile, cardio, fitness, error
+        case symptoms
         case sleepDebt = "sleep_debt"
     }
     /// recent days (newest first) that have a movement profile.
@@ -147,6 +221,13 @@ struct Summary: Codable {
 }
 
 extension Summary {
+    /// Whichever Symptom Radar this build has: the on-device torch model when the
+    /// `.ptl` is bundled, the shared core's baseline comparison otherwise.
+    var symptomRadar: IllnessResult? {
+        if let illness, illness.available { return illness }
+        return symptoms
+    }
+
     // The calendar date you WOKE from a night. Nights are labelled by onset date (the
     // evening you went to bed), so an overnight sleep crossing midnight belongs to the
     // next day's morning. Pairing a day with the sleep you woke from — not the sleep you
@@ -230,7 +311,7 @@ enum VitalKind: String, Identifiable, CaseIterable {
     var caption: String {
         switch self {
         case .hrv: return "RMSSD from the longest sleep of each morning"
-        case .heartRate: return "Nightly minimum resting heart rate"
+        case .heartRate: return "Hour by hour from the beats the ring recorded, plus the nightly minimum resting rate"
         case .temp: return "Nightly skin temperature"
         case .oxygen: return "Nightly average blood oxygen"
         }

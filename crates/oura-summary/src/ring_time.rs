@@ -69,7 +69,7 @@ pub(crate) struct Resolved {
 }
 
 /// Maps the ring's rebooting relative clock onto UTC.
-pub(crate) struct RingClock {
+pub struct RingClock {
     epochs: Vec<Epoch>,
     // `(unix * 10 - ring_ds, epoch index)`: the UTC projection offset in deciseconds
     // of every anchor, sorted by offset so replay recovery can find the newest
@@ -88,7 +88,7 @@ fn anchor_source(tag: u8, value: &Value) -> &'static str {
 }
 
 impl RingClock {
-    pub(crate) fn from_events(events: &[(i64, u8, String, i64)]) -> Self {
+    pub fn from_events(events: &[(i64, u8, String, i64)]) -> Self {
         let mut epochs: Vec<Epoch> = Vec::new();
         // Store::decoded_events preserves `(captured_unix, insertion id)` order.
         // The id tie-breaker matters: a full-history drain inserts thousands of
@@ -145,7 +145,7 @@ impl RingClock {
         }
     }
 
-    pub(crate) fn unix_s(&self, ds: i64, captured_unix: i64) -> f64 {
+    pub fn unix_s(&self, ds: i64, captured_unix: i64) -> f64 {
         self.resolve(ds, captured_unix).unix
     }
 
@@ -220,7 +220,7 @@ impl RingClock {
         }
     }
 
-    pub(crate) fn latest_unix(&self) -> i64 {
+    pub fn latest_unix(&self) -> i64 {
         self.epochs
             .iter()
             .flat_map(|e| e.anchors.iter().map(|(_, unix)| *unix))

@@ -301,6 +301,16 @@ void*_Nonnull uniffi_oura_core_fn_constructor_ringsession_new(uint64_t writer, R
 void uniffi_oura_core_fn_method_ringsession_cancel(void*_Nonnull ptr, RustBuffer reason, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_FACTORY_RESET
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_FACTORY_RESET
+uint64_t uniffi_oura_core_fn_method_ringsession_factory_reset(void*_Nonnull ptr, RustBuffer key_hex, RustBuffer confirm_serial
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PAIR
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PAIR
+uint64_t uniffi_oura_core_fn_method_ringsession_pair(void*_Nonnull ptr, RustBuffer existing_key_hex
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PUSH_FRAME
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_METHOD_RINGSESSION_PUSH_FRAME
 void uniffi_oura_core_fn_method_ringsession_push_frame(void*_Nonnull ptr, RustBuffer data, RustCallStatus *_Nonnull out_status
@@ -321,6 +331,11 @@ void uniffi_oura_core_fn_init_callback_vtable_blewriter(UniffiVTableCallbackInte
 void uniffi_oura_core_fn_init_callback_vtable_syncprogresslistener(UniffiVTableCallbackInterfaceSyncProgressListener* _Nonnull vtable
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_BACKUP_DATABASE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_BACKUP_DATABASE
+uint64_t uniffi_oura_core_fn_func_backup_database(RustBuffer db_path, RustBuffer dest_path, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_CORE_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_CORE_VERSION
 RustBuffer uniffi_oura_core_fn_func_core_version(RustCallStatus *_Nonnull out_status
@@ -332,9 +347,19 @@ RustBuffer uniffi_oura_core_fn_func_core_version(RustCallStatus *_Nonnull out_st
 RustBuffer uniffi_oura_core_fn_func_database_integrity(RustBuffer db_path, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EVENTS_JSON
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EVENTS_JSON
+RustBuffer uniffi_oura_core_fn_func_events_json(RustBuffer db_path, RustBuffer name_filter, uint32_t limit, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EXPORT_DATABASE
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_EXPORT_DATABASE
 void uniffi_oura_core_fn_func_export_database(RustBuffer db_path, RustBuffer out_path, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_HOURLY_HR_JSON
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_HOURLY_HR_JSON
+RustBuffer uniffi_oura_core_fn_func_hourly_hr_json(RustBuffer db_path, int64_t tz_offset, uint32_t days, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_FN_FUNC_QUICK_SUMMARY_JSON
@@ -632,6 +657,12 @@ void ffi_oura_core_rust_future_free_void(uint64_t handle
 void ffi_oura_core_rust_future_complete_void(uint64_t handle, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_BACKUP_DATABASE
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_BACKUP_DATABASE
+uint16_t uniffi_oura_core_checksum_func_backup_database(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_CORE_VERSION
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_CORE_VERSION
 uint16_t uniffi_oura_core_checksum_func_core_version(void
@@ -644,9 +675,21 @@ uint16_t uniffi_oura_core_checksum_func_database_integrity(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_EVENTS_JSON
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_EVENTS_JSON
+uint16_t uniffi_oura_core_checksum_func_events_json(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_EXPORT_DATABASE
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_EXPORT_DATABASE
 uint16_t uniffi_oura_core_checksum_func_export_database(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_HOURLY_HR_JSON
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_FUNC_HOURLY_HR_JSON
+uint16_t uniffi_oura_core_checksum_func_hourly_hr_json(void
     
 );
 #endif
@@ -671,6 +714,18 @@ uint16_t uniffi_oura_core_checksum_func_summary_json(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_CANCEL
 #define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_CANCEL
 uint16_t uniffi_oura_core_checksum_method_ringsession_cancel(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_FACTORY_RESET
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_FACTORY_RESET
+uint16_t uniffi_oura_core_checksum_method_ringsession_factory_reset(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_PAIR
+#define UNIFFI_FFIDEF_UNIFFI_OURA_CORE_CHECKSUM_METHOD_RINGSESSION_PAIR
+uint16_t uniffi_oura_core_checksum_method_ringsession_pair(void
     
 );
 #endif
