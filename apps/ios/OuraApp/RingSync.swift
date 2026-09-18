@@ -460,7 +460,6 @@ final class RingSync: ObservableObject {
     }
 
     /// Connect, wire the inbound-frame pump, and run a full sync into the writable DB.
-    @discardableResult
     private func rememberSerial(_ serial: String) {
         guard !serial.isEmpty, serial != "unknown" else { return }
         knownSerial = serial
@@ -597,6 +596,7 @@ final class RingSync: ObservableObject {
         }
     }
 
+    @discardableResult
     func run(keyHex: String, maxAttempts: Int = 6, source: String = "manual") async -> SyncReport? {
         guard !busy else { return nil }
         connectionIssue = nil

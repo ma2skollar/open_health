@@ -12,7 +12,7 @@ and on-device analysis.
   <img src="docs/screenshots/activity.png" width="32%" alt="Activity report with movement, steps and workouts" />
 </p>
 
-<p align="center"><sub>iOS · Overview, sleep and activity · Real data from a Ring 4, July 2026</sub></p>
+<p align="center"><sub>iOS · Overview, sleep and activity · Real data from a Ring 5, July 2026</sub></p>
 
 The web dashboard also brings together local blood reports and DNA analysis.
 Ring communication and portable algorithms are powered by
