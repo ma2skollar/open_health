@@ -2,7 +2,7 @@
 
 `overview.png`, `sleep.png`, and `activity.png` were captured on September 16,
 2026 from the production SwiftUI app on the iPhone 17 Pro simulator (iOS 26.5,
-dark appearance), running against the author's own Ring 4 data as synced to
+dark appearance), running against the author's own Ring 5 data as synced to
 the local store (last sync July 17, 2026). No ring identifiers or keys are
 shown. Images are unretouched simulator screenshots, opened with the
 `-openDay` launch argument.
