@@ -1,4 +1,4 @@
-# open_oura — iOS app · Goal
+# open_health — iOS app · Goal
 
 A native iOS client to the same local Rust core as the web dashboard. Same data,
 same numbers — a **calm, instrument-grade** reading of your ring, with a quiet

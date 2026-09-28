@@ -1,6 +1,6 @@
 # Two clients, one core — keep them in sync
 
-open_oura has **two user-facing clients that render the same health data**. When you
+open_health has **two user-facing clients that render the same health data**. When you
 add or change a feature, you almost always have to touch **both**. This is the map.
 
 | | Web dashboard | Native iOS app |

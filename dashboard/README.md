@@ -1,4 +1,4 @@
-# open_oura web dashboard
+# open_health web dashboard
 
 A local, single-page health dashboard that turns your synced ring data into the
 few numbers that matter. Follows the product vision in

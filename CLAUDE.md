@@ -1,8 +1,11 @@
-# open_oura — repo guide for agents
+# open_health — repo guide for agents
 
-Independent, cloud-free client for the Oura ring: BLE sync + decode in Rust, the daily
-health computations in Rust, the ML models (sleep / CVA / activity) as decrypted
-TorchScript. See `README.md` and `docs/` for the reverse-engineering details.
+Local-first health apps (native iOS app + web dashboard) for the Oura ring, built on
+[open_oura](https://github.com/Th0rgal/open_oura), which owns the BLE protocol, sync,
+decoders and ported algorithms (pulled in as git dependencies). This repo holds the
+shared summary brain, the two clients, blood/DNA analysis, and the ML model runners
+(sleep / CVA / activity / illness) as decrypted TorchScript. For reverse-engineering
+details, see open_oura's `docs/`.
 
 ## ⚠️ Two clients render the same data — keep them in sync
 
