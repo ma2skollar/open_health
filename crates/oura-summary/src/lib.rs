@@ -17,6 +17,9 @@ pub mod ring_time;
 pub mod sleep_score;
 pub mod symptoms;
 
+/// An unanchored ring-clock epoch at least this long is worth a warning.
+const UNANCHORED_WARN_H: f64 = 12.0;
+
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1993,15 +1996,40 @@ pub fn build_summary(db: &Path, tz: i64, runner: &dyn ModelRunner) -> Result<Val
 
     let mut clock_diag = clock.diagnostics();
     clock_diag["undated_nights"] = json!(undated_nights);
-    clock_diag["warnings"] = json!(if undated_nights.is_empty() {
-        Vec::<String>::new()
-    } else {
-        vec![format!(
+    let mut clock_warnings: Vec<String> = Vec::new();
+    if !undated_nights.is_empty() {
+        clock_warnings.push(format!(
             "{} night(s) could not be placed in time because the ring's clock was not \
              synced for that period. They are hidden until the next sync anchors them.",
             undated_nights.len()
-        )]
-    });
+        ));
+    }
+    // A Gen 3 barely declares bedtime periods, so an unanchored boot can hide every
+    // night without producing a single undated one above. Say so from the clock
+    // itself: whole days of history with no time anchor at all.
+    let unanchored_h: f64 = clock_diag["epochs"]
+        .as_array()
+        .map(|epochs| {
+            epochs
+                .iter()
+                .filter(|e| e["anchors"].as_u64() == Some(0))
+                .filter_map(|e| e["span_h"].as_f64())
+                .filter(|&h| h >= UNANCHORED_WARN_H)
+                .sum()
+        })
+        .unwrap_or(0.0);
+    if unanchored_h > 0.0 && undated_nights.is_empty() {
+        clock_warnings.push(format!(
+            "About {} of ring history has no time anchor, so it cannot be placed on the \
+             calendar. Sync again (the sync sets the ring's clock) to date it.",
+            if unanchored_h >= 48.0 {
+                format!("{:.0} days", unanchored_h / 24.0)
+            } else {
+                format!("{unanchored_h:.0} hours")
+            }
+        ));
+    }
+    clock_diag["warnings"] = json!(clock_warnings);
 
     Ok(json!({
         "generated_at": now,

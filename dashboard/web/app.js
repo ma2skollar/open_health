@@ -163,7 +163,7 @@ function renderTiles(d) {
       status: diff < -0.5 ? { label: "Younger", kind: "ok" } : diff > 0.5 ? { label: "Older", kind: "warn" } : { label: "In line", kind: "neutral" },
     }));
   } else {
-    box.append(metricCard("Vascular age", "—", "", { sub: "needs cva_ppg on" }));
+    box.append(metricCard("Vascular age", "—", "", { sub: cvaMissing(d).short }));
   }
 }
 
@@ -294,8 +294,27 @@ function renderDay(d) {
   const box = $("day");
   box.innerHTML = "";
   const days = dayKeys(d);
+  // Nights the shared brain withheld because the ring clock was not anchored for
+  // that boot (same notice as the iOS home). They come back once a sync anchors them.
+  const clockWarnings = d.clock?.warnings || [];
+  const unanchored = (d.clock?.epochs || []).some((e) => !e.anchors);
+  const clockNote = () => {
+    if (!clockWarnings.length && !unanchored) return null;
+    const note = el("div", "clock-note");
+    note.append(el("div", "clock-note-title", "Ring clock"));
+    for (const w of clockWarnings) note.append(el("p", null, esc(w)));
+    if (unanchored && !clockWarnings.length) {
+      note.append(el("p", null, "Part of the ring's history has no time anchor, so it cannot be placed on the calendar yet."));
+    }
+    note.append(el("p", "clock-note-fix", "Run <code>oura sync</code> again (it now sets the ring's clock) to date it."));
+    return note;
+  };
   if (!days.length) {
-    box.append(el("div", "error", "No days yet. Wear the ring and sync."));
+    box.append(el("div", "error", unanchored || clockWarnings.length
+      ? "No dated days yet: the ring's clock hasn't been synced for this data."
+      : "No days yet. Wear the ring and sync."));
+    const note = clockNote();
+    if (note) box.append(note);
     $("sleep-legend").hidden = true;
     return;
   }
@@ -308,6 +327,8 @@ function renderDay(d) {
     btn.addEventListener("click", () => openDaysBrowser(d, days));
     box.append(btn);
   }
+  const note = clockNote();
+  if (note) box.append(note);
 }
 
 const debtDuration = (minutes) => {
@@ -387,21 +408,36 @@ const BIOMARKER_UNIT = {
   AverageBreath: " br/min", LowestHeartRate: " bpm", AverageHrv: " ms", TemperatureDeviation: "°C",
 };
 
+const cvaMissing = (d) => {
+  const gated = (d.device?.insights || []).find((i) => i.name === "Cardiovascular age")?.status === "gated";
+  return gated
+    ? { short: "needs cva_ppg on", long: "Cardiovascular age needs the cva_ppg feature on. Enable it, then sync overnight." }
+    : { short: "needs the CVA model", long: "Cardiovascular age needs the CVA model runner (Python + tools/run_cva_model.py); the ring's PPG data is already there." };
+};
+
 function renderIllness(d) {
   const box = $("illness");
   box.innerHTML = "";
-  const ill = d.illness;
-  if (!ill) { box.append(el("div", "error", "Symptom radar needs the model runner (desktop dashboard).")); return; }
+  // Oura's model when the Python runner produced it, otherwise the shared core's
+  // model-free radar (same choice as the iOS app's `symptomRadar`).
+  const fromModel = !!d.illness?.available;
+  const ill = fromModel ? d.illness : (d.symptoms || d.illness);
+  if (!ill) { box.append(el("div", "error", "Symptom radar needs a few nights of sleep data.")); return; }
+  // The runner emits snake_case, the core camelCase.
+  const trafficLight = ill.traffic_light ?? ill.trafficLight;
+  const daysWithData = ill.days_with_data ?? ill.daysWithData;
   if (!ill.available) {
     const why = ill.status === "MISSING_LAST_NIGHT_SLEEP" ? "Last night's sleep is missing — wear the ring overnight and sync."
-      : ill.status === "MISSING_SLEEP_DATA" ? "Too many recent nights are missing (needs ≥ 7 of the last 14)."
+      : ill.status === "MISSING_SLEEP_DATA" ? (fromModel || d.illness
+        ? "Too many recent nights are missing (needs ≥ 7 of the last 14)."
+        : "Needs at least 7 nights of sleep to learn your baseline.")
       : "Not enough history yet.";
     box.append(el("div", "error", why));
     return;
   }
-  const light = ILLNESS_LIGHT[ill.traffic_light] || "ok";
+  const light = ILLNESS_LIGHT[trafficLight] || "ok";
   const head = el("div", `il-status il-${light}`);
-  const label = ill.traffic_light === "NO_SIGNS" ? "No signs" : ill.traffic_light === "MINOR_SIGNS" ? "Minor signs" : "Major signs";
+  const label = { NO_SIGNS: "No signs", MINOR_SIGNS: "Minor signs", MAJOR_SIGNS: "Major signs" }[trafficLight] || "No result yet";
   head.innerHTML = `<span class="il-dot"></span><span class="il-label">${label}</span>`;
   box.append(head);
   const flagged = (ill.biomarkers || []).filter((b) => b.indicatesSymptoms);
@@ -423,7 +459,8 @@ function renderIllness(d) {
     }
     box.append(list);
   }
-  box.append(el("div", "il-foot", `On-device illness model · ${ill.days_with_data} of 30 days · ${esc(ill.date)}`));
+  const basis = fromModel ? `On-device illness model · ${daysWithData} of 30 days` : `Compared with your own baseline · ${daysWithData} nights`;
+  box.append(el("div", "il-foot", `${basis} · ${esc(ill.date)}`));
 }
 
 function renderCardio(d) {
@@ -434,7 +471,7 @@ function renderCardio(d) {
   // VO₂max is model-free (from demographics), so it shows even without the CVA model.
   const vo2Kv = vo2 != null ? el("div", "kv", `<div class="k">VO₂max estimate</div><div class="v">${vo2} ml/kg/min</div>`) : null;
   if (!cv || cv.vascular_age == null) {
-    box.append(el("div", "error", "Cardiovascular age needs the cva_ppg feature on. Enable it, then sync overnight."));
+    box.append(el("div", "error", cvaMissing(d).long));
     if (vo2Kv) { const kvs = el("div", "kvs"); kvs.append(vo2Kv); box.append(kvs); }
     return;
   }

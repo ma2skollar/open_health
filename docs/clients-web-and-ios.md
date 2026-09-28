@@ -149,6 +149,19 @@ hair. We expose per-stage means (esp. deep-sleep HRV) rather than an overnight H
 nocturnal HRV is stage-driven (deep ↑, REM ↓), so a slope tracks stage order, not recovery —
 which is why Oura's own app has no per-night HRV trend either.
 
+## Known gaps (iOS-only, not yet on the web)
+
+Now on both: the model-free Symptom Radar (`symptoms`, used when the Python runner
+has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only:
+
+- **Sleep report without a hypnogram**: iOS still draws the time-in-bed strip and the
+  signal lanes; the web returns early.
+- **Sleep score + breathing rate** (`nights[].sleep_score`, `breath_rate`).
+- **Skin temperature / latest HR vitals and trend pages**, **hourly heart rate**
+  (`hourly_hr` is FFI-only; no `/api` endpoint yet).
+- **Symptom Radar details**: all four biomarkers with their personal band
+  (`lower`/`upper`); the web lists only the flagged ones.
+
 ## Known gaps (web-only, not yet on iOS)
 
 - **Advanced & debugging**: on-ring feature toggles (`/api/feature`) and the per-type
