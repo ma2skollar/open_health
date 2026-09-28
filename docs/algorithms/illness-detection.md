@@ -95,6 +95,14 @@ proven three ways inside the graph:
   (indices 5-29). Empirically verified: modifying index 0 shifts the compared value;
   the mean/std window is rows 5-29 only.
 
+**Activity is lagged one day.** The sleep series at a given position is that day's
+longest sleep, but `sedentary_time` / `resting_time` at the same position are the
+`DbDailyActivity` of the **previous** day (`activityMap.get(day.minusDays(1))` in
+`symptomradar/model/a.smali`, method `a(...)`, ~l.788-835; the DB query window starts
+30 days back for that reason). So index 0 = last night's sleep + yesterday's full day of
+activity. Feeding the wake day's partial morning instead (≈0 sedentary) shifts the score
+by 0.1-0.4 on real data.
+
 **Missing days:** encode as `NaN`. `_normalize` maps NaN (and out-of-range) to 0.5 after
 scaling; a separate NaN-mask channel is fed to the network; `nanmean`/`nanstd` skip NaN
 in biomarker baselines. **Hard requirements:** today's temperature deviation (index 0)

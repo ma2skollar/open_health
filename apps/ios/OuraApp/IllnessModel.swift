@@ -116,7 +116,7 @@ enum IllnessModel {
             }
         }
         guard let latestWake else { return (nil, nil) }
-        let cutoff = Double(latestWake - nDays - 1) * self.day - tz
+        let cutoff = Double(latestWake - nDays - 2) * self.day - tz  // one extra day: activity is lagged
         // Only the tags below feed the model; letting SQLite skip the rest avoids
         // decoding two million rows of unrelated JSON.
         let relevant = events.restricted("tag IN (68,96,113,93,70,105,117,118,80)")
@@ -217,8 +217,11 @@ enum IllnessModel {
         let finiteSkin = skin.filter { $0.isFinite }
         let baseTemp = finiteSkin.isEmpty ? Double.nan : median(finiteSkin)
         let tempDev = skin.map { $0.isFinite && baseTemp.isFinite ? Float($0 - baseTemp) : .nan }
-        let sedC = (0..<nDays).map { i in sed[anchor - i].map { Float($0) } ?? .nan }
-        let restC = (0..<nDays).map { i in rest[anchor - i].map { Float($0) } ?? .nan }
+        // Oura pairs each night with the full day *before* it (`activityMap.get(day.minusDays(1))`
+        // in the Symptom Radar input builder). Using the wake day itself fed the model a
+        // near-empty morning, which drags the score down on exactly the nights that matter.
+        let sedC = (0..<nDays).map { i in sed[anchor - i - 1].map { Float($0) } ?? .nan }
+        let restC = (0..<nDays).map { i in rest[anchor - i - 1].map { Float($0) } ?? .nan }
 
         // 301/302 guards (mirror the model's input validator)
         if !tempDev[0].isFinite {

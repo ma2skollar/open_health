@@ -600,7 +600,13 @@ struct IllnessCard: View {
     }
     private var explanation: String {
         switch illness.status {
-        case "NO_SIGNS": return "Your overnight biometrics are within their usual ranges."
+        case "NO_SIGNS":
+            // The decision comes from the model's overall score, not a count of flags:
+            // a night can have biometrics out of range and still not add up to strain.
+            let flagged = illness.biomarkers.filter(\.indicatesSymptoms).count
+            return flagged == 0
+                ? "Your overnight biometrics are within their usual ranges."
+                : "\(flagged == 1 ? "One overnight biometric is" : "\(flagged) overnight biometrics are") outside your usual range, but together they don’t match the pattern of your body fighting something."
         case "MINOR_SIGNS": return "Some overnight biometrics are outside your usual ranges."
         case "MAJOR_SIGNS": return "Several overnight biometrics are outside your usual ranges."
         case "MISSING_LAST_NIGHT_SLEEP": return "Wear your ring overnight, then sync to see your latest result."

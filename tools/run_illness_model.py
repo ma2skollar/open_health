@@ -183,8 +183,10 @@ def series(per_day, sed, rest, anchor):
     # nightly temp deviation vs personal baseline (median of available skin temps)
     base_temp = np.nanmedian(skin) if np.isfinite(skin).any() else nan
     temp_dev = (skin - base_temp).reshape(N_DAYS, 1).astype(np.float32)
-    sed_c = col(lambda d: float(sed.get(d, nan)))
-    rest_c = col(lambda d: float(rest.get(d, nan)))
+    # Oura pairs each night with the full day before it (activityMap.get(day.minusDays(1))),
+    # not the wake day's partial morning — see illness-detection.md §2.
+    sed_c = col(lambda d: float(sed.get(d - 1, nan)))
+    rest_c = col(lambda d: float(rest.get(d - 1, nan)))
     return breath, avg_hr, low_hr, hrv, temp_dev, sed_c, rest_c, skin, base_temp
 
 

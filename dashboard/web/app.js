@@ -404,9 +404,14 @@ function renderIllness(d) {
   const label = ill.traffic_light === "NO_SIGNS" ? "No signs" : ill.traffic_light === "MINOR_SIGNS" ? "Minor signs" : "Major signs";
   head.innerHTML = `<span class="il-dot"></span><span class="il-label">${label}</span>`;
   box.append(head);
-  box.append(el("p", "il-copy", ILLNESS_COPY[ill.status] || ""));
-
   const flagged = (ill.biomarkers || []).filter((b) => b.indicatesSymptoms);
+  // The decision is the model's overall score, not a count of flags: a night can have
+  // biometrics out of range and still not add up to strain.
+  const copy = ill.status === "NO_SIGNS" && flagged.length
+    ? `No signs of illness. ${flagged.length === 1 ? "One biometric is" : `${flagged.length} biometrics are`} outside your usual range, but together they don't match the pattern of your body fighting something.`
+    : ILLNESS_COPY[ill.status] || "";
+  box.append(el("p", "il-copy", copy));
+
   if (flagged.length) {
     const list = el("div", "il-biomarkers");
     for (const b of flagged) {
