@@ -57,11 +57,21 @@ struct NightRow: Codable, Identifiable {
     var stages: [Int]? = nil
     var stages_full: [Int]? = nil
     var staging_source: String? = nil
+    /// The official app's main chart: 30 s stages folded into 5-minute blocks.
+    var stages_5min: [Int]? = nil
+    /// Wall-clock start (unix s) of the first NSSA epoch.
+    var stages_t0_unix: Double? = nil
     var staging_coverage_pct: Double? = nil
     var staging_complete: Bool? = nil
     var captured_unix: Int64? = nil
     var stagingKey: String { "\(start_ds ?? 0):\(start_unix ?? captured_unix ?? 0)" }
     var hypnogram: [Int]? { stages_full ?? stages }
+    /// Stages for metrics: Oura's hypnograms verbatim, our signal estimate smoothed
+    /// (mirrors oura-summary's is_oura_staging / smooth_stages split).
+    var analysisStages: [Int] {
+        let st = hypnogram ?? []
+        return Sleep.isOuraStaging(staging_source) ? st : Sleep.smooth(st, 5)
+    }
     var stagingComplete: Bool { staging_complete ?? (hypnogram?.allSatisfy { (1...4).contains($0) } ?? false) }
     var durationS: Double {
         if let start_unix, let end_unix { return Double(end_unix - start_unix) }
