@@ -140,7 +140,10 @@ summary JSON; iOS recomputes from the
 **on-device** SleepNet hypnogram (`NightRow.stages`), because iOS runs `build_summary` with
 `NoModelRunner` (no server-side staging), so the FFI `stages_full`/`metrics` are empty there.
 The raw signal series (`nights[].series`) DO come from the FFI on both. If you change the
-smoothing window or a metric definition, change **both** implementations.
+smoothing window or a metric definition, change **both** implementations. Oura's own stagings
+(`staging_source` `nssa` or `ring`) are never smoothed or deep-refined (`is_oura_staging` /
+`Sleep.isOuraStaging`); only the signal-derived estimate is. Both clients also draw
+`stages_5min`, the official app's 5-minute chart (`aggregate_30s_to_5min` / `Sleep.aggregate5Min`).
 
 **Autonomic-by-stage** (mean HR/HRV per sleep stage) is the same story: Rust
 `autonomic_by_stage` fills `nights[].autonomic` for the web; iOS recomputes in Swift
