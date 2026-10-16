@@ -1819,6 +1819,44 @@ fn feat(name: &str, on: bool, feature: &str) -> Value {
 /// Mode filter over a centered odd window — removes single-epoch flicker from the
 /// model hypnogram so cycle/awakening counts reflect real architecture, not 30 s noise
 /// (clinical scoring smooths the same way before deriving events).
+/// Hypnograms that come from Oura's own staging and must be shown as-is:
+/// `nssa` (the official app's sleepstaging model) and `ring` (the ring's own
+/// `sleep_phase_data`). Mirrors `Sleep.isOuraStaging` in Reports.swift.
+pub fn is_oura_staging(source: Option<&str>) -> bool {
+    matches!(source, Some("nssa") | Some("ring"))
+}
+
+/// Android `SleepPhaseConverter.aggregate30SecTo5Min` (7.18.0), what the official
+/// sleep chart draws: drop codes outside 1..=4, cut into 10-epoch windows (the last
+/// one partial), skip windows under 5 epochs, AWAKE when it holds >= 4 awake epochs,
+/// otherwise the most frequent stage with ties going AWAKE > DEEP > REM > LIGHT.
+/// Mirrors `Sleep.aggregate5Min` in Reports.swift.
+pub fn aggregate_30s_to_5min(stages: &[i64]) -> Vec<i64> {
+    let codes: Vec<i64> = stages
+        .iter()
+        .copied()
+        .filter(|c| (1..=4).contains(c))
+        .collect();
+    codes
+        .chunks(10)
+        .filter(|w| w.len() >= 5)
+        .map(|w| {
+            let mut counts = [0usize; 5];
+            for &c in w {
+                counts[c as usize] += 1;
+            }
+            if counts[4] >= 4 {
+                return 4;
+            }
+            let max = counts[1..].iter().copied().max().unwrap_or(0);
+            [4, 1, 3, 2]
+                .into_iter()
+                .find(|&c| counts[c as usize] >= max)
+                .unwrap_or(4)
+        })
+        .collect()
+}
+
 fn smooth_stages(vals: &[i64], win: usize) -> Vec<i64> {
     if vals.len() < win || win < 3 {
         return vals.to_vec();
@@ -2404,10 +2442,19 @@ pub fn build_summary(
             .and_then(|h| h["stages"].as_array())
             .map(|s| s.iter().filter_map(|x| x.as_i64()).collect())
             .unwrap_or_default();
-        // smooth once (≈2.5 min window) — used for the displayed hypnogram AND the
-        // derived metrics, so the two always agree.
-        let mut full_stages = smooth_stages(&raw_stages, 5);
-        if !full_stages.is_empty()
+        // Oura's own hypnograms (NSSA on the phone, or the ring's sleep_phase_data) are
+        // shown verbatim: the official app neither smooths them again nor invents deep
+        // sleep. Only our signal-derived estimate gets the ≈2.5 min majority filter and
+        // the N3 recovery, for the displayed hypnogram AND the derived metrics alike.
+        let staging_source = hyp.and_then(|h| h["source"].as_str());
+        let oura_stages = is_oura_staging(staging_source);
+        let mut full_stages = if oura_stages {
+            raw_stages.clone()
+        } else {
+            smooth_stages(&raw_stages, 5)
+        };
+        if !oura_stages
+            && !full_stages.is_empty()
             && !full_stages.contains(&1)
             && hyp.and_then(|h| h["deep_pct"].as_f64()).unwrap_or(0.0) == 0.0
             && nt.hr_t.len() >= 12
@@ -2506,7 +2553,14 @@ pub fn build_summary(
             None
         };
         let wake_ymd = Some(ymd_label(end_unix, tz));
-        nights_json.push(json!({
+        // The official app's main hypnogram: the 30 s stages folded into 5-minute
+        // blocks (Android `SleepPhaseConverter.aggregate30SecTo5Min`).
+        let stages_5min = (oura_stages && !full_stages.is_empty())
+            .then(|| aggregate_30s_to_5min(&full_stages));
+        // Wall-clock start (unix s) of stages_full[0] when the stager reports it: NSSA
+        // epochs sit on the 30 s grid floor30(bedtime start), not on start_ds.
+        let stages_t0_unix = hyp.and_then(|h| h["stages_t0_unix"].as_f64());
+        let mut night_json = json!({
             "date": date_label(start_unix, tz),
             "ymd": ymd_label(start_unix, tz),
             // The morning you woke up: what the apps group a night under. Computed
@@ -2538,7 +2592,7 @@ pub fn build_summary(
             "wake_pct": wake_pct_val,
             "efficiency": hyp.map(|h| h["efficiency_pct"].clone()),
             "stages": stage_cells,
-            "staging_source": hyp.and_then(|h| h["source"].as_str()),
+            "staging_source": staging_source,
             "staging_coverage_pct": coverage_pct,
             "staging_complete": complete_staging,
             "captured_unix": nt.captured_unix,
@@ -2585,7 +2639,10 @@ pub fn build_summary(
                 age: demo.age,
             }) } else { Value::Null },
             "breath_rate": night_breath.map(|b| (b * 10.0).round() / 10.0),
-        }));
+        });
+        night_json["stages_5min"] = json!(stages_5min);
+        night_json["stages_t0_unix"] = json!(stages_t0_unix);
+        nights_json.push(night_json);
         if is_main_sleep {
             if let Some(lowest) = raw_lowest_hr {
                 prior_main_rhr.push((end_unix, lowest));
@@ -3156,6 +3213,33 @@ mod tests {
         let compact = downsample_codes(&smoothed, 120);
         assert!(compact[..60].iter().all(|&c| c == 0));
         assert_eq!(sleep_metrics(&smoothed, 8.0 * 3600.0), (Value::Null, 0));
+    }
+
+    #[test]
+    fn five_minute_blocks_follow_the_android_converter() {
+        // 4 awake epochs force AWAKE even when light dominates.
+        assert_eq!(aggregate_30s_to_5min(&[2, 2, 2, 2, 2, 2, 4, 4, 4, 4]), vec![4]);
+        // ties go AWAKE > DEEP > REM > LIGHT; 3 awake epochs do not force AWAKE.
+        assert_eq!(aggregate_30s_to_5min(&[2, 2, 2, 1, 1, 1, 4, 4, 4, 3]), vec![4]);
+        assert_eq!(aggregate_30s_to_5min(&[2, 2, 2, 1, 1, 1, 4, 4, 3, 3]), vec![1]);
+        assert_eq!(aggregate_30s_to_5min(&[2, 2, 2, 2, 3, 3, 3, 3, 1, 4]), vec![3]);
+        // a trailing window keeps >= 5 epochs, shorter tails are dropped, and
+        // unknown (0) epochs are removed before windowing like Character.digit-less
+        // codes on Android.
+        let mut night = vec![1; 10];
+        night.extend([0, 0]);
+        night.extend([3; 5]);
+        assert_eq!(aggregate_30s_to_5min(&night), vec![1, 3]);
+        assert_eq!(aggregate_30s_to_5min(&[2; 14]), vec![2]);
+        assert!(aggregate_30s_to_5min(&[]).is_empty());
+    }
+
+    #[test]
+    fn oura_hypnograms_are_not_smoothed_or_refined() {
+        assert!(is_oura_staging(Some("nssa")));
+        assert!(is_oura_staging(Some("ring")));
+        assert!(!is_oura_staging(Some("signals")));
+        assert!(!is_oura_staging(None));
     }
 
     #[test]

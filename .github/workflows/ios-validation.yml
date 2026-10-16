@@ -33,7 +33,8 @@ jobs:
           python3 tools/test_cli_config.py
       - name: Python input and clock regression tests
         run: |
-          python3 -m unittest discover -s tools -p test_sleep_inputs.py
+          python3 -m pip install --quiet numpy
+          python3 -m unittest discover -s tools -p test_nssa_inputs.py
           python3 -m unittest discover -s tools -p test_epoch_time.py
       - name: Web chart regression tests
         run: |
