@@ -458,6 +458,14 @@ struct SyncView: View {
                     Task { if let url = await ring.exportRawDatabase() { diagnosticFile = url } }
                 }
                 SupportDivider()
+                NavigationLink {
+                    ResearchExportView()
+                } label: {
+                    SupportRowLabel(icon: "tablecells", title: "Research export",
+                                    detail: "Every heart beat and movement as CSV", trailing: "chevron.right")
+                }
+                .buttonStyle(.plain)
+                SupportDivider()
                 SupportRow(icon: "arrow.up.doc", title: "Restore from a backup",
                            detail: restoreNote ?? "Replaces what this iPhone holds",
                            disabled: ring.busy) { showRestorePicker = true }

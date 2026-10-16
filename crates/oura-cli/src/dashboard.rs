@@ -469,6 +469,7 @@ async fn handle(
     let forbid = matches!(
         (method, path),
         ("POST", "/api/profile")
+            | ("POST", "/api/research-marker")
             | ("POST", "/api/bedtime")
             | ("POST", "/api/sync")
             | ("POST", "/api/live-hr")
@@ -675,6 +676,54 @@ async fn handle(
             .map_err(|e| anyhow!(e))?;
             match body {
                 Ok(v) => json_resp(&mut sock, &v).await,
+                Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
+            }
+        }
+        ("GET", "/api/research-export") => {
+            // ZIP of raw per-beat / per-window CSVs for [start, end) — the same
+            // `research_export` the iOS app and `oura research-export` use.
+            let num = |k: &str| query_param(query, k).and_then(|v| v.parse::<f64>().ok());
+            let (Some(start), Some(end)) = (num("start"), num("end")) else {
+                return write_resp(&mut sock, "400 Bad Request", "text/plain", b"start and end (unix seconds) are required").await;
+            };
+            let streams: Vec<_> = query_param(query, "streams")
+                .unwrap_or_default()
+                .split(',')
+                .filter_map(oura_summary::research_export::Stream::from_id)
+                .collect();
+            let tz = num("tz").unwrap_or(effective_tz);
+            let built = tokio::task::spawn_blocking(move || {
+                use oura_summary::research_export as rx;
+                let export = rx::build(&db, &rx::Request { start_unix: start, end_unix: end, streams, tz_offset_hours: tz })?;
+                let name = rx::bundle_name(start, tz);
+                Ok::<_, anyhow::Error>((rx::to_zip(&export, &name)?, name))
+            })
+            .await
+            .map_err(|e| anyhow!(e))?;
+            match built {
+                Ok((zip, name)) => {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/zip\r\nContent-Disposition: attachment; filename=\"{name}.zip\"\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+                        zip.len()
+                    );
+                    sock.write_all(head.as_bytes()).await?;
+                    sock.write_all(&zip).await?;
+                    Ok(())
+                }
+                Err(e) => write_resp(&mut sock, "400 Bad Request", "text/plain", e.to_string().as_bytes()).await,
+            }
+        }
+        ("POST", "/api/research-marker") => {
+            let label = serde_json::from_str::<Value>(body)
+                .ok()
+                .and_then(|v| v["label"].as_str().map(str::to_owned))
+                .unwrap_or_default();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as f64 / 1000.0)
+                .unwrap_or(0.0);
+            match oura_summary::research_export::add_marker(&db, now, &label) {
+                Ok(()) => json_resp(&mut sock, &json!({ "ok": true, "unix": now })).await,
                 Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
             }
         }

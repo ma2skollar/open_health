@@ -13,6 +13,7 @@
 //! `docs/clients-web-and-ios.md`.
 
 pub mod hourly_hr;
+pub mod research_export;
 pub mod ring_time;
 pub mod sleep_score;
 pub mod symptoms;

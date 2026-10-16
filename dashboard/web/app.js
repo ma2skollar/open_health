@@ -2198,3 +2198,47 @@ $("profile-btn").addEventListener("click", openProfile);
 $("profile-form").addEventListener("submit", saveProfile);
 $("profile-cancel").addEventListener("click", () => $("profile-dialog").close());
 load();
+
+// ── research export: raw CSVs for a window, built by oura-summary::research_export ──
+(function researchExport() {
+  const form = document.getElementById("research-form");
+  if (!form) return;
+  const pad = (n) => String(n).padStart(2, "0");
+  const local = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  const start = new Date(); start.setDate(start.getDate() - 1); start.setHours(20, 0, 0, 0);
+  const end = new Date(); end.setHours(12, 0, 0, 0);
+  form.querySelector("#rx-start").value = local(start);
+  form.querySelector("#rx-end").value = local(end);
+  form.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const status = form.querySelector("#rx-status");
+    const s = new Date(form.querySelector("#rx-start").value);
+    const t = new Date(form.querySelector("#rx-end").value);
+    const streams = [...form.querySelectorAll("#rx-streams input:checked")].map((i) => i.value);
+    if (!(t > s)) { status.textContent = "The end must be after the start."; return; }
+    if (!streams.length) { status.textContent = "Choose at least one kind of data."; return; }
+    const q = new URLSearchParams({
+      start: String(s.getTime() / 1000), end: String(t.getTime() / 1000),
+      streams: streams.join(","), tz: String(-s.getTimezoneOffset() / 60),
+    });
+    const a = document.createElement("a");
+    a.href = `/api/research-export?${q}`;
+    document.body.append(a); a.click(); a.remove();
+    status.textContent = "Preparing the ZIP. Your browser will save it when it is ready.";
+  });
+  form.querySelector("#rx-mark").addEventListener("click", async () => {
+    const status = form.querySelector("#rx-status");
+    const label = form.querySelector("#rx-label").value;
+    try {
+      const r = await fetch("/api/research-marker", {
+        method: "POST", headers: { "Content-Type": "application/json", "X-Oura-Dash": "1" },
+        body: JSON.stringify({ label }),
+      });
+      const j = await r.json();
+      if (j.error) throw new Error(j.error);
+      status.textContent = `Marked at ${new Date(j.unix * 1000).toLocaleTimeString()}. It will be in markers.csv.`;
+    } catch (err) {
+      status.textContent = `Could not save the marker: ${err.message}`;
+    }
+  });
+})();
