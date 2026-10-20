@@ -188,6 +188,12 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
 
 - **Sleep report without a hypnogram**: iOS still draws the time-in-bed strip and the
   signal lanes; the web returns early.
+- **iOS NSSA cache admission** includes the current model demographics before the
+  automatic planner reuses a night. The web runner already fingerprints demographics
+  with each request; iOS also checks them before its shortcut can skip that request.
+  Cache entries bind their mapped window, so a changed bedtime end cannot reuse cells
+  from the old interval. Saved NSSA summaries can satisfy the automatic plan; older
+  SleepNet summaries cannot substitute for NSSA.
 - **Apple Health HRV export** uses the RMSSD type on iOS 27 and later. On older
   systems, ring RMSSD remains visible in the app rather than being mislabeled as
   SDNN. Reconciliation removes only this exporter's legacy `openoura.hrv.*` SDNN
