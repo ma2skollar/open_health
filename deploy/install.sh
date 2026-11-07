@@ -75,9 +75,16 @@ for dir in "$PREFIX" "$PREFIX/bin" "$PREFIX/data" "$PREFIX/backups" "$CONF_DIR";
         run mkdir -p "$dir"
     fi
 done
-run chown "$SERVICE_USER:$SERVICE_USER" "$PREFIX/data" "$PREFIX/backups"
+# $PREFIX is the unit's WorkingDirectory, so the service user has to be able to
+# traverse it. Mode 0750 alone left it root:root, and systemd then failed with
+# "Changing to the requested working directory failed: Permission denied"
+# (status=200/CHDIR). The binaries under $PREFIX/bin stay root-owned 0755.
+run chown "$SERVICE_USER:$SERVICE_USER" "$PREFIX" "$PREFIX/data" "$PREFIX/backups"
 run chmod 0750 "$PREFIX" "$PREFIX/data" "$PREFIX/backups"
 run chmod 0755 "$PREFIX/bin"
+# The group has to match oura.env's (root:$SERVICE_USER, 0640) or the file is
+# unreadable through its own directory.
+run chown "root:$SERVICE_USER" "$CONF_DIR"
 run chmod 0750 "$CONF_DIR"
 
 if [ ! -f "$BIN_SRC" ]; then
