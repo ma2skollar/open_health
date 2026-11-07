@@ -255,6 +255,12 @@ enum Command {
         /// Local HTTP port.
         #[arg(long, default_value_t = 8090)]
         port: u16,
+        /// Address to listen on. Loopback by default. Set `0.0.0.0` — or the
+        /// host's LAN address — to open the dashboard from another machine, which
+        /// is only safe behind a firewall or a VPN. The DNS-rebind guard stays on:
+        /// a `Host` that is not the address you connected to is still refused.
+        #[arg(long, env = "OURA_BIND", default_value = "127.0.0.1")]
+        bind: String,
         /// Timezone offset (hours from UTC) for displayed times.
         #[arg(long, default_value_t = local_tz_offset_hours(), value_parser = parse_tz_offset, allow_hyphen_values = true)]
         tz_offset: f64,
@@ -505,6 +511,7 @@ async fn main() -> Result<()> {
         Command::FeatureStatus => cmd_feature_status(&cli, &key).await,
         Command::Dashboard {
             port,
+            bind,
             tz_offset,
             sex,
             age,
@@ -530,6 +537,7 @@ async fn main() -> Result<()> {
             })?;
             dashboard::serve(
                 *port,
+                bind.clone(),
                 cli.db.clone(),
                 *tz_offset,
                 cli.name.clone(),

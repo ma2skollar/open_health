@@ -120,6 +120,7 @@ Edit `/etc/oura/oura.env` and replace every `__PLACEHOLDER__`:
 | `OURA_RING_DB` | ring database path, `/srv/oura/data/oura.db` |
 | `OURA_MANUAL_DB` | manual database path, `/srv/oura/data/manual.db` |
 | `OURA_PORT` | loopback port, default `8090` |
+| `OURA_BIND` | listen address; unset keeps loopback, set it to the LAN address (step 6, option B) |
 | `OURA_TZ_OFFSET` | your UTC offset in hours, e.g. `1` or `5.5` |
 | `OURA_HUB_STATE_DIR` | hub state directory, `/srv/oura/data/hub` |
 
@@ -163,17 +164,37 @@ address, and the browser talks to `[IP_ADDRESS]:8090` — the only `Host` the
 dashboard accepts. Log in as `root`: the `oura` service account has a nologin
 shell.
 
-### Option B — reverse proxy on the LXC (LAN/VPN only)
+### Option B — listen on the LAN address (simplest, least isolation)
+
+Set the address the dashboard binds in `/etc/oura/oura.env` and restart the
+service:
+
+```sh
+OURA_BIND=<lxc-lan-ip>
+sudo systemctl restart oura-dashboard.service
+```
+
+Then `http://<lxc-lan-ip>:8090` opens directly from any machine that can reach the
+LXC. Leaving `OURA_BIND` unset — or empty — keeps the loopback default.
+
+This drops the isolation the loopback bind provides, so restrict port 8090 to your
+LAN or VPN subnet with the LXC firewall, and never forward it from the internet.
+The `Host` guard still applies: it accepts only the address the request actually
+arrived on, so a name pointed at the LXC (`Host: oura.lan`) is refused with `403`
+unless you reach it through a proxy that rewrites `Host` to that address and port.
+
+### Option C — reverse proxy on the LXC (LAN/VPN only)
 
 Run a proxy on the LXC that terminates TLS and forwards to `127.0.0.1:8090`.
 Bind the proxy to the LXC's LAN address and restrict it to your LAN or VPN
 subnet with the LXC firewall. The project does not ship a proxy configuration;
 choose one and document the choice.
 
-### Option C — VPN into the LAN
+### Option D — VPN into the LAN
 
-Reach the LXC over your existing VPN and use option A's tunnel, or bind the proxy
-to the VPN interface only.
+Reach the LXC over your existing VPN and use option A's tunnel, or set `OURA_BIND`
+to the VPN interface's address. Alone, a VPN changes who can connect, not what the
+dashboard listens on.
 
 ## 7. Start and verify
 

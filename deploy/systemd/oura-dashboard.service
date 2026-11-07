@@ -10,7 +10,11 @@ User=oura
 Group=oura
 WorkingDirectory=/srv/oura
 EnvironmentFile=-/etc/oura/oura.env
-# The dashboard binds loopback only; a reverse proxy terminates TLS in front of it.
+# OURA_BIND in /etc/oura/oura.env decides what the dashboard listens on; the
+# binary reads that variable itself, so no flag is passed here. Unset or empty,
+# the binary's default applies: loopback only. Set it to this host's LAN address
+# to serve other machines, which is only safe behind a firewall or a VPN — see
+# docs/DEPLOY_LXC.md.
 ExecStart=/srv/oura/bin/oura --db ${OURA_RING_DB} dashboard --port ${OURA_PORT} --tz-offset ${OURA_TZ_OFFSET} --manual-db ${OURA_MANUAL_DB}
 Restart=on-failure
 RestartSec=3

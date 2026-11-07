@@ -98,7 +98,7 @@ msg_ok "Installed Dashboard"
 # ── Verify ────────────────────────────────────────────────────────────────────
 msg_info "Checking the Dashboard"
 if ./deploy/health.sh; then
-  msg_ok "Dashboard answers on [IP_ADDRESS]:8090 (loopback only)"
+  msg_ok "Dashboard answers on localhost:8090 (loopback only)"
 else
   msg_warn "Health check reported a problem — see the output above"
 fi

@@ -7,6 +7,7 @@
 //! run through the Python runners, shelled out exactly like `oura sessions`. All
 //! data stays on this machine.
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -355,6 +356,7 @@ fn cached_summary(db: &Path, tz: f64) -> Result<Arc<Value>> {
 
 pub async fn serve(
     port: u16,
+    bind: String,
     db: PathBuf,
     tz: f64,
     name: String,
@@ -381,10 +383,24 @@ pub async fn serve(
             None
         }
     };
-    let listener = TcpListener::bind(("127.0.0.1", port))
+    // `--bind ${OURA_BIND}` expands to an empty argument when the environment file
+    // was written before OURA_BIND existed. That is the loopback default, not a
+    // configuration error.
+    let bind = if bind.trim().is_empty() {
+        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST).to_string()
+    } else {
+        bind
+    };
+    let listener = TcpListener::bind((bind.as_str(), port))
         .await
-        .context("binding port")?;
-    println!("open_oura dashboard running — open http://127.0.0.1:{port} in your browser");
+        .with_context(|| format!("binding {bind}:{port}"))?;
+    // A wildcard bind has no address to print; print where the data lives instead
+    // of a literal the operator did not ask for.
+    let shown = match bind.parse::<IpAddr>() {
+        Ok(ip) if ip.is_unspecified() => "<this-host>".to_string(),
+        _ => bind.clone(),
+    };
+    println!("open_oura dashboard running — open http://{shown}:{port} in your browser");
     loop {
         let (sock, _) = listener.accept().await?;
         let (db, name, key_file) = (db.clone(), name.clone(), key_file.clone());
@@ -461,6 +477,43 @@ fn split_request(req: &str) -> (&str, &str) {
     match req.split_once("\r\n\r\n") {
         Some((head, body)) => (head, body),
         None => (req, ""),
+    }
+}
+
+/// Loopback-only guard (DNS-rebind protection), applied before any routing.
+///
+/// The dashboard answers only when the request's `Host` is the address the client
+/// actually connected to — loopback unless `--bind` moved the listener — or the
+/// literal `localhost`. Comparing against the connection's own local address
+/// rather than against a fixed string is what lets a LAN bind work without
+/// enumerating the host's interfaces, and it still refuses a rebound name: a page
+/// served from `evil.example` sends `Host: evil.example`, which is not an IP
+/// literal and matches nothing.
+fn host_header_ok(host: Option<&str>, local_ip: Option<IpAddr>, port: u16) -> bool {
+    let Some(host) = host else {
+        return false;
+    };
+    // rsplit_once keeps an IPv6 literal whole: `[::1]:8090` -> ("[::1]", "8090").
+    let Some((addr, got_port)) = host.rsplit_once(':') else {
+        return false;
+    };
+    if got_port.parse::<u16>() != Ok(port) {
+        return false;
+    }
+    if addr.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let addr = addr
+        .strip_prefix('[')
+        .and_then(|a| a.strip_suffix(']'))
+        .unwrap_or(addr);
+    let Ok(ip) = addr.parse::<IpAddr>() else {
+        return false;
+    };
+    match local_ip {
+        // 127.0.0.1 and ::1 are the same socket as far as the browser is concerned.
+        Some(local) => ip == local || (ip.is_loopback() && local.is_loopback()),
+        None => ip.is_loopback(),
     }
 }
 
@@ -818,6 +871,59 @@ mod request_guard_tests {
         assert!(head.starts_with("GET / HTTP/1.1"));
         assert_eq!(body, "");
     }
+
+    // ── host guard ────────────────────────────────────────────────────────────
+    //
+    // `Host` must be the address the client actually connected to, which is
+    // loopback unless the operator moved the listener with --bind.
+
+    const LOOPBACK: Option<IpAddr> =
+        Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+    const LAN: Option<IpAddr> = Some(IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 50)));
+
+    #[test]
+    fn a_loopback_bind_accepts_its_own_address_and_localhost() {
+        for host in ["127.0.0.1:8090", "localhost:8090", "LOCALHOST:8090", "[::1]:8090"] {
+            assert!(host_header_ok(Some(host), LOOPBACK, 8090), "{host} is local");
+        }
+    }
+
+    #[test]
+    fn a_rebound_name_is_refused() {
+        // A page served from evil.example sends its own name, not an address.
+        assert!(!host_header_ok(Some("evil.example:8090"), LOOPBACK, 8090));
+        assert!(
+            !host_header_ok(Some("evil.example:8090"), LAN, 8090),
+            "the guard does not depend on the bind address"
+        );
+    }
+
+    #[test]
+    fn a_lan_bind_accepts_the_address_the_client_used() {
+        assert!(host_header_ok(Some("192.168.1.50:8090"), LAN, 8090));
+        assert!(
+            !host_header_ok(Some("192.168.1.51:8090"), LAN, 8090),
+            "another address on the same port is not this socket"
+        );
+        assert!(
+            !host_header_ok(Some("127.0.0.1:8090"), LAN, 8090),
+            "loopback is only accepted when the connection arrived on loopback"
+        );
+    }
+
+    #[test]
+    fn the_port_must_match() {
+        assert!(host_header_ok(Some("localhost:8090"), LOOPBACK, 8090));
+        assert!(!host_header_ok(Some("localhost:8091"), LOOPBACK, 8090));
+    }
+
+    #[test]
+    fn a_missing_or_unparseable_host_is_refused() {
+        assert!(!host_header_ok(None, LOOPBACK, 8090));
+        assert!(!host_header_ok(Some("localhost"), LOOPBACK, 8090));
+        assert!(!host_header_ok(Some("localhost:http"), LOOPBACK, 8090));
+        assert!(!host_header_ok(Some(""), LOOPBACK, 8090));
+    }
 }
 
 async fn write_resp(sock: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> Result<()> {
@@ -862,10 +968,11 @@ async fn handle(
     // satisfy a header check — see `same_origin_write_ok`.
     let (head, body) = split_request(&req);
 
-    // Loopback-only (DNS-rebind guard).
-    let host_ok = header(head, "host")
-        .is_some_and(|h| h == format!("127.0.0.1:{port}") || h == format!("localhost:{port}"));
-    if !host_ok {
+    // Loopback-only unless --bind says otherwise (DNS-rebind guard). The
+    // connection's own local address is what the client put in `Host`, so that is
+    // what it is compared against.
+    let local_ip = sock.local_addr().ok().map(|a| a.ip());
+    if !host_header_ok(header(head, "host"), local_ip, port) {
         return write_resp(&mut sock, "403 Forbidden", "text/plain", b"forbidden").await;
     }
     // vendored SVG icons (Phosphor), served from disk
