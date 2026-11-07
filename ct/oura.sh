@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Th0rgal
-# License: MIT | https://github.com/Th0rgal/open_health/raw/main/LICENSE
-# Source: https://github.com/Th0rgal/open_health
+# License: MIT | https://github.com/ma2skollar/open_health/raw/main/LICENSE
+# Source: https://github.com/ma2skollar/open_health
 #
 # Community-scripts style LXC installer for the Open Health dashboard.
 # Run on the Proxmox VE host as root:
 #
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Th0rgal/open_health/main/ct/oura.sh)"
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/ma2skollar/open_health/main/ct/oura.sh)"
 #
-# The script sources the community-scripts engine (build.func), creates an
-# unprivileged Debian LXC, and runs install/oura.sh inside it. The install
-# script builds the Rust binaries and starts the systemd units.
+# Sources the community-scripts engine (build.func), which opens the usual
+# Default/Advanced dialog (Advanced picks the container ID), creates an
+# unprivileged Debian LXC, and runs install/oura.sh inside it.
+#
+# The script base points at this fork: a ct script fetched with curl cannot tell
+# the engine where it came from, and install/oura.sh only exists here.
 
-export COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/Th0rgal/open_health/main}"
+export COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/ma2skollar/open_health/main}"
 
 _cs_boot="${COMMUNITY_SCRIPTS_CORE_DIR:-$(dirname "${BASH_SOURCE[0]}")/../../core}/core/build.func"
 source "$_cs_boot" 2>/dev/null || source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_URL:-https://raw.githubusercontent.com/community-scripts/core/main}/core/build.func")

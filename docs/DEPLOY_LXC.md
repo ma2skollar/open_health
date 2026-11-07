@@ -23,21 +23,23 @@ internet.
 
 ### Automated (recommended)
 
-`deploy/pve-setup.sh` runs steps 1–7 on the Proxmox host. On a terminal it opens
-a whiptail dialog like the community LXC scripts: **Default Install**, or
-**Advanced Install** to choose the container ID (for example `222`), hostname,
-template, storages, resources and network. It then shows a summary you confirm
-before anything is created or installed. Nothing touches the host until you
-approve that summary.
+The installer is a [community-scripts](https://github.com/community-scripts/ProxmoxVE)
+style script, so the setup dialog is the one Proxmox users already know:
+**Default Install**, or **Advanced Install** to choose the container ID (for
+example `222`), hostname, template, storage and resources. On the host:
 
 ```sh
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/ma2skollar/open_health/main/deploy/pve-setup.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ma2skollar/open_health/main/ct/oura.sh)"
 ```
 
-Skip the dialog with `NONINTERACTIVE=1`, or go straight to a flow with
-`MODE=default` / `MODE=advanced`; the environment variables `CTID`,
-`CT_HOSTNAME`, `CONTAINER_STORAGE`, `TEMPLATE_STORAGE`, `TEMPLATE`, `MEMORY`,
-`CORES` and `DISK` then apply.
+`deploy/pve-setup.sh` is a thin wrapper around the same script, kept for older
+links.
+
+The engine creates the container and runs `install/oura.sh` inside it: build
+dependencies, the Rust toolchain, a clone of this repository, `cargo build` for
+`oura-cli` and `oura-backup`, then `deploy/install.sh` and the systemd units.
+The dialog is skipped when stdin is not a terminal; set `var_cpu`, `var_ram`,
+`var_disk`, `var_version` or `CTID` to override the defaults then.
 
 ### Manual
 

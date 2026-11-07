@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # Copyright (c) 2026 Th0rgal
-# License: MIT | https://github.com/Th0rgal/open_health/raw/main/LICENSE
-# Source: https://github.com/Th0rgal/open_health
+# License: MIT | https://github.com/ma2skollar/open_health/raw/main/LICENSE
+# Source: https://github.com/ma2skollar/open_health
 #
 # Runs INSIDE the LXC container. Fetched by build_container from
 # COMMUNITY_SCRIPTS_URL/install/oura.sh. Builds the Rust binaries and installs
 # the systemd units. Idempotent: re-running skips existing binaries.
 
 set -euo pipefail
+
+REPO_URL="${REPO_URL:-https://github.com/ma2skollar/open_health.git}"
+BRANCH="${BRANCH:-main}"
 
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '✓ %s\n' "$*"; }
@@ -36,7 +39,7 @@ fi
 # ── Clone or update the repository ────────────────────────────────────────────
 if [ ! -d /root/oura/.git ]; then
   say "Cloning repository..."
-  git clone https://github.com/Th0rgal/open_health.git /root/oura
+  git clone --branch "$BRANCH" "$REPO_URL" /root/oura
   ok "Repository cloned"
 else
   say "Repository already present"
@@ -51,7 +54,11 @@ ok "Build complete"
 
 # ── Install ───────────────────────────────────────────────────────────────────
 say "Installing binaries and units..."
-./deploy/install.sh --bin ./target/release/oura --backup-bin ./target/release/oura-backup
+# install.sh copies oura.env.example and already tries to start the unit; that
+# start cannot succeed while the example still holds __PLACEHOLDER__ paths, so a
+# non-zero exit here is expected on the first run and not fatal on its own.
+./deploy/install.sh --bin ./target/release/oura --backup-bin ./target/release/oura-backup ||
+  warn "install.sh reported a failure — configuration is fixed next"
 ok "Installed"
 
 # ── Configure ─────────────────────────────────────────────────────────────────
@@ -70,7 +77,13 @@ fi
 # ── Enable and start ──────────────────────────────────────────────────────────
 say "Starting oura-dashboard.service..."
 systemctl daemon-reload
-systemctl enable --now oura-dashboard.service
+systemctl enable oura-dashboard.service
+systemctl restart oura-dashboard.service
+if ! systemctl is-active --quiet oura-dashboard.service; then
+  journalctl -u oura-dashboard.service -n 30 --no-pager || true
+  err "oura-dashboard.service did not start"
+  exit 1
+fi
 ok "Service started"
 
 say "Open Health installation complete."
