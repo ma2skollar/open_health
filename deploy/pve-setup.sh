@@ -5,7 +5,7 @@
 #
 # Run this on the Proxmox VE host as root:
 #
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Th0rgal/open_health/main/deploy/pve-setup.sh)"
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/ma2skollar/open_health/main/deploy/pve-setup.sh)"
 #
 # Or copy this file to the PVE host and run it there:
 #
