@@ -12,6 +12,16 @@
 #   scp deploy/pve-setup.sh root@pve:/root/
 #   ssh root@pve 'bash /root/pve-setup.sh'
 #
+# On a terminal it opens the same whiptail dialog the community LXC scripts use:
+# a Default/Advanced menu, an advanced wizard (container ID, hostname, template,
+# storages, resources, network) with Back navigation, and a summary you confirm
+# before anything on the host is touched. Create the container with, say, ID 222
+# through Advanced Install; the default is only a starting value.
+#
+# The dialog is skipped (defaults and env vars apply) when stdin is not a TTY,
+# when whiptail is missing, or when NONINTERACTIVE=1. Pass MODE=default or
+# MODE=advanced to skip the menu and go straight into that flow.
+#
 # Override defaults with environment variables:
 #
 #   CTID=200 CT_HOSTNAME=oura CONTAINER_STORAGE=local-lvm \
@@ -84,10 +94,309 @@ container_running() {
     [ "$(pct status "$CTID" 2>/dev/null | awk '{print $2}')" = "running" ]
 }
 
+# ── Interactive UI (whiptail) ────────────────────────────────────────────────
+# Same flow as the community-scripts LXC dialog: a Default/Advanced menu, an
+# advanced wizard with Back navigation, and a summary you confirm before
+# anything on the host is touched. Skipped entirely when stdin is not a TTY,
+# when whiptail is missing, or when NONINTERACTIVE=1. MODE=default|advanced
+# jumps straight into that flow (and is how you script it unattended).
+WHIPTAIL_BACKTITLE="Oura Dashboard LXC"
+
+ui_tty() {
+    [ "${NONINTERACTIVE:-0}" != "1" ] &&
+        [ -t 0 ] && [ -t 1 ] &&
+        [ "${TERM:-}" != "dumb" ]
+}
+
+# whiptail ships with Proxmox VE; install it if a fresh host lacks it, since the
+# dialog is the whole point of running this on a terminal.
+ensure_whiptail() {
+    command -v whiptail >/dev/null 2>&1 && return 0
+    msg "installing whiptail (needed for the setup dialog)..."
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq whiptail >/dev/null 2>&1 || true
+    command -v whiptail >/dev/null 2>&1
+}
+
+ui_available() {
+    ui_tty || return 1
+    ensure_whiptail
+}
+
+ui_input() { # ui_input <title> <prompt> <default>
+    whiptail --backtitle "$WHIPTAIL_BACKTITLE" --title "$1" \
+        --ok-button "Next" --cancel-button "Back" \
+        --inputbox "$2" 13 70 "$3" 3>&1 1>&2 2>&3
+}
+
+ui_menu() { # ui_menu <title> <prompt> <height> <width> <list-height> <default-item> <tag item>...
+    local title="$1" prompt="$2" h="$3" w="$4" lh="$5" def="$6"
+    shift 6
+    whiptail --backtitle "$WHIPTAIL_BACKTITLE" --title "$title" \
+        --ok-button "Select" --cancel-button "Back" --notags \
+        --menu "$prompt" "$h" "$w" "$lh" "$@" --default-item "$def" 3>&1 1>&2 2>&3
+}
+
+ui_confirm() { # ui_confirm <title> <text> [no]   (default button: yes, or no)
+    if [ "${3:-}" = "no" ]; then
+        whiptail --backtitle "$WHIPTAIL_BACKTITLE" --title "$1" --defaultno --yesno "$2" 22 78
+    else
+        whiptail --backtitle "$WHIPTAIL_BACKTITLE" --title "$1" --yesno "$2" 22 78
+    fi
+}
+
+ui_note() { whiptail --backtitle "$WHIPTAIL_BACKTITLE" --title "$1" --msgbox "$2" 13 70; }
+
+ui_ask() { # ui_ask <title> <prompt> <default> <validator-cmd...> — re-prompts until valid
+    local title="$1" prompt="$2" default="$3" out
+    shift 3
+    while :; do
+        out="$(ui_input "$title" "$prompt" "$default")" || return 1
+        out="${out:-$default}"
+        if "$@" "$out"; then printf '%s' "$out"; return 0; fi
+        ui_note "$title" "Invalid value: '${out}'. Try again."
+    done
+}
+
+# Storages usable for a given content type, active only.
+list_storage() {
+    pvesm status -content "$1" 2>/dev/null | awk 'NR>1 && $3=="active" {print $1}'
+}
+
+valid_ctid()     { [[ "$1" =~ ^[1-9][0-9]{2,8}$ ]]; }
+valid_hostname() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$ ]]; }
+valid_positive() { [[ "$1" =~ ^[1-9][0-9]*$ ]]; }
+valid_cidr()     { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$ ]]; }
+valid_ipv4()     { [[ "$1" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; }
+valid_ifname()   { [[ "$1" =~ ^[a-zA-Z0-9._-]+$ ]]; }
+
+ctid_in_use() {
+    pct status "$1" >/dev/null 2>&1 && return 0
+    command -v qm >/dev/null 2>&1 && qm status "$1" >/dev/null 2>&1 && return 0
+    return 1
+}
+
+# advanced_settings — step wizard with Back navigation, like community-scripts.
+advanced_settings() {
+    local step=1
+    local id host disk cores ram swap bridge net x
+    while [ "$step" -le 10 ]; do
+        case "$step" in
+        1) # Container ID
+            if ! id="$(ui_input "CONTAINER ID" \
+                "\nSet CONTAINER ID\n\nThis is the Proxmox container to create, or to reuse if it already exists." \
+                "$CTID")"; then
+                return 1
+            fi
+            id="${id:-$CTID}"
+            if ! valid_ctid "$id"; then
+                ui_note "Invalid ID" "Container ID must be a number from 100 up, without leading zeros."
+                continue
+            fi
+            if ctid_in_use "$id" &&
+                ! whiptail --backtitle "$WHIPTAIL_BACKTITLE" --title "ID Already In Use" --defaultno \
+                    --yesno "Container/VM ID ${id} already exists.\n\nUse it and (re)install the Oura dashboard inside it?\n\nChoose No to enter a different ID." 13 70; then
+                continue
+            fi
+            CTID="$id"; step=$((step + 1))
+            ;;
+        2) # Hostname
+            if ! host="$(ui_ask "HOSTNAME" \
+                "\nSet the container hostname\n(lowercase letters, digits, dots and hyphens)" \
+                "$CT_HOSTNAME" valid_hostname)"; then
+                step=$((step - 1))
+                continue
+            fi
+            CT_HOSTNAME="$host"; step=$((step + 1))
+            ;;
+        3) # Template family
+            local -a tt=()
+            while IFS= read -r x; do
+                [ -n "$x" ] || continue
+                tt+=("$x" "$x")
+            done < <(pveam available --section system 2>/dev/null | awk '{print $2}' |
+                grep -E '^(debian|ubuntu)-[0-9.]+-standard_amd64\.tar\.zst$' |
+                sed -E 's/_[0-9][0-9.]*-[0-9]+_amd64\.tar\.zst$//' | sort -uVr)
+            if [ "${#tt[@]}" -eq 0 ]; then
+                if x="$(ui_input "TEMPLATE" \
+                    "\nNo template catalog found; type a base name (e.g. debian-12-standard)." "$TEMPLATE")"; then
+                    TEMPLATE="${x:-$TEMPLATE}"; step=$((step + 1))
+                else
+                    step=$((step - 1))
+                fi
+                continue
+            fi
+            if x="$(ui_menu "TEMPLATE" \
+                "\nChoose the container OS template.\nPoint releases are resolved to the newest available." \
+                20 70 "$(( ${#tt[@]} / 2 > 12 ? 12 : ${#tt[@]} / 2 ))" "$TEMPLATE" "${tt[@]}")"; then
+                TEMPLATE="$x"; step=$((step + 1))
+            else
+                step=$((step - 1))
+            fi
+            ;;
+        4) # Container storage (rootfs)
+            local -a st=()
+            while IFS= read -r x; do [ -n "$x" ] && st+=("$x" "$x"); done < <(list_storage rootdir)
+            if [ "${#st[@]}" -eq 0 ]; then
+                if x="$(ui_input "CONTAINER STORAGE" \
+                    "\nNo active storage with 'rootdir' content found.\n\nSet the container storage name." \
+                    "$CONTAINER_STORAGE")"; then
+                    CONTAINER_STORAGE="${x:-$CONTAINER_STORAGE}"; step=$((step + 1))
+                else
+                    step=$((step - 1))
+                fi
+                continue
+            fi
+            if x="$(ui_menu "CONTAINER STORAGE" \
+                "\nChoose the storage for the container root filesystem." \
+                20 70 "$(( ${#st[@]} / 2 > 10 ? 10 : ${#st[@]} / 2 ))" "$CONTAINER_STORAGE" "${st[@]}")"; then
+                CONTAINER_STORAGE="$x"; step=$((step + 1))
+            else
+                step=$((step - 1))
+            fi
+            ;;
+        5) # Template storage
+            local -a ts=()
+            while IFS= read -r x; do [ -n "$x" ] && ts+=("$x" "$x"); done < <(list_storage vztmpl)
+            if [ "${#ts[@]}" -eq 0 ]; then
+                if x="$(ui_input "TEMPLATE STORAGE" \
+                    "\nNo active storage with 'vztmpl' content found.\n\nSet the template storage name." \
+                    "$TEMPLATE_STORAGE")"; then
+                    TEMPLATE_STORAGE="${x:-$TEMPLATE_STORAGE}"; step=$((step + 1))
+                else
+                    step=$((step - 1))
+                fi
+                continue
+            fi
+            if x="$(ui_menu "TEMPLATE STORAGE" \
+                "\nChoose the storage for the downloaded template." \
+                20 70 "$(( ${#ts[@]} / 2 > 10 ? 10 : ${#ts[@]} / 2 ))" "$TEMPLATE_STORAGE" "${ts[@]}")"; then
+                TEMPLATE_STORAGE="$x"; step=$((step + 1))
+            else
+                step=$((step - 1))
+            fi
+            ;;
+        6) # Disk
+            if ! disk="$(ui_ask "DISK SIZE" "\nSet the container disk size in GiB." "$DISK" valid_positive)"; then
+                step=$((step - 1)); continue
+            fi
+            DISK="$disk"; step=$((step + 1))
+            ;;
+        7) # Cores
+            if ! cores="$(ui_ask "CPU CORES" "\nAllocate CPU cores." "$CORES" valid_positive)"; then
+                step=$((step - 1)); continue
+            fi
+            CORES="$cores"; step=$((step + 1))
+            ;;
+        8) # RAM
+            if ! ram="$(ui_ask "MEMORY" "\nAllocate RAM in MiB." "$MEMORY" valid_positive)"; then
+                step=$((step - 1)); continue
+            fi
+            MEMORY="$ram"
+            if ! swap="$(ui_ask "SWAP" "\nAllocate swap in MiB." "$SWAP" valid_positive)"; then
+                step=$((step - 1)); continue
+            fi
+            SWAP="$swap"; step=$((step + 1))
+            ;;
+        9) # Network
+            if ! net="$(ui_menu "NETWORK" \
+                "\nChoose the network configuration for eth0." 13 70 2 \
+                "$([ -n "$CT_IP" ] && echo static || echo dhcp)" \
+                "dhcp" "Address assigned by your LAN (recommended)" \
+                "static" "You supply a static IPv4 CIDR address and gateway")"; then
+                step=$((step - 1)); continue
+            fi
+            if [ "$net" = "static" ]; then
+                NET_MODE="static"
+                if ! CT_IP="$(ui_ask "STATIC IPV4" \
+                    "\nEnter the static IPv4 CIDR address\n(e.g. [IP_ADDRESS]/24)." "${CT_IP}" valid_cidr)"; then
+                    step=$((step - 1)); continue
+                fi
+                if ! CT_GW="$(ui_ask "GATEWAY" \
+                    "\nEnter the gateway IP address." "${CT_GW}" valid_ipv4)"; then
+                    step=$((step - 1)); continue
+                fi
+            else
+                NET_MODE="dhcp"; CT_IP=""; CT_GW=""
+            fi
+            step=$((step + 1))
+            ;;
+        10) # Bridge
+            if ! bridge="$(ui_ask "BRIDGE" "\nSet the network bridge (e.g. vmbr0)." "$BRIDGE" valid_ifname)"; then
+                step=$((step - 1)); continue
+            fi
+            BRIDGE="$bridge"; step=$((step + 1))
+            ;;
+        esac
+    done
+    return 0
+}
+
+show_summary() {
+    local net action
+    if [ -n "$CT_IP" ]; then
+        net="${BRIDGE}, static ${CT_IP}${CT_GW:+ via ${CT_GW}}"
+    else
+        net="${BRIDGE}, dhcp"
+    fi
+    if container_exists; then
+        action="Container ${CTID} already exists — the dashboard will be (re)installed inside it."
+    else
+        action="Container ${CTID} will be created and started."
+    fi
+    printf '%s' "About to set up the Oura dashboard LXC.
+
+  Container ID : ${CTID}
+  Hostname     : ${CT_HOSTNAME}
+  Template     : ${TEMPLATE} (newest point release)
+  Resources    : ${CORES} vCPU, ${MEMORY} MiB RAM, ${SWAP} MiB swap, ${DISK} GiB disk
+  Storage      : ${CONTAINER_STORAGE} (rootfs), ${TEMPLATE_STORAGE} (templates)
+  Network      : ${net}
+
+${action}
+
+Inside the container this installs build dependencies, the Rust toolchain,
+clones ${REPO_URL} (branch ${BRANCH}), builds it, and enables the service.
+
+Nothing has been changed yet. Proceed?"
+}
+
 # ── Preflight ────────────────────────────────────────────────────────────────
 if [ "$(id -u)" -ne 0 ]; then
     err "this script must run as root on the Proxmox VE host"
     exit 1
+fi
+
+if ui_available; then
+    case "${MODE:-}" in
+    "") # Show the menu, like the community scripts.
+        MODE="$(ui_menu "OURA DASHBOARD LXC" \
+            "\nChoose an option:\n Use TAB or Arrow keys to navigate, ENTER to select.\n" \
+            20 74 3 "1" \
+            "1" "Default Install — CTID ${CTID}, ${CORES} vCPU, ${MEMORY} MiB RAM, ${DISK} GiB, DHCP" \
+            "2" "Advanced Install — choose container ID, hostname, resources, storage, network" \
+            "3" "Exit")" || { msg "cancelled"; exit 0; }
+        ;;
+    esac
+    case "$MODE" in
+    2 | advanced | ADVANCED)
+        MODE=advanced
+        advanced_settings || { err "cancelled during advanced settings"; exit 1; }
+        ;;
+    3 | exit | EXIT)
+        msg "cancelled"
+        exit 0
+        ;;
+    *)
+        MODE=default
+        ;;
+    esac
+    # Reusing an existing container defaults the confirm button to No.
+    DEFNO=yes
+    if container_exists; then DEFNO=no; fi
+    ui_confirm "CONFIRM" "$(show_summary)" "$DEFNO" || {
+        err "aborted by user — nothing was changed"
+        exit 0
+    }
 fi
 
 msg "Oura LXC setup — CTID=${CTID}, hostname=${CT_HOSTNAME}, template=${TEMPLATE}"

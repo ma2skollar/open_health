@@ -21,6 +21,26 @@ internet.
 
 ## 1. Create the LXC
 
+### Automated (recommended)
+
+`deploy/pve-setup.sh` runs steps 1–7 on the Proxmox host. On a terminal it opens
+a whiptail dialog like the community LXC scripts: **Default Install**, or
+**Advanced Install** to choose the container ID (for example `222`), hostname,
+template, storages, resources and network. It then shows a summary you confirm
+before anything is created or installed. Nothing touches the host until you
+approve that summary.
+
+```sh
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ma2skollar/open_health/main/deploy/pve-setup.sh)"
+```
+
+Skip the dialog with `NONINTERACTIVE=1`, or go straight to a flow with
+`MODE=default` / `MODE=advanced`; the environment variables `CTID`,
+`CT_HOSTNAME`, `CONTAINER_STORAGE`, `TEMPLATE_STORAGE`, `TEMPLATE`, `MEMORY`,
+`CORES` and `DISK` then apply.
+
+### Manual
+
 On the Proxmox host, create an **unprivileged** container from a Debian or Ubuntu
 template. Suggested minimum: 2 vCPU, 2 GiB RAM, 8 GiB disk. Give it a static LAN
 address or a DHCP reservation so its address is stable.
