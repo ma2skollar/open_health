@@ -4,7 +4,8 @@
 # Source: https://github.com/ma2skollar/open_health
 #
 # Runs INSIDE the LXC container. Fetched by build_container from
-# COMMUNITY_SCRIPTS_URL/install/oura.sh. Builds the Rust binaries and installs
+# COMMUNITY_SCRIPTS_URL/install/openhealth-install.sh (named after APP="Open
+# Health"). Builds the Rust binaries and installs
 # the systemd units. Idempotent: re-running skips existing binaries.
 
 set -euo pipefail

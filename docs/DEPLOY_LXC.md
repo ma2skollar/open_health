@@ -35,7 +35,8 @@ bash -c "$(curl -fsSL https://raw.githubusercontent.com/ma2skollar/open_health/m
 `deploy/pve-setup.sh` is a thin wrapper around the same script, kept for older
 links.
 
-The engine creates the container and runs `install/oura.sh` inside it: build
+The engine creates the container and runs `install/openhealth-install.sh` inside
+it (the engine derives that name from `APP`): build
 dependencies, the Rust toolchain, a clone of this repository, `cargo build` for
 `oura-cli` and `oura-backup`, then `deploy/install.sh` and the systemd units.
 The dialog is skipped when stdin is not a terminal; set `var_cpu`, `var_ram`,
