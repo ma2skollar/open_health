@@ -15,7 +15,7 @@
 # Override defaults with environment variables:
 #
 #   CTID=200 CT_HOSTNAME=oura CONTAINER_STORAGE=local-lvm \
-#   TEMPLATE_STORAGE=local TEMPLATE=debian-12-standard_12.7-1_amd64.tar.zst \
+#   TEMPLATE_STORAGE=local TEMPLATE=debian-12-standard \
 #   MEMORY=2048 CORES=2 DISK=8 REPO_URL=https://github.com/ma2skollar/open_health.git \
 #   BRANCH=main bash pve-setup.sh
 #
@@ -38,7 +38,7 @@ CT_IP="${CT_IP:-}"
 CT_GW="${CT_GW:-}"
 CONTAINER_STORAGE="${CONTAINER_STORAGE:-local-lvm}"
 TEMPLATE_STORAGE="${TEMPLATE_STORAGE:-local}"
-TEMPLATE="${TEMPLATE:-debian-12-standard_12.7-1_amd64.tar.zst}"
+TEMPLATE="${TEMPLATE:-debian-12-standard}"
 REPO_URL="${REPO_URL:-https://github.com/Th0rgal/open_health.git}"
 BRANCH="${BRANCH:-main}"
 CT_USER="${CT_USER:-oura}"
@@ -93,17 +93,42 @@ fi
 msg "Oura LXC setup — CTID=${CTID}, hostname=${CT_HOSTNAME}, template=${TEMPLATE}"
 
 # ── Template ─────────────────────────────────────────────────────────────────
-if ! pveam list "$TEMPLATE_STORAGE" 2>/dev/null | grep -q "$TEMPLATE"; then
+# Resolve the template name to the newest matching image present locally or in
+# the PVE index. Accepts a full filename or a base name such as
+# "debian-12-standard" (the default). Point releases move with every PVE
+# refresh, so a hardcoded name goes stale and breaks pveam download.
+resolve_template() {
+    local base="$1" storage="$2" found=""
+    case "$base" in
+        *_amd64.tar.zst|*_amd64.tar.gz) basename "$base"; return 0 ;;
+    esac
+    found="$(pveam list "$storage" 2>/dev/null | grep -oE "${base}[0-9._-]+_amd64\\.tar\\.(zst|gz)" | sort -V | tail -n1)"
+    if [ -n "$found" ]; then
+        echo "$found"
+        return 0
+    fi
+    found="$(pveam available --section system 2>/dev/null | grep -oE "${base}[0-9._-]+_amd64\\.tar\\.(zst|gz)" | sort -V | tail -n1)"
+    [ -n "$found" ] && { echo "$found"; return 0; }
+    return 1
+}
+
+TEMPLATE_NAME="$(resolve_template "$TEMPLATE" "$TEMPLATE_STORAGE" || true)"
+
+if [ -z "$TEMPLATE_NAME" ] || ! pveam list "$TEMPLATE_STORAGE" 2>/dev/null | grep -q "$TEMPLATE_NAME"; then
     msg "downloading template ${TEMPLATE} to ${TEMPLATE_STORAGE}..."
     pveam update
-    # Extract the template name from the full path if the user supplied a path
-    TEMPLATE_NAME="$(basename "$TEMPLATE")"
+    TEMPLATE_NAME="$(resolve_template "$TEMPLATE" "$TEMPLATE_STORAGE")" || {
+        err "no ${TEMPLATE} template found in storage '${TEMPLATE_STORAGE}' or the PVE index"
+        err "list available templates with: pveam available --section system | grep debian"
+        exit 1
+    }
     if ! pveam download "$TEMPLATE_STORAGE" "$TEMPLATE_NAME"; then
         err "failed to download template ${TEMPLATE_NAME}"
-        err "list available templates with: pveam available | grep debian"
+        err "list available templates with: pveam available --section system | grep debian"
         exit 1
     fi
 fi
+TEMPLATE="$TEMPLATE_NAME"
 ok "template present"
 
 # ── Create container ─────────────────────────────────────────────────────────
