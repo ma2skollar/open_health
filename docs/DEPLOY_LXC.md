@@ -141,16 +141,27 @@ dashboard from the container itself:
 pct exec <ctid> -- /root/oura/deploy/health.sh
 ```
 
+Two things make the container's LAN address the wrong one to open. The listener
+binds `[IP_ADDRESS]` only, so `http://<lxc-lan-ip>:8090` finds nothing listening;
+and the dashboard answers only when the request's `Host` header is
+`[IP_ADDRESS]:<port>` or `localhost:<port>` (a DNS-rebind guard) — anything else
+gets `403 Forbidden`. Both are deliberate. A reverse proxy therefore has to
+rewrite `Host` to `[IP_ADDRESS]:8090` instead of passing the client's hostname
+through.
+
 ### Option A — SSH tunnel (fastest, no extra service)
 
 On the iPhone, use an SSH client (for example Termius) to forward a local port to
 the LXC's loopback port:
 
 ```sh
-ssh -N -L 8090:127.0.0.1:8090 oura@<lxc-lan-ip>
+ssh -N -L 8090:127.0.0.1:8090 root@<lxc-lan-ip>
 ```
 
-Then open `http://127.0.0.1:8090` on the phone. Nothing listens on the LAN.
+Then open `http://[IP_ADDRESS]:8090` on the phone. Nothing listens on the LAN
+address, and the browser talks to `[IP_ADDRESS]:8090` — the only `Host` the
+dashboard accepts. Log in as `root`: the `oura` service account has a nologin
+shell.
 
 ### Option B — reverse proxy on the LXC (LAN/VPN only)
 
