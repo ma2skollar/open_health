@@ -1,0 +1,42 @@
+[Unit]
+Description=Oura local-first health dashboard
+Documentation=file:/srv/oura/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=oura
+Group=oura
+WorkingDirectory=/srv/oura
+EnvironmentFile=-/etc/oura/oura.env
+# The dashboard binds loopback only; a reverse proxy terminates TLS in front of it.
+ExecStart=/srv/oura/bin/oura --db ${OURA_RING_DB} dashboard --port ${OURA_PORT} --tz-offset ${OURA_TZ_OFFSET} --manual-db ${OURA_MANUAL_DB}
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+
+# UNVERIFIED hardening: there is no LXC yet. Re-check each directive on first
+# deployment; relax only with a comment saying which one and why.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+# The dashboard writes only under its data root; the ring database is opened read-only.
+ReadWritePaths=/srv/oura
+
+[Install]
+WantedBy=multi-user.target

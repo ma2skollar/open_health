@@ -1,0 +1,33 @@
+[package]
+name = "oura-hub"
+description = "Authenticated collector ingestion and immutable ring generations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "oura-hub"
+path = "src/main.rs"
+
+[dependencies]
+oura-protocol-v1 = { path = "../oura-protocol-v1" }
+oura-summary = { path = "../oura-summary" }
+axum = { version = "0.8", features = ["ws"] }
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+fs2 = "0.4"
+futures-util = "0.3"
+http-body-util = "0.1"
+rusqlite = { version = "0.31", features = ["bundled", "hooks"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "signal"] }
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio-tungstenite = "0.29"
+tower = { version = "0.5", features = ["util"] }

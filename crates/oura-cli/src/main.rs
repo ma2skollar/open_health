@@ -13,12 +13,11 @@ use oura_store::storage::Store;
 
 #[cfg(feature = "torch")]
 mod activity_model;
-mod blood;
 mod dashboard;
-mod dna;
 mod game;
 mod motion_server;
 mod pyrunner;
+mod secret_file;
 mod viz;
 
 fn parse_tz_offset(value: &str) -> std::result::Result<f64, String> {
@@ -271,17 +270,31 @@ enum Command {
         /// Weight (kg) for the CVA model.
         #[arg(long, default_value_t = 75.0)]
         weight: f64,
-        /// Directory to read genome `*.vcf.gz` files from for the /dna explorer.
-        /// Keep your (large, private) genomes anywhere — e.g.
-        /// `--dna-files ~/Documents/health/genomes`. Defaults to the repo's
-        /// `dna/files/`; also settable via `$OURA_DNA_FILES`.
-        #[arg(long, value_name = "DIR")]
-        dna_files: Option<PathBuf>,
-        /// Directory to scan for local blood report PDFs named `blood *.pdf`.
-        /// Defaults to `~/Documents/official/health` when present; also settable
-        /// via `$OURA_BLOOD_FILES`.
-        #[arg(long, value_name = "DIR")]
-        blood_files: Option<PathBuf>,
+        /// Manual metrics SQLite path (default: `manual.db` beside the ring DB).
+        #[arg(long, env = "OURA_MANUAL_DB")]
+        manual_db: Option<PathBuf>,
+        /// Body-weight display unit for the manual panel: kg | lb (default kg).
+        #[arg(long, env = "OURA_WEIGHT_UNIT", default_value = "kg")]
+        weight_unit: String,
+    },
+    /// Import a one-time historical PulsHealth long-format CSV into manual.db.
+    ///
+    /// Rows are `timestamp,metric,value,unit,source_bundle_id`. Steps are summed
+    /// per local day; calories and weight keep the day's last sample. Re-running
+    /// the same file is a no-op. `--dry-run` reports changes without writing.
+    Import {
+        /// CSV file to import.
+        file: PathBuf,
+        /// Report what would change without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Manual metrics SQLite path (default: `manual.db` beside the ring DB).
+        #[arg(long, env = "OURA_MANUAL_DB")]
+        manual_db: Option<PathBuf>,
+        /// Source name stored on every row. Ring steps must outrank this source,
+        /// so the default is deliberately lower authority than "ring".
+        #[arg(long, default_value = "pulshealth-export")]
+        source: String,
     },
 }
 
@@ -362,14 +375,8 @@ fn generate_key() -> Result<[u8; 16]> {
 
 /// Persist a key as hex with owner-only permissions.
 fn save_key(path: &Path, key: &[u8; 16]) -> Result<()> {
-    std::fs::write(path, format!("{}\n", hex::encode(key)))
-        .with_context(|| format!("writing key file {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
+    crate::secret_file::write_private(path, format!("{}\n", hex::encode(key)).as_bytes())
+        .with_context(|| format!("writing key file {}", path.display()))
 }
 
 /// Open the readings store for best-effort live persistence, warning (rather than
@@ -503,8 +510,8 @@ async fn main() -> Result<()> {
             age,
             height,
             weight,
-            dna_files,
-            blood_files,
+            manual_db,
+            weight_unit,
         } => {
             let seed = dashboard::Demographics {
                 sex: sex.chars().next().unwrap_or('M').to_ascii_uppercase(),
@@ -513,10 +520,14 @@ async fn main() -> Result<()> {
                 weight_kg: *weight,
                 ring_size: 10.0,
             };
-            // where the /dna explorer reads genome files from (flag → env → repo default)
-            dna::set_genomes_dir(dna_files.clone());
-            // where the /blood explorer reads and caches local lab PDFs
-            blood::set_files_dir(blood_files.clone());
+            // Manual metrics default to `manual.db` beside the ring database, so a
+            // ring-less install still works.
+            let manual_path = manual_db
+                .clone()
+                .unwrap_or_else(|| cli.db.with_file_name("manual.db"));
+            let unit = dashboard::WeightUnit::parse(weight_unit).ok_or_else(|| {
+                anyhow!("--weight-unit must be kg or lb (got {weight_unit:?})")
+            })?;
             dashboard::serve(
                 *port,
                 cli.db.clone(),
@@ -524,10 +535,94 @@ async fn main() -> Result<()> {
                 cli.name.clone(),
                 cli.key_file.clone(),
                 seed,
+                manual_path,
+                unit,
             )
             .await
         }
+        Command::Import {
+            file,
+            dry_run,
+            manual_db,
+            source,
+        } => cmd_import(&cli, file, *dry_run, manual_db.clone(), source.clone()),
     }
+}
+
+/// One-time historical import into manual.db.
+///
+/// The ring takes over steps afterwards, so "ring" outranks the import source in
+/// step precedence: a ring day is never overwritten by an imported day.
+fn cmd_import(
+    cli: &Cli,
+    file: &Path,
+    dry_run: bool,
+    manual_db: Option<PathBuf>,
+    source: String,
+) -> Result<()> {
+    let manual_path = manual_db.unwrap_or_else(|| cli.db.with_file_name("manual.db"));
+    let store = oura_manual::ManualStore::open(&manual_path)
+        .with_context(|| format!("opening manual.db at {}", manual_path.display()))?;
+    let importer = oura_import::PulsHealthImporter::new(source.clone(), "1");
+    let opts = oura_import::ApplyOptions {
+        note: Some("PulsHealth one-time import".to_string()),
+        step_precedence: vec!["ring".to_string(), source.clone()],
+    };
+
+    if dry_run {
+        let report = oura_import::dry_run(&importer, file, &store, &opts)
+            .with_context(|| format!("dry run of {}", file.display()))?;
+        println!(
+            "dry run: {} to write, {} unchanged, {} rejected, {} step days owned by another source",
+            report.rows.len(),
+            report.unchanged,
+            report.rejected.len(),
+            report.skipped_step_sources.len()
+        );
+        for row in report.rows.iter().take(20) {
+            println!(
+                "  {} {} {:?} -> {}",
+                row.local_date, row.kind, row.old, row.new
+            );
+        }
+        if report.rows.len() > 20 {
+            println!("  ... and {} more", report.rows.len() - 20);
+        }
+        for rejected in report.rejected.iter().take(10) {
+            println!("  rejected line {}: {}", rejected.line, rejected.reason);
+        }
+        if report.rejected.len() > 10 {
+            println!("  ... and {} more rejected", report.rejected.len() - 10);
+        }
+        for skipped in report.skipped_step_sources.iter().take(10) {
+            println!(
+                "  {} steps kept from {:?} ({}), skipped {:?}",
+                skipped.local_date,
+                skipped.kept_source,
+                skipped.kept_value,
+                skipped.skipped_source
+            );
+        }
+        return Ok(());
+    }
+
+    let summary = oura_import::apply(&importer, file, &store, &opts)
+        .with_context(|| format!("importing {}", file.display()))?;
+    match summary.batch_id {
+        Some(id) => println!(
+            "imported batch {id}: {} inserted, {} updated, {} unchanged, {} rejected, {} step days skipped",
+            summary.inserted,
+            summary.updated,
+            summary.unchanged,
+            summary.rejected,
+            summary.skipped_step_sources
+        ),
+        None => println!(
+            "nothing to import: {} unchanged, {} rejected, {} step days skipped",
+            summary.unchanged, summary.rejected, summary.skipped_step_sources
+        ),
+    }
+    Ok(())
 }
 
 /// Subscribe a feature capability via SetFeatureSubscription (needs auth).

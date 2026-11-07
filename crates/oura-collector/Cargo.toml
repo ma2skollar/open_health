@@ -1,0 +1,37 @@
+[package]
+name = "oura-collector"
+description = "Single-owner Pi ring collector with durable snapshot delivery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+ble = ["oura-ble/ble"]
+
+[dependencies]
+oura-ble = { path = "../oura-ble" }
+oura-protocol-v1 = { path = "../oura-protocol-v1" }
+oura-store = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
+oura-protocol = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
+async-trait = "0.1"
+tokio = { version = "1", features = ["full", "test-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots", "connect"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.10"
+rusqlite = { version = "0.31", features = ["bundled", "backup"] }
+sha2 = "0.10"
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+fs2 = "0.4"
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"

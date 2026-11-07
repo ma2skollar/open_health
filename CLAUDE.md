@@ -3,7 +3,7 @@
 Local-first health apps (native iOS app + web dashboard) for the Oura ring, built on
 [open_oura](https://github.com/Th0rgal/open_oura), which owns the BLE protocol, sync,
 decoders and ported algorithms (pulled in as git dependencies). This repo holds the
-shared summary brain, the two clients, blood/DNA analysis, and the ML model runners
+shared summary brain, the two clients, and the ML model runners
 (sleep / CVA / activity / illness) as decrypted TorchScript. For reverse-engineering
 details, see open_oura's `docs/`.
 

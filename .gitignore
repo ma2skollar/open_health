@@ -7,10 +7,6 @@
 *.hex
 captures/
 reverse/
-dna/files/*
-!dna/files/.gitkeep
-dna/scores/*
-!dna/scores/.gitkeep
 
 # Proprietary/decrypted ML models and mobile exports.
 notes/models/
@@ -38,3 +34,10 @@ nssa_cache.json
 # Python research/test bytecode
 __pycache__/
 apps/ios/OuraApp/project-model-validation.yml
+
+# --- local additions (this fork) ---
+# Reference clones of the upstream projects; never part of the fork.
+upstream/
+# Local build/verification output (docker build logs, artifacts).
+/out/
+/dist/

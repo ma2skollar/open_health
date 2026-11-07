@@ -1,0 +1,6 @@
+date,calories,weight_kg,steps,note
+2026-01-01,2100,70.5,8500,new year
+2026-01-02,,70.2,9100,no calories logged
+2026-01-03,1850,-,NA,
+2026-01-04,notanumber,70.0,7000,bad calories
+2026-01-32,2000,70.1,6000,impossible date

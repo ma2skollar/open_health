@@ -1,0 +1,30 @@
+[package]
+name = "oura-ble"
+description = "Bounded Oura ring boundary with an always-available scripted transport"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+ble = ["dep:oura-link", "oura-link/ble", "dep:oura-protocol", "dep:tracing"]
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+zeroize = "1"
+oura-link = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781", default-features = false, optional = true }
+oura-protocol = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781", optional = true }
+# Upstream request tracing includes authentication frames. Disable debug/trace
+# callsites at compile time, including when a caller installs a verbose subscriber.
+tracing = { version = "0.1", features = ["max_level_info", "release_max_level_info"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["sync", "time", "rt", "macros", "test-util"] }
+tempfile = "3"

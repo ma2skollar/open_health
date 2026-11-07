@@ -1,0 +1,11 @@
+[package]
+name = "oura-manual"
+description = "Application-owned SQLite store for manual calories-eaten and body-weight records (manual.db)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }

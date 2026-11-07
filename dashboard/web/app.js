@@ -42,6 +42,9 @@ function postDash(url, body) {
 function getDash(url) {
   return fetch(url, { headers: { ...DASH_HEADERS } });
 }
+function deleteDash(url) {
+  return fetch(url, { method: "DELETE", headers: { ...DASH_HEADERS } });
+}
 
 // Smooth curve THROUGH the points using a monotone cubic Hermite spline
 // (Fritsch–Carlson). Monotone = the curve never overshoots past a data point, so it
@@ -2282,4 +2285,241 @@ load();
       status.textContent = `Could not save the marker: ${err.message}`;
     }
   });
+})();
+
+// ── daily manual entry: calories eaten + body weight, no ring needed ─────────
+// Talks to /api/manual/*. Storage is canonical (kcal, kg); the configured display
+// unit only changes what is shown, and a save converts back to kg. A missing day
+// has no row — it is never charted as zero.
+(function manualEntry() {
+  const panel = $("manual-panel");
+  if (!panel) return;
+
+  const LB_PER_KG = 2.2046226218487757;
+  let UNIT = "kg";
+  let ENTRIES = [];
+
+  const pad2 = (n) => String(n).padStart(2, "0");
+  const localToday = () => {
+    const d = new Date();
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+  };
+  const shiftDays = (ymd, delta) => {
+    const [y, m, d] = ymd.split("-").map(Number);
+    const dt = new Date(y, m - 1, d);
+    dt.setDate(dt.getDate() + delta);
+    return `${dt.getFullYear()}-${pad2(dt.getMonth() + 1)}-${pad2(dt.getDate())}`;
+  };
+  const trimNum = (v) => String(Math.round(v * 100) / 100);
+  const round1 = (v) => Math.round(v * 10) / 10;
+  const dispWeight = (kg) => (UNIT === "lb" ? kg * LB_PER_KG : kg);
+  const storeWeight = (shown) => (UNIT === "lb" ? shown / LB_PER_KG : shown);
+  const ymdToDay = (ymd) => {
+    const [y, m, d] = ymd.split("-").map(Number);
+    return Math.round(Date.UTC(y, m - 1, d) / 86400000);
+  };
+
+  const dateInput = $("manual-date");
+  const calInput = $("manual-calories");
+  const wtInput = $("manual-weight");
+  const noteInput = $("manual-note");
+  const wtUnit = $("manual-weight-unit");
+  const wtChartUnit = $("manual-weight-chart-unit");
+  const wtLegend = $("manual-weight-legend");
+  const calChart = $("manual-calories-chart");
+  const wtChart = $("manual-weight-chart");
+  const recent = $("manual-recent");
+  const EMPTY = '<p class="manual-empty">No data yet.</p>';
+
+  const msg = (kind, text, isError) => {
+    const p = $("manual-msg-" + kind);
+    if (!p) return;
+    p.textContent = text || "";
+    p.classList.toggle("is-error", !!isError);
+  };
+
+  // Calories as bars. Each bar is a stored value; a missing day has no bar.
+  function caloriesSvg(points) {
+    const pts = (points || []).filter((p) => p && p.value != null);
+    if (!pts.length) return "";
+    const W = 600, H = 120, base = H - 1;
+    const max = Math.max(1, ...pts.map((p) => p.value));
+    const bw = W / pts.length;
+    const bars = pts.map((p, i) => {
+      const bh = Math.max(1.5, (p.value / max) * (H - 6));
+      const x = i * bw + bw * 0.18;
+      return `<rect x="${x.toFixed(2)}" y="${(base - bh).toFixed(2)}" width="${(bw * 0.64).toFixed(2)}" height="${bh.toFixed(2)}" rx="1.5"></rect>`;
+    }).join("");
+    return `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Calories per day"><g class="manual-bars">${bars}</g></svg>`;
+  }
+
+  // Weight line plus a visually distinct rolling-trend line, both drawn only
+  // through stored points (no interpolation, no filling of gaps).
+  function weightSvg(points, trend) {
+    const pts = (points || []).filter((p) => p && p.value != null);
+    if (!pts.length) return null;
+    const tpts = (trend || []).filter((p) => p && p.value != null);
+    const W = 600, H = 130, padT = 10, padB = 12;
+    const vals = pts.concat(tpts).map((p) => p.value);
+    const min = Math.min(...vals), max = Math.max(...vals);
+    const rng = Math.max(0.5, max - min);
+    const days = pts.map((p) => ymdToDay(p.date));
+    const d0 = Math.min(...days);
+    const span = Math.max(1, Math.max(...days) - d0);
+    const xOf = (p) => ((ymdToDay(p.date) - d0) / span) * W;
+    const yOf = (v) => padT + (1 - (v - min) / rng) * (H - padT - padB);
+    const at = (p) => [xOf(p), yOf(p.value)];
+    const line = pts.length > 1 ? `<path class="manual-line" d="${smoothPath(pts.map(at))}"></path>` : "";
+    const trendLine = tpts.length > 1 ? `<path class="manual-trend" d="${smoothPath(tpts.map(at))}"></path>` : "";
+    const dots = pts.map((p) => {
+      const [x, y] = at(p);
+      return `<circle class="manual-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.6"></circle>`;
+    }).join("");
+    return {
+      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Weight and its rolling trend">${line}${trendLine}${dots}</svg>`,
+      hasTrend: tpts.length > 1,
+    };
+  }
+
+  function renderCharts(series) {
+    calChart.innerHTML = caloriesSvg(series.calories) || EMPTY;
+    const wt = weightSvg(series.weight, series.weight_trend);
+    wtChart.innerHTML = wt ? wt.svg : EMPTY;
+    wtLegend.hidden = !(wt && wt.hasTrend);
+  }
+
+  function renderRecent() {
+    const today = localToday();
+    const from = shiftDays(today, -29);
+    const byDate = new Map();
+    for (const e of ENTRIES) {
+      if (e.local_date < from || e.local_date > today) continue;
+      if (!byDate.has(e.local_date)) byDate.set(e.local_date, {});
+      byDate.get(e.local_date)[e.kind] = e;
+    }
+    const dates = [...byDate.keys()].sort().reverse();
+    if (!dates.length) {
+      recent.replaceChildren(el("p", "manual-empty", "No entries yet."));
+      return;
+    }
+    const table = el("div", "manual-table");
+    table.append(el("div", "manual-thead", "<span>Date</span><span>Values</span><span></span>"));
+    for (const date of dates) {
+      const rec = byDate.get(date);
+      const kcal = rec.calories_eaten ? `${Math.round(rec.calories_eaten.value)} kcal` : "—";
+      const wt = rec.weight_kg ? `${round1(dispWeight(rec.weight_kg.value)).toFixed(1)} ${UNIT}` : "—";
+      const row = el("div", "manual-trow");
+      row.append(el("div", "manual-date", esc(fmtDay(date))));
+      row.append(el("div", "manual-vals", `<span>${kcal}</span><span>${wt}</span>`));
+      const actions = el("div", "manual-actions");
+      const edit = el("button", "manual-btn", "Edit");
+      edit.type = "button";
+      edit.addEventListener("click", () => {
+        dateInput.value = date;
+        fillFromEntries();
+        panel.scrollIntoView({ block: "start", behavior: "smooth" });
+        calInput.focus();
+      });
+      const del = el("button", "manual-btn manual-btn-danger", "Delete");
+      del.type = "button";
+      del.addEventListener("click", () => removeDate(date));
+      actions.append(edit, del);
+      row.append(actions);
+      table.append(row);
+    }
+    recent.replaceChildren(table);
+  }
+
+  // Prefill from stored entries for the date currently in the form.
+  function fillFromEntries() {
+    const rec = ENTRIES.filter((e) => e.local_date === dateInput.value);
+    const cal = rec.find((e) => e.kind === "calories_eaten");
+    const wt = rec.find((e) => e.kind === "weight_kg");
+    calInput.value = cal ? trimNum(cal.value) : "";
+    wtInput.value = wt ? trimNum(dispWeight(wt.value)) : "";
+    msg("calories", "");
+    msg("weight", "");
+  }
+
+  async function save(kind) {
+    const date = dateInput.value || localToday();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      msg(kind, "Pick a date first.", true);
+      return;
+    }
+    const input = kind === "calories" ? calInput : wtInput;
+    const raw = input.value.trim();
+    if (raw === "") {
+      msg(kind, kind === "calories" ? "Enter calories in kcal." : `Enter a weight in ${UNIT}.`, true);
+      return;
+    }
+    const shown = Number(raw);
+    if (!Number.isFinite(shown) || shown < 0) {
+      msg(kind, "Enter a number that is not negative.", true);
+      return;
+    }
+    const payload = {
+      local_date: date,
+      kind: kind === "calories" ? "calories_eaten" : "weight_kg",
+      value: kind === "calories" ? shown : storeWeight(shown),
+      note: noteInput.value.trim() || null,
+    };
+    try {
+      const j = await (await postDash("/api/manual/entries", payload)).json();
+      if (!j.ok) {
+        msg(kind, j.error || "Could not save.", true);
+        return;
+      }
+      msg(kind, j.outcome === "updated" ? "Updated." : "Saved.", false);
+      await refresh();
+    } catch {
+      msg(kind, "Couldn't reach the local server.", true);
+    }
+  }
+
+  async function removeDate(date) {
+    if (!window.confirm(`Delete the entries for ${date}?`)) return;
+    try {
+      await Promise.all(["calories_eaten", "weight_kg"].map((kind) =>
+        deleteDash(`/api/manual/entries?date=${encodeURIComponent(date)}&kind=${kind}`)));
+      await refresh();
+      msg("calories", "");
+      msg("weight", "");
+    } catch {
+      toast("Couldn't reach the local server.", "error");
+    }
+  }
+
+  async function refresh() {
+    try {
+      const [sr, er] = await Promise.all([
+        fetch("/api/manual/series?days=180"),
+        fetch(`/api/manual/entries?from=${shiftDays(localToday(), -29)}&to=${localToday()}`),
+      ]);
+      const series = await sr.json();
+      const listed = await er.json();
+      if (series.error || listed.error) throw new Error(series.error || listed.error);
+      UNIT = series.unit || "kg";
+      wtUnit.textContent = UNIT;
+      wtChartUnit.textContent = UNIT;
+      ENTRIES = listed.entries || [];
+      renderCharts(series);
+      renderRecent();
+    } catch {
+      calChart.innerHTML = EMPTY;
+      wtChart.innerHTML = EMPTY;
+      wtLegend.hidden = true;
+      recent.replaceChildren(el("p", "manual-empty", "Could not load entries."));
+    }
+  }
+
+  dateInput.value = localToday();
+  $("manual-form").addEventListener("submit", (e) => e.preventDefault());
+  dateInput.addEventListener("change", fillFromEntries);
+  $("manual-save-calories").addEventListener("click", () => save("calories"));
+  $("manual-save-weight").addEventListener("click", () => save("weight"));
+  calInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); save("calories"); } });
+  wtInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); save("weight"); } });
+  noteInput.addEventListener("keydown", (e) => { if (e.key === "Enter") e.preventDefault(); });
+  refresh().then(fillFromEntries);
 })();

@@ -805,6 +805,97 @@ body.page-open { overflow: hidden; }
   padding: 24px; text-align: center; color: var(--muted); font-size: 14px;
 }
 
+/* ── daily manual entry: calories + weight, no ring needed ─── */
+.manual-panel { margin-top: var(--s5); }
+.manual-export {
+  font-size: 12px; color: var(--muted); text-decoration: none;
+  padding: 9px 12px; margin: -9px -12px -9px 0; border-radius: var(--radius-sm);
+}
+.manual-export:hover { color: var(--accent); background: var(--hover-fill); }
+
+.manual-form { display: flex; flex-direction: column; gap: var(--s3); margin-bottom: var(--s5); }
+.manual-row {
+  display: grid; grid-template-columns: 76px minmax(0, 1fr) auto;
+  align-items: center; gap: var(--s3);
+}
+.manual-row label {
+  font-size: 10.5px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--faint); font-weight: 580;
+}
+.manual-row input {
+  font-family: var(--sans); font-size: 15px; color: var(--text); width: 100%;
+  min-height: 40px; background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: var(--radius-sm); padding: 9px 11px;
+  -webkit-appearance: none; appearance: none;
+}
+.manual-row input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+/* keep the native date picker (appearance:none can hide the value on iOS Safari) */
+.manual-row input[type="date"] { -webkit-appearance: auto; appearance: auto; }
+.manual-input { position: relative; min-width: 0; }
+.manual-input input { padding-right: 42px; }
+.manual-unit {
+  position: absolute; right: 11px; top: 50%; transform: translateY(-50%);
+  font-size: 12px; color: var(--faint); pointer-events: none;
+}
+.manual-save { min-height: 40px; padding: 9px 16px; }
+.manual-msg { grid-column: 2 / -1; margin: 0; font-size: 12px; color: var(--muted); }
+.manual-msg:empty { display: none; }
+.manual-msg.is-error { color: var(--warn); }
+
+.manual-charts { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s5); margin-bottom: var(--s5); }
+.manual-chart { margin: 0; min-width: 0; }
+.manual-chart figcaption {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); margin-bottom: var(--s2);
+}
+.manual-chart-unit { color: var(--faint); }
+.manual-chart-body { min-height: 120px; }
+.manual-svg { display: block; width: 100%; height: 120px; overflow: visible; }
+.manual-bars rect { fill: var(--accent); opacity: 0.5; }
+.manual-line { fill: none; stroke: var(--accent); stroke-width: 1.6; vector-effect: non-scaling-stroke; }
+.manual-trend { fill: none; stroke: var(--muted); stroke-width: 1.6; stroke-dasharray: 5 4; vector-effect: non-scaling-stroke; }
+.manual-dot { fill: var(--accent); }
+.manual-legend { display: flex; gap: 14px; margin-top: var(--s2); font-size: 12px; color: var(--muted); }
+.manual-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.manual-sw { width: 14px; height: 0; border-top-width: 2.5px; border-top-style: solid; }
+.manual-sw.weight { border-color: var(--accent); }
+.manual-sw.trend { border-color: var(--muted); border-top-style: dashed; }
+.manual-empty { margin: 0; padding: var(--s5) 0; text-align: center; color: var(--faint); font-size: 13px; }
+
+.manual-table { display: flex; flex-direction: column; }
+.manual-thead, .manual-trow {
+  display: grid; grid-template-columns: 92px minmax(0, 1fr) auto;
+  align-items: center; gap: var(--s3); padding: 6px 0;
+}
+.manual-thead {
+  font-size: 10.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--faint); border-bottom: 1px solid var(--line);
+}
+.manual-trow { border-bottom: 1px solid var(--line-soft); font-size: 14px; }
+.manual-date { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+.manual-vals { display: flex; gap: 10px 18px; flex-wrap: wrap; min-width: 0; font-variant-numeric: tabular-nums; }
+.manual-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.manual-btn {
+  font-family: var(--sans); font-size: 13px; color: var(--muted); cursor: pointer;
+  min-height: 40px; padding: 0 12px; background: none;
+  border: 1px solid var(--line); border-radius: var(--radius-sm);
+}
+.manual-btn:hover { color: var(--text); border-color: var(--hover-line); background: var(--hover-fill); }
+.manual-btn-danger:hover { color: var(--warn); border-color: color-mix(in oklab, var(--warn) 40%, var(--line)); }
+
+@media (max-width: 760px) {
+  .manual-charts { grid-template-columns: 1fr; gap: var(--s4); }
+}
+@media (max-width: 560px) {
+  .manual-row { grid-template-columns: 64px minmax(0, 1fr); }
+  .manual-save { grid-column: 2; justify-self: end; }
+  .manual-msg { grid-column: 2; }
+  .manual-thead { display: none; }
+  .manual-trow { grid-template-columns: 1fr auto; row-gap: 4px; padding: 10px 0; }
+  .manual-vals { grid-column: 1 / -1; }
+}
+
 /* ── profile dialog ─────────────────────────────────────── */
 .dialog {
   border: 1px solid var(--line); border-radius: var(--radius);

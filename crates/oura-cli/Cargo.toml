@@ -15,7 +15,8 @@ oura-protocol = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d33
 oura-link = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
 oura-store = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
 oura-summary = { path = "../oura-summary" }
-oura-dna = { path = "../oura-dna" }
+oura-manual = { path = "../oura-manual" }
+oura-import = { path = "../oura-import" }
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }
@@ -23,12 +24,8 @@ anyhow = "1"
 hex = "0.4"
 serde_json = "1"
 regex = "1"
-rusqlite = { version = "0.31", features = ["bundled"] }
+rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 sha2 = "0.10"
-# Outbound HTTPS is used ONLY to fetch PUBLIC PGS Catalog score *definitions* from
-# EBI on explicit user action (see dna.rs); no genome/personal data is ever sent.
-# rustls (no system OpenSSL) keeps the macOS build turnkey.
-ureq = { version = "2", default-features = false, features = ["tls"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 getrandom = "0.3"

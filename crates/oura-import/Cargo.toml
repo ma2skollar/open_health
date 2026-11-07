@@ -1,0 +1,12 @@
+[package]
+name = "oura-import"
+description = "Import historical manual metrics into manual.db: dry run, explicit mapping, provenance and rollback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+oura-manual = { path = "../oura-manual" }
+csv = "1"
+thiserror = "1"

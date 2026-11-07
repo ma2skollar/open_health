@@ -1,5 +1,13 @@
 # Two clients, one core — keep them in sync
 
+> **Fork note.** This document is upstream's and is retained for reference. In
+> this fork the **DNA explorer** and the **blood/lab panel** have been removed,
+> together with the `oura-dna` crate, the `dna/` directory, the web assets, the
+> routes, the CLI flags, and the `ureq` outbound dependency (third-party upload
+> and download). See `docs/LOCAL-MODIFICATIONS.md` and
+> `docs/DECISIONS/0006-remove-dna-blood-and-outbound-integrations.md`. Sections
+> below that describe those two panels no longer apply.
+
 open_health has **two user-facing clients that render the same health data**. When you
 add or change a feature, you almost always have to touch **both**. This is the map.
 
@@ -206,6 +214,12 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
 
 ## Known gaps (web-only, not yet on iOS)
 
+- **Daily manual entry** (calories eaten + body weight): the *Daily entry* panel and the
+  `GET/POST/DELETE /api/manual/entries`, `GET /api/manual/series`, `GET /api/manual/export`
+  routes over the separate `manual.db` (`crates/oura-manual`; see
+  `docs/DECISIONS/0003-separate-manual-metric-store.md`). It works with **no ring and no
+  ring database**. Deliberately web-only for now — the native app has no manual-metric UI
+  yet, and the metric is not part of `oura-summary`'s JSON (it is its own store).
 - **One-page day view**: web shows Sleep, Activity and Heart rate on one scrolling page, every
   chart on one time axis (`dayAxis`) with a shared cursor (`dayCursor`), plus ‹ › / ← → to step
   through days with data; iOS `DayReportView` keeps tabs and reaches days via `AllDaysView`.

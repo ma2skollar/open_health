@@ -24,14 +24,6 @@
           <span class="ic" style="--i:url(/icons/arrows-clockwise.svg)"></span>
           <span id="sync-label">Sync</span>
         </button>
-        <a id="dna-link" class="action" href="/dna" title="Explore your DNA">
-          <span class="ic" style="--i:url(/icons/dna.svg)"></span>
-          <span>DNA</span>
-        </a>
-        <a id="blood-link" class="action" href="/blood" title="Blood test panel">
-          <span class="ic" style="--i:url(/icons/drop.svg)"></span>
-          <span>Blood</span>
-        </a>
         <button id="profile-btn" class="action icon-only" title="Edit your details" aria-label="Edit profile">
           <span class="ic" style="--i:url(/icons/user.svg)"></span>
         </button>
@@ -41,6 +33,66 @@
     <section class="brief" aria-labelledby="brief-label">
       <span id="brief-label" class="brief-label">Latest interpretation</span>
       <p id="digest" class="digest skeleton skeleton-text">&nbsp;</p>
+    </section>
+
+    <!-- manual metrics: calories + weight, usable with no ring and no ring DB -->
+    <section class="panel manual-panel" id="manual-panel" aria-labelledby="manual-title">
+      <div class="panel-head">
+        <h2 id="manual-title"><span class="ic" style="--i:url(/icons/act-kcal.svg)"></span>Daily entry</h2>
+        <a class="manual-export" id="manual-export" href="/api/manual/export" download="manual-entries.csv">Export CSV</a>
+      </div>
+
+      <form id="manual-form" class="manual-form" novalidate>
+        <div class="manual-row">
+          <label for="manual-date">Date</label>
+          <input id="manual-date" name="local_date" type="date" required />
+        </div>
+
+        <div class="manual-row">
+          <label for="manual-calories">Calories</label>
+          <div class="manual-input">
+            <input id="manual-calories" name="calories" type="number" inputmode="numeric" min="0" max="20000" step="1" placeholder="0" />
+            <span class="manual-unit">kcal</span>
+          </div>
+          <button type="button" class="btn-primary manual-save" id="manual-save-calories">Save</button>
+          <p class="manual-msg" id="manual-msg-calories" role="status"></p>
+        </div>
+
+        <div class="manual-row">
+          <label for="manual-weight">Weight</label>
+          <div class="manual-input">
+            <input id="manual-weight" name="weight" type="number" inputmode="decimal" min="0" step="0.1" placeholder="0" />
+            <span class="manual-unit" id="manual-weight-unit">kg</span>
+          </div>
+          <button type="button" class="btn-primary manual-save" id="manual-save-weight">Save</button>
+          <p class="manual-msg" id="manual-msg-weight" role="status"></p>
+        </div>
+
+        <div class="manual-row">
+          <label for="manual-note">Note</label>
+          <input id="manual-note" name="note" type="text" maxlength="2000" placeholder="optional — saved with the row you save" />
+        </div>
+      </form>
+
+      <div class="manual-charts">
+        <figure class="manual-chart">
+          <figcaption><span>Calories</span><span class="manual-chart-unit">kcal</span></figcaption>
+          <div class="manual-chart-body" id="manual-calories-chart"><p class="manual-empty">No data yet.</p></div>
+        </figure>
+        <figure class="manual-chart">
+          <figcaption><span>Weight</span><span class="manual-chart-unit" id="manual-weight-chart-unit">kg</span></figcaption>
+          <div class="manual-chart-body" id="manual-weight-chart"><p class="manual-empty">No data yet.</p></div>
+          <div class="manual-legend" id="manual-weight-legend" hidden>
+            <span><i class="manual-sw weight"></i>Weight</span>
+            <span><i class="manual-sw trend"></i>7-entry trend</span>
+          </div>
+        </figure>
+      </div>
+
+      <div class="manual-recent">
+        <p class="subhead">Recent entries · last 30 days</p>
+        <div id="manual-recent"><p class="manual-empty">No entries yet.</p></div>
+      </div>
     </section>
 
     <main class="dashboard-grid">

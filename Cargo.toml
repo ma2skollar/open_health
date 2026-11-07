@@ -5,7 +5,14 @@ members = [
     "crates/oura-ffi",
     "crates/oura-core",
     "crates/oura-summary",
-    "crates/oura-dna",
+    "crates/oura-manual",
+    "crates/oura-import",
+    "crates/oura-backup",
+    "crates/oura-protocol-v1",
+    "crates/oura-hub",
+    "crates/oura-ble",
+    "crates/oura-collector",
+    "crates/oura-collector-sim",
 ]
 
 [workspace.package]

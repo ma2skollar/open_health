@@ -1,0 +1,33 @@
+[Unit]
+Description=Oura backup (manual.db plus the ring database)
+Documentation=file:/srv/oura/README.md
+After=oura-dashboard.service
+Requires=oura-dashboard.service
+ConditionPathExists=/srv/oura/bin/oura-backup
+
+[Service]
+Type=oneshot
+User=oura
+Group=oura
+WorkingDirectory=/srv/oura
+EnvironmentFile=-/etc/oura/oura.env
+ExecStart=/srv/oura/bin/oura-backup create --dest /srv/oura/backups --db ${OURA_RING_DB} --manual-db ${OURA_MANUAL_DB} --label scheduled
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# Backups read the databases and write only under the data root.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+ReadWritePaths=/srv/oura

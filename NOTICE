@@ -1,0 +1,23 @@
+NOTICE
+======
+
+This repository is a fork of "open_health" by Th0rgal
+(https://github.com/Th0rgal/open_health), licensed under the MIT License.
+The upstream LICENSE file is retained unchanged.
+
+Fork base revision: 8f616ec5bdf569e7faecbcefa2b8eff6f69ae2bc (2026-10-25)
+
+It depends on crates from "open_oura" by the same author
+(https://github.com/Th0rgal/open_oura), also MIT licensed, pinned to revision
+4f7957d3304c4084f0e1e703f3d84606bf10b781, and vendors that project's
+"oura-store" crate under vendor/oura-store as upstream's Cargo [patch] does.
+
+Local modifications relative to the fork base are listed in
+docs/LOCAL-MODIFICATIONS.md.
+
+Third-party assets:
+  - Dashboard SVG icons derived from Phosphor Icons (MIT), vendored under
+    dashboard/web/icons/ so the dashboard needs no external asset host.
+
+No proprietary model files, ring authentication keys, or personal health data
+are included in this repository.
