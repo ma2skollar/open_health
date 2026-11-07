@@ -23,8 +23,14 @@ source "$_cs_boot" 2>/dev/null || source <(curl -fsSL "${COMMUNITY_SCRIPTS_CORE_
 
 APP="Open Health"
 var_tags="${var_tags:-health;dashboard;oura}"
+# Recommended resources: 2 vCPU, 4096 MiB RAM, 8 GiB disk.
+#
+# The build is the peak, not the dashboard: rustup plus a release build with
+# LTO. 2048 MiB also completed a build, with no headroom to spare, and 2 GiB is
+# what docs/DEPLOY_LXC.md lists as the bare minimum. At runtime the service is
+# idle. The Advanced dialog overrides all three (var_cpu, var_ram, var_disk).
 var_cpu="${var_cpu:-2}"
-var_ram="${var_ram:-2048}"
+var_ram="${var_ram:-4096}"
 var_disk="${var_disk:-8}"
 var_os="${var_os:-debian}"
 var_version="${var_version:-12}"
@@ -58,15 +64,21 @@ function update_script() {
   fi
 
   msg_info "Updating ${APP}"
-  cd /root/oura
+  cd /root/oura || exit 1
   git pull --ff-only
+  # shellcheck disable=SC1091
   . "$HOME/.cargo/env"
   cargo build --release -p oura-cli -p oura-backup
+  # cargo build alone leaves /srv/oura/bin/oura on the previous revision, so the
+  # built binaries still have to be installed.
+  ./deploy/install.sh --bin ./target/release/oura --backup-bin ./target/release/oura-backup || true
+  systemctl restart oura-dashboard.service
+  if ! systemctl is-active --quiet oura-dashboard.service; then
+    msg_error "oura-dashboard.service did not come back up"
+    exit 1
+  fi
   msg_ok "Updated ${APP}"
-
-  msg_info "Restarting service"
-  systemctl restart oura-dashboard
-  msg_ok "Restarted service"
+  msg_ok "Updated successfully!"
   exit
 }
 
@@ -74,4 +86,9 @@ start
 build_container
 description
 
-msg_ok "Completed Successfully!\n"
+msg_ok "Completed successfully!\n"
+echo -e "${CREATING}${GN}${APP} setup has been successfully initialized!${CL}"
+echo -e "${INFO}${YW}The dashboard binds loopback only. Reach it from your workstation with:${CL}"
+echo -e "${GATEWAY}${BGN}ssh -N -L 8090:[IP_ADDRESS]:8090 root@${IP}${CL}"
+echo -e "${INFO}${YW}then open http://[IP_ADDRESS]:8090 in a browser.${CL}"
+echo -e "${INFO}${YW}Health check: pct exec ${CTID} -- /root/oura/deploy/health.sh${CL}"

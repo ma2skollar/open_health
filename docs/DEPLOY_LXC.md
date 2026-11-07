@@ -39,8 +39,25 @@ The engine creates the container and runs `install/openhealth-install.sh` inside
 it (the engine derives that name from `APP`): build
 dependencies, the Rust toolchain, a clone of this repository, `cargo build` for
 `oura-cli` and `oura-backup`, then `deploy/install.sh` and the systemd units.
-The dialog is skipped when stdin is not a terminal; set `var_cpu`, `var_ram`,
-`var_disk`, `var_version` or `CTID` to override the defaults then.
+
+Every choice made in the dialog is applied inside the container: root password or
+automatic login, console mode, timezone, SSH keys and the MOTD are handled by the
+engine's own `setting_up_container` / `motd_ssh` / `customize` steps, which
+`install/openhealth-install.sh` runs. `OURA_TZ_OFFSET` follows the container
+timezone rather than a fixed value.
+
+### Resources
+
+| Resource | Value | Why |
+|---|---|---|
+| vCPU | 2 | Parallel `rustc` during the build; idle afterwards |
+| RAM | 4 GiB | The build is the peak (rustup + release build with LTO) |
+| Disk | 8 GiB | Toolchain plus build artefacts; 8 GiB completed a full build |
+
+2 GiB RAM also completes a build but leaves no headroom, and it is the minimum
+quoted below. The dashboard itself is idle at runtime. Override with `var_cpu`,
+`var_ram` or `var_disk`; `var_version` and `CTID` work the same way. The dialog is
+skipped when stdin is not a terminal.
 
 ### Manual
 
@@ -116,6 +133,13 @@ never replaces it.
 
 The dashboard binds `127.0.0.1` on purpose. Pick one access path. Do **not**
 publish the port directly to the internet.
+
+The installer prints the tunnel command for the container it built. To check the
+dashboard from the container itself:
+
+```sh
+pct exec <ctid> -- /root/oura/deploy/health.sh
+```
 
 ### Option A — SSH tunnel (fastest, no extra service)
 
@@ -196,7 +220,17 @@ delay. A Proxmox VE snapshot alone is **not** a backup; see `docs/OPERATIONS.md`
 
 ## 10. Upgrade and rollback
 
-Upgrade: install the new binary, `systemctl restart oura-dashboard.service`, then
+Upgrade with the engine's entrypoint, which pulls the tracked branch, rebuilds
+and reinstalls the units and the service:
+
+```sh
+update                       # inside the container
+pct exec <ctid> -- update    # from the Proxmox host
+```
+
+By hand: `git pull`, `cargo build --release -p oura-cli -p oura-backup`,
+`deploy/install.sh --bin ./target/release/oura --backup-bin
+./target/release/oura-backup`, `systemctl restart oura-dashboard.service`, then
 re-run `health.sh`. Migrations are forward-only.
 
 Rollback: stop the service, restore the previous binary and the databases from a
