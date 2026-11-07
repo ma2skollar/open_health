@@ -55,16 +55,32 @@ ok "Build complete"
 
 # ── Install ───────────────────────────────────────────────────────────────────
 say "Installing binaries and units..."
+# A clone made on a Windows host can lose the executable bit, so never rely on
+# it and never invoke the script by path alone.
+chmod +x ./deploy/install.sh ./deploy/health.sh 2>/dev/null || true
 # install.sh copies oura.env.example and already tries to start the unit; that
 # start cannot succeed while the example still holds __PLACEHOLDER__ paths, so a
-# non-zero exit here is expected on the first run and not fatal on its own.
-./deploy/install.sh --bin ./target/release/oura --backup-bin ./target/release/oura-backup ||
-  warn "install.sh reported a failure — configuration is fixed next"
+# non-zero exit here is expected on the first run. Its units are written before
+# that last step, so they are what tells whether the install actually happened.
+install_rc=0
+bash ./deploy/install.sh --bin ./target/release/oura --backup-bin ./target/release/oura-backup ||
+  install_rc=$?
+if [ ! -f /etc/systemd/system/oura-dashboard.service ]; then
+  err "install.sh failed (exit ${install_rc}) before installing the units"
+  exit 1
+fi
+if [ "$install_rc" -ne 0 ]; then
+  warn "install.sh exit ${install_rc} — expected until oura.env is configured"
+fi
 ok "Installed"
 
 # ── Configure ─────────────────────────────────────────────────────────────────
 CONF=/etc/oura/oura.env
-if grep -q '__PLACEHOLDER__' "$CONF" 2>/dev/null; then
+if [ ! -f "$CONF" ]; then
+  err "install.sh did not create ${CONF}"
+  exit 1
+fi
+if grep -q '__PLACEHOLDER__' "$CONF"; then
   say "Configuring ${CONF}..."
   sed -i 's|__RING_DB__|/srv/oura/data/oura.db|g' "$CONF"
   sed -i 's|__MANUAL_DB__|/srv/oura/data/manual.db|g' "$CONF"
@@ -72,7 +88,7 @@ if grep -q '__PLACEHOLDER__' "$CONF" 2>/dev/null; then
   sed -i 's|__HUB_STATE_DIR__|/srv/oura/data/hub|g' "$CONF"
   ok "Placeholders replaced — review ${CONF}"
 else
-  say "oura.env already configured — left untouched"
+  say "${CONF} already configured — left untouched"
 fi
 
 # ── Enable and start ──────────────────────────────────────────────────────────
