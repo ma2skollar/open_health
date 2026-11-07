@@ -16,7 +16,7 @@
 #
 #   CTID=200 CT_HOSTNAME=oura CONTAINER_STORAGE=local-lvm \
 #   TEMPLATE_STORAGE=local TEMPLATE=debian-12-standard_12.7-1_amd64.tar.zst \
-#   MEMORY=2048 CORES=2 DISK=8 REPO_URL=https://github.com/Th0rgal/open_health.git \
+#   MEMORY=2048 CORES=2 DISK=8 REPO_URL=https://github.com/ma2skollar/open_health.git \
 #   BRANCH=main bash pve-setup.sh
 #
 # The script is idempotent: re-running it skips an existing container and only
