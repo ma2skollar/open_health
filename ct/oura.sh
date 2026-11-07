@@ -15,6 +15,12 @@
 # The script base points at this fork: a ct script fetched with curl cannot tell
 # the engine where it came from, and install/openhealth-install.sh only exists
 # here.
+#
+# After the wizard it asks how the dashboard should be reachable — loopback (the
+# default) or this container's LAN interfaces — and install/openhealth-install.sh
+# writes the answer into /etc/oura/oura.env as OURA_BIND. Preset var_oura_bind (or
+# OURA_BIND) to skip the question: empty keeps loopback, `all` serves the LAN, and
+# any other value is used verbatim as a listen address.
 
 export COMMUNITY_SCRIPTS_URL="${COMMUNITY_SCRIPTS_URL:-https://raw.githubusercontent.com/ma2skollar/open_health/main}"
 
@@ -83,6 +89,35 @@ function update_script() {
 }
 
 start
+
+# The engine's wizard has no step for an app-specific question, so where the
+# dashboard listens is asked here: on the host, after the wizard, before the
+# container exists, and the answer is handed to install/openhealth-install.sh,
+# which writes OURA_BIND into /etc/oura/oura.env. An update run never reaches this
+# point, and a preset (var_oura_bind, or OURA_BIND) skips the question.
+if [[ -z "${var_oura_bind:-}" ]]; then
+  var_oura_bind="${OURA_BIND:-}"
+fi
+if [[ -z "$var_oura_bind" ]] && [[ "${PHS_SILENT:-0}" != "1" ]] &&
+  command -v whiptail >/dev/null 2>&1 && [[ -t 0 ]]; then
+  choice="$(whiptail --backtitle "Proxmox VE Helper Scripts" --title "DASHBOARD ACCESS" \
+    --ok-button "Select" --cancel-button "Keep it private" \
+    --menu "\nHow should the Oura dashboard be reachable?\n
+  Loopback    inside the container only; reach it over an SSH tunnel.
+  On the LAN  this container's interfaces; open http://<container-ip>:8090.
+
+There is no login on the dashboard. Keep port 8090 on your LAN or VPN
+and never forward it from the internet.\n" \
+    20 78 2 \
+    "loopback" "Loopback only (recommended)" \
+    "lan" "Reachable on the LAN" 3>&1 1>&2 2>&3)" || choice="loopback"
+  case "$choice" in
+  lan) var_oura_bind="all" ;;
+  *) var_oura_bind="" ;;
+  esac
+fi
+export var_oura_bind="${var_oura_bind:-}"
+
 build_container
 description
 

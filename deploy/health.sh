@@ -7,6 +7,12 @@
 # it never prints a token, a key, or a health payload.
 set -uo pipefail
 
+# The service reads /etc/oura/oura.env; read the same file so the probe uses the
+# port and listen address the dashboard was actually given.
+CONF="${OURA_CONF:-/etc/oura/oura.env}"
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
 PORT="${OURA_PORT:-8090}"
 DATA_DIR="${OURA_DATA_DIR:-/srv/oura}"
 MIN_FREE_MB="${MIN_FREE_MB:-500}"
@@ -25,12 +31,23 @@ else
     ok "systemctl not present — service state not checked"
 fi
 
-# 2. The dashboard answers on its loopback port.
-code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://localhost:${PORT}/api/summary" 2>/dev/null || true)"
+# 2. The dashboard answers on the address it is configured to listen on. A
+# specific bind does not serve loopback, so "localhost" alone would report a
+# false failure; a wildcard bind does serve loopback, so it is tried first and
+# the configured address is the fallback.
+probe() {
+    curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://$1:${PORT}/api/summary" 2>/dev/null || true
+}
+code="$(probe localhost)"
+probed="localhost"
+if [ "$code" != 200 ] && [ -n "${OURA_BIND:-}" ] && [ "$OURA_BIND" != localhost ]; then
+    code="$(probe "$OURA_BIND")"
+    probed="$OURA_BIND"
+fi
 case "$code" in
-    200) ok "dashboard answers on the loopback port (HTTP 200)" ;;
-    000|"") bad "dashboard did not answer on the loopback port" ;;
-    *) bad "dashboard answered HTTP ${code}" ;;
+    200) ok "dashboard answers on ${probed}:${PORT} (HTTP 200)" ;;
+    000|"") bad "dashboard did not answer on ${probed}:${PORT}" ;;
+    *) bad "dashboard answered HTTP ${code} on ${probed}:${PORT}" ;;
 esac
 
 # 3. Free disk above the floor.

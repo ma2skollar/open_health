@@ -164,18 +164,30 @@ address, and the browser talks to `[IP_ADDRESS]:8090` — the only `Host` the
 dashboard accepts. Log in as `root`: the `oura` service account has a nologin
 shell.
 
-### Option B — listen on the LAN address (simplest, least isolation)
+### Option B — serve the LAN (simplest, least isolation)
 
-Set the address the dashboard binds in `/etc/oura/oura.env` and restart the
-service:
+The installer asks. After the setup wizard it offers:
+
+```
+  Loopback    inside the container only; reach it over an SSH tunnel.
+  On the LAN  this container's interfaces; open http://<container-ip>:8090.
+```
+
+Answering "On the LAN" writes `OURA_BIND` into `/etc/oura/oura.env`, so
+`http://<container-ip>:8090` opens directly from any machine that can reach the
+LXC. Choosing loopback — or cancelling — leaves `OURA_BIND` unset and the
+dashboard on loopback.
+
+To change it afterwards, edit the value and restart:
 
 ```sh
-OURA_BIND=<lxc-lan-ip>
+sudoedit /etc/oura/oura.env     # OURA_BIND=0.0.0.0, or a specific address
 sudo systemctl restart oura-dashboard.service
 ```
 
-Then `http://<lxc-lan-ip>:8090` opens directly from any machine that can reach the
-LXC. Leaving `OURA_BIND` unset — or empty — keeps the loopback default.
+`OURA_BIND` takes any address the dashboard should listen on. Leave it unset or
+empty for loopback; an address that is not loopback stops answering on loopback,
+which `health.sh` accounts for.
 
 This drops the isolation the loopback bind provides, so restrict port 8090 to your
 LAN or VPN subnet with the LXC firewall, and never forward it from the internet.

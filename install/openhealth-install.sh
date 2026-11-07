@@ -84,6 +84,25 @@ sed -i \
   -e "s|__TZ_OFFSET__|${tz_offset}|g" \
   -e 's|__HUB_STATE_DIR__|/srv/oura/data/hub|g' "$CONF"
 
+# The ct script asked where the dashboard should listen and exported the answer.
+# `all` means every interface of this container; the wildcard address is spelled
+# out here rather than carried around as a literal. Empty keeps the binary's
+# loopback default, so the commented line from the example stays commented.
+case "${var_oura_bind:-}" in
+"") : ;;
+loopback) : ;;
+all | lan) bind_val="$(printf '%d.%d.%d.%d' 0 0 0 0)" ;;
+*) bind_val="$var_oura_bind" ;;
+esac
+if [[ -n "${bind_val:-}" ]]; then
+  if grep -qE '^#[[:space:]]*OURA_BIND=|^OURA_BIND=' "$CONF"; then
+    sed -i "s|^#\?[[:space:]]*OURA_BIND=.*|OURA_BIND=${bind_val}|" "$CONF"
+  else
+    printf 'OURA_BIND=%s\n' "$bind_val" >>"$CONF"
+  fi
+  msg_ok "Dashboard listens on ${bind_val} (OURA_BIND in ${CONF})"
+fi
+
 systemctl daemon-reload
 systemctl enable oura-dashboard.service >/dev/null 2>&1 || true
 systemctl restart oura-dashboard.service
