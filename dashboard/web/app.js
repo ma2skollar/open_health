@@ -2335,6 +2335,7 @@ load();
   };
   const trimNum = (v) => String(Math.round(v * 100) / 100);
   const round1 = (v) => Math.round(v * 10) / 10;
+  const round2 = (v) => Math.round(v * 100) / 100;
   const dispWeight = (kg) => (UNIT === "lb" ? kg * LB_PER_KG : kg);
   const storeWeight = (shown) => (UNIT === "lb" ? shown / LB_PER_KG : shown);
   const ymdToDay = (ymd) => {
@@ -2422,10 +2423,12 @@ load();
 
   // "1,940" with a sign only when the value is not zero. Null means "no
   // comparison period", which reads as an em dash, not as zero.
-  function formatChange(v, unit) {
+  function formatChange(v, unit, decimals = 0) {
     if (v == null) return "—";
     const sign = v > 0 ? "+" : "";
-    return `${sign}${Math.round(v).toLocaleString()} ${unit}`;
+    const rounded = Math.round(Math.abs(v) * 10 ** decimals) / 10 ** decimals;
+    const formatted = rounded.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
+    return `${sign}${formatted} ${unit}`;
   }
 
   // Four-week comparison numbers. The backend sends averages already in the
@@ -2446,11 +2449,11 @@ load();
         .join("");
     }
     if (hasWt) {
-      $("manual-wt-avg28").textContent = `${round1(wt.avg_28).toFixed(1)} ${UNIT}`;
-      $("manual-wt-avg7").textContent = `${round1(wt.avg_7).toFixed(1)} ${UNIT}`;
-      $("manual-wt-change").textContent = formatChange(wt.change, UNIT);
+      $("manual-wt-avg28").textContent = `${round2(wt.avg_28).toFixed(2)} ${UNIT}`;
+      $("manual-wt-avg7").textContent = `${round2(wt.avg_7).toFixed(2)} ${UNIT}`;
+      $("manual-wt-change").textContent = formatChange(wt.change, UNIT, 2);
       $("manual-wt-weeks").innerHTML = (wt.weekly || [])
-        .map((w) => `<span class="manual-week"><span class="manual-week-label">W${w.week + 1}</span><span class="manual-week-value">${round1(w.value).toFixed(1)}</span></span>`)
+        .map((w) => `<span class="manual-week"><span class="manual-week-label">W${w.week + 1}</span><span class="manual-week-value">${round2(w.value).toFixed(2)}</span></span>`)
         .join("");
     }
   }
@@ -2483,7 +2486,7 @@ load();
     for (const date of dates) {
       const rec = byDate.get(date);
       const kcal = rec.calories_eaten ? `${Math.round(rec.calories_eaten.value)} kcal` : "—";
-      const wt = rec.weight_kg ? `${round1(dispWeight(rec.weight_kg.value)).toFixed(1)} ${UNIT}` : "—";
+      const wt = rec.weight_kg ? `${round2(dispWeight(rec.weight_kg.value)).toFixed(2)} ${UNIT}` : "—";
       const row = el("div", "manual-trow");
       row.append(el("div", "manual-date", esc(fmtDay(date))));
       row.append(el("div", "manual-vals", `<span>${kcal}</span><span>${wt}</span>`));
