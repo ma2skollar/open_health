@@ -2,26 +2,25 @@
    One accent (teal), one radius scale, off-black/off-white, system type. */
 
 :root {
-  --bg: #f3f4f6;
+  --bg: #f8f8f4;
   --surface: #ffffff;
-  --surface-2: #fbfbfc;
-  --text: #1b1d21;
-  --muted: #6a7078;
-  --faint: #969ca6;
-  --line: rgba(17, 20, 24, 0.08);
-  --line-soft: rgba(17, 20, 24, 0.05);
+  --surface-2: #f4f0ec;
+  --text: #24201c;
+  --muted: #545048;
+  --faint: #8c8880;
+  --line: rgba(36, 32, 28, 0.10);
+  --line-soft: rgba(36, 32, 28, 0.06);
   --accent: #0d9488;
   --accent-soft: rgba(13, 148, 136, 0.12);
   --good: var(--accent);
   --warn: #c9842b;
   --shadow: none;
 
-  /* sleep stages — vivid hues, lightness-led (deep darkest → awake lightest);
-     rendered glassy (lower opacity) on the hypnogram so the saturation reads soft */
-  --deep: #454fb0;
-  --light: #8693d6;
-  --rem: #4fa6b0;
-  --wake: #d2b06e;
+  /* sleep stages — the app's blue/light-blue/green/orange legend */
+  --deep: #2c68c8;
+  --light: #9cc4f4;
+  --rem: #2cc48c;
+  --wake: #e07848;
 
   --radius: 10px;
   --radius-sm: 6px;
@@ -68,23 +67,23 @@
    data-theme="dark". Light stays the base :root, forced with data-theme="light". */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #0b0c0f;
-    --surface: #16181d;
-    --surface-2: #1b1e24;
-    --text: #e8e9ec;
-    --muted: #9aa0aa;
-    --faint: #6b7280;
-    --line: rgba(255, 255, 255, 0.09);
-    --line-soft: rgba(255, 255, 255, 0.06);
-    --accent: #2dd4bf;
-    --accent-soft: rgba(45, 212, 191, 0.14);
+    --bg: #101010;
+    --surface: #1c1b18;
+    --surface-2: #282420;
+    --text: #ece8e0;
+    --muted: #a8a094;
+    --faint: #6c6862;
+    --line: rgba(236, 232, 224, 0.12);
+    --line-soft: rgba(236, 232, 224, 0.07);
+    --accent: #2cc48c;
+    --accent-soft: rgba(44, 196, 140, 0.14);
     --good: var(--accent);
-    --warn: #e0a44e;
+    --warn: #e07848;
     --shadow: none;
-    --deep: #5d6989;
-    --light: #8c97b3;
-    --rem: #6fa1a8;
-    --wake: #c1b08f;
+    --deep: #2c68c8;
+    --light: #9cc4f4;
+    --rem: #2cc48c;
+    --wake: #e07848;
     --sheen: none;
     --sheen-strong: none;
     --rim: 0 0 0 1px var(--line);
@@ -93,23 +92,23 @@
   }
 }
 :root[data-theme="dark"] {
-  --bg: #0b0c0f;
-  --surface: #16181d;
-  --surface-2: #1b1e24;
-  --text: #e8e9ec;
-  --muted: #9aa0aa;
-  --faint: #6b7280;
-  --line: rgba(255, 255, 255, 0.09);
-  --line-soft: rgba(255, 255, 255, 0.06);
-  --accent: #2dd4bf;
-  --accent-soft: rgba(45, 212, 191, 0.14);
+  --bg: #101010;
+  --surface: #1c1b18;
+  --surface-2: #282420;
+  --text: #ece8e0;
+  --muted: #a8a094;
+  --faint: #6c6862;
+  --line: rgba(236, 232, 224, 0.12);
+  --line-soft: rgba(236, 232, 224, 0.07);
+  --accent: #2cc48c;
+  --accent-soft: rgba(44, 196, 140, 0.14);
   --good: var(--accent);
-  --warn: #e0a44e;
+  --warn: #e07848;
   --shadow: none;
-  --deep: #5d6989;
-  --light: #8c97b3;
-  --rem: #6fa1a8;
-  --wake: #c1b08f;
+  --deep: #2c68c8;
+  --light: #9cc4f4;
+  --rem: #2cc48c;
+  --wake: #e07848;
   --sheen: none;
   --sheen-strong: none;
   --rim: 0 0 0 1px var(--line);
@@ -160,7 +159,7 @@ body {
   background: var(--accent);
   box-shadow: inset 0 0 0 3px var(--bg);
 }
-.word { font-weight: 600; letter-spacing: -0.01em; font-size: 16px; }
+.word { font-family: var(--serif); font-weight: 500; letter-spacing: -0.01em; font-size: 17px; }
 .brand-copy { display: flex; align-items: baseline; gap: 11px; min-width: 0; }
 .brand-meta {
   font-family: var(--mono); font-size: 9px; line-height: 1;
@@ -206,9 +205,9 @@ body {
   color: var(--faint); letter-spacing: 0.1em; text-transform: uppercase;
 }
 .digest {
-  font-family: var(--sans);
-  font-size: 15px;
-  line-height: 1.5;
+  font-family: var(--serif);
+  font-size: 16px;
+  line-height: 1.55;
   font-weight: 400;
   margin: 0;
   max-width: 78ch;
