@@ -2347,17 +2347,17 @@ load();
   const wtInput = $("manual-weight");
   const noteInput = $("manual-note");
   const wtUnit = $("manual-weight-unit");
-  const wtChartUnit = $("manual-weight-chart-unit");
   const wtLegend = $("manual-weight-legend");
   const calLegend = $("manual-calories-legend");
   const calChart = $("manual-calories-chart");
   const wtChart = $("manual-weight-chart");
   const summary = $("manual-summary");
   const recent = $("manual-recent");
+  const dlg = $("manual-dialog");
   const EMPTY = '<p class="manual-empty">No data yet.</p>';
 
-  const msg = (kind, text, isError) => {
-    const p = $("manual-msg-" + kind);
+  const msg = (text, isError) => {
+    const p = $("manual-msg");
     if (!p) return;
     p.textContent = text || "";
     p.classList.toggle("is-error", !!isError);
@@ -2490,12 +2490,7 @@ load();
       const actions = el("div", "manual-actions");
       const edit = el("button", "manual-btn", "Edit");
       edit.type = "button";
-      edit.addEventListener("click", () => {
-        dateInput.value = date;
-        fillFromEntries();
-        panel.scrollIntoView({ block: "start", behavior: "smooth" });
-        calInput.focus();
-      });
+      edit.addEventListener("click", () => openModal(date));
       const del = el("button", "manual-btn manual-btn-danger", "Delete");
       del.type = "button";
       del.addEventListener("click", () => removeDate(date));
@@ -2513,43 +2508,60 @@ load();
     const wt = rec.find((e) => e.kind === "weight_kg");
     calInput.value = cal ? trimNum(cal.value) : "";
     wtInput.value = wt ? trimNum(dispWeight(wt.value)) : "";
-    msg("calories", "");
-    msg("weight", "");
+    msg("");
   }
 
-  async function save(kind) {
+  // Open the dialog. With a date, the form prefills from stored entries; with
+  // none, it starts on today.
+  function openModal(date) {
+    dateInput.value = date || localToday();
+    fillFromEntries();
+    msg("");
+    if (typeof dlg.showModal === "function") dlg.showModal();
+    else dlg.setAttribute("open", "");
+  }
+
+  // Save both fields in one submit. Empty fields are skipped; at least one
+  // value must be present. Each request runs in parallel and the dialog only
+  // closes after every response reports success.
+  async function saveModal() {
     const date = dateInput.value || localToday();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
-      msg(kind, "Pick a date first.", true);
+      msg("Pick a date first.", true);
       return;
     }
-    const input = kind === "calories" ? calInput : wtInput;
-    const raw = input.value.trim();
-    if (raw === "") {
-      msg(kind, kind === "calories" ? "Enter calories in kcal." : `Enter a weight in ${UNIT}.`, true);
+    const calRaw = calInput.value.trim();
+    const wtRaw = wtInput.value.trim();
+    const cal = calRaw === "" ? null : Number(calRaw);
+    const wt = wtRaw === "" ? null : Number(wtRaw);
+    if (cal !== null && (!Number.isFinite(cal) || cal < 0)) {
+      msg("Enter calories that are not negative.", true);
       return;
     }
-    const shown = Number(raw);
-    if (!Number.isFinite(shown) || shown < 0) {
-      msg(kind, "Enter a number that is not negative.", true);
+    if (wt !== null && (!Number.isFinite(wt) || wt < 0)) {
+      msg(`Enter a weight in ${UNIT} that is not negative.`, true);
       return;
     }
-    const payload = {
-      local_date: date,
-      kind: kind === "calories" ? "calories_eaten" : "weight_kg",
-      value: kind === "calories" ? shown : storeWeight(shown),
-      note: noteInput.value.trim() || null,
-    };
+    if (cal === null && wt === null) {
+      msg("Enter calories or a weight.", true);
+      return;
+    }
+    const note = noteInput.value.trim() || null;
+    const payloads = [];
+    if (cal !== null) payloads.push({ local_date: date, kind: "calories_eaten", value: cal, note });
+    if (wt !== null) payloads.push({ local_date: date, kind: "weight_kg", value: storeWeight(wt), note });
     try {
-      const j = await (await postDash("/api/manual/entries", payload)).json();
-      if (!j.ok) {
-        msg(kind, j.error || "Could not save.", true);
-        return;
+      const results = await Promise.all(payloads.map((p) => postDash("/api/manual/entries", p).then((r) => r.json())));
+      for (const j of results) {
+        if (!j.ok) {
+          msg(j.error || "Could not save.", true);
+          return;
+        }
       }
-      msg(kind, j.outcome === "updated" ? "Updated." : "Saved.", false);
+      dlg.close();
       await refresh();
     } catch {
-      msg(kind, "Couldn't reach the local server.", true);
+      msg("Couldn't reach the local server.", true);
     }
   }
 
@@ -2559,8 +2571,7 @@ load();
       await Promise.all(["calories_eaten", "weight_kg"].map((kind) =>
         deleteDash(`/api/manual/entries?date=${encodeURIComponent(date)}&kind=${kind}`)));
       await refresh();
-      msg("calories", "");
-      msg("weight", "");
+      msg("");
     } catch {
       toast("Couldn't reach the local server.", "error");
     }
@@ -2577,7 +2588,6 @@ load();
       if (series.error || listed.error) throw new Error(series.error || listed.error);
       UNIT = series.unit || "kg";
       wtUnit.textContent = UNIT;
-      wtChartUnit.textContent = UNIT;
       ENTRIES = listed.entries || [];
       renderSummary(series);
       renderCharts(series);
@@ -2593,12 +2603,11 @@ load();
   }
 
   dateInput.value = localToday();
-  $("manual-form").addEventListener("submit", (e) => e.preventDefault());
+  $("manual-add").addEventListener("click", () => openModal());
+  $("manual-form").addEventListener("submit", (e) => { e.preventDefault(); saveModal(); });
+  $("manual-cancel").addEventListener("click", () => dlg.close());
+  dlg.querySelector(".dd-close").addEventListener("click", () => dlg.close());
+  dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
   dateInput.addEventListener("change", fillFromEntries);
-  $("manual-save-calories").addEventListener("click", () => save("calories"));
-  $("manual-save-weight").addEventListener("click", () => save("weight"));
-  calInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); save("calories"); } });
-  wtInput.addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); save("weight"); } });
-  noteInput.addEventListener("keydown", (e) => { if (e.key === "Enter") e.preventDefault(); });
   refresh().then(fillFromEntries);
 })();
