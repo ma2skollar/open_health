@@ -815,7 +815,10 @@ body.page-open { overflow: hidden; }
 
 .manual-form { display: flex; flex-direction: column; gap: var(--s3); margin-bottom: var(--s5); }
 .manual-row {
-  display: grid; grid-template-columns: 76px minmax(0, 1fr) auto;
+  /* The third column is reserved even on rows without a Save button (Date,
+     Note), so every input ends at the same right edge instead of the rows
+     without a button running wider than the ones with one. */
+  display: grid; grid-template-columns: 76px minmax(0, 1fr) 88px;
   align-items: center; gap: var(--s3);
 }
 .manual-row label {
@@ -837,7 +840,7 @@ body.page-open { overflow: hidden; }
   position: absolute; right: 11px; top: 50%; transform: translateY(-50%);
   font-size: 12px; color: var(--faint); pointer-events: none;
 }
-.manual-save { min-height: 40px; padding: 9px 16px; }
+.manual-save { min-height: 40px; padding: 9px 16px; justify-self: end; }
 .manual-msg { grid-column: 2 / -1; margin: 0; font-size: 12px; color: var(--muted); }
 .manual-msg:empty { display: none; }
 .manual-msg.is-error { color: var(--warn); }

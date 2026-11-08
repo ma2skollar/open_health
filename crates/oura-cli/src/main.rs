@@ -15,6 +15,7 @@ use oura_store::storage::Store;
 mod activity_model;
 mod dashboard;
 mod game;
+mod icons;
 mod motion_server;
 mod pyrunner;
 mod secret_file;

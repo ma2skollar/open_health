@@ -975,15 +975,18 @@ async fn handle(
     if !host_header_ok(header(head, "host"), local_ip, port) {
         return write_resp(&mut sock, "403 Forbidden", "text/plain", b"forbidden").await;
     }
-    // vendored SVG icons (Phosphor), served from disk
+    // vendored SVG icons (Phosphor). Embedded at build time, so the packaged
+    // binary serves them with no checkout on disk; the on-disk copy still wins
+    // when `repo_root()` finds the repository, keeping the UI editable.
     if path.starts_with("/icons/") && path.ends_with(".svg") && !path.contains("..") {
+        let name = path.trim_start_matches("/icons/");
         if let Some(root) = repo_root() {
-            if let Ok(bytes) = std::fs::read(
-                root.join("dashboard/web")
-                    .join(path.trim_start_matches('/')),
-            ) {
+            if let Ok(bytes) = std::fs::read(root.join("dashboard/web/icons").join(name)) {
                 return write_resp(&mut sock, "200 OK", "image/svg+xml", &bytes).await;
             }
+        }
+        if let Some(bytes) = crate::icons::get(name) {
+            return write_resp(&mut sock, "200 OK", "image/svg+xml", bytes).await;
         }
         return write_resp(&mut sock, "404 Not Found", "text/plain", b"not found").await;
     }
