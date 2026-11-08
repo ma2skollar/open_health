@@ -152,6 +152,8 @@ body {
   max-width: var(--maxw);
   margin: 0 auto;
   padding: clamp(20px, 3.5vh, 44px) clamp(20px, 3vw, 40px) clamp(64px, 10vh, 120px);
+  background:
+    radial-gradient(1200px 600px at 20% 0%, color-mix(in oklab, var(--accent) 7%, transparent), transparent 70%);
 }
 
 /* ── header (flat instrument bar, hairline underline) ───── */
@@ -164,7 +166,7 @@ body {
   z-index: 30;
   margin-bottom: var(--s4);
   padding: var(--s2) 2px var(--s3);
-  background: color-mix(in oklab, var(--bg) 88%, transparent);
+  background: transparent;
   -webkit-backdrop-filter: blur(18px) saturate(130%);
   backdrop-filter: blur(18px) saturate(130%);
   border-bottom: 1px solid var(--line);
@@ -1184,6 +1186,7 @@ body.page-open { overflow: hidden; }
   grid-template-columns: 1fr;
   gap: var(--s5);
   margin-top: var(--s5);
+  padding-top: var(--s5);
 }
 @media (min-width: 1080px) {
   .bottom-section { grid-template-columns: 1fr 1fr; }
@@ -1194,6 +1197,7 @@ details.panel {
   border-radius: var(--radius);
   background: var(--surface);
   padding: 0;
+  overflow: hidden;
 }
 details.panel > summary.panel-head {
   margin: 0;

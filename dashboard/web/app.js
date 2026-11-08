@@ -2415,7 +2415,7 @@ load();
       return `<circle class="manual-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.6"><title>${esc(p.date)}: ${round2(p.value).toFixed(2)} ${UNIT}</title></circle>`;
     }).join("");
     return {
-      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Weight and its rolling trend">${trendLine}${dots}</svg>`,
+      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Weight and its rolling trend">${trendLine}${dots}</svg>`,
       hasTrend: tpts.length > 1,
     };
   }
