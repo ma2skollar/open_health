@@ -41,3 +41,6 @@ upstream/
 # Local build/verification output (docker build logs, artifacts).
 /out/
 /dist/
+
+# PulsHealth exports are local health data; never commit them.
+pulshealth-export-*.csv
