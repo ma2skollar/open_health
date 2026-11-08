@@ -5,6 +5,29 @@
 // map in docs/clients-web-and-ios.md. New computed fields go in crates/oura-summary.
 "use strict";
 
+// ── theme ──────────────────────────────────────────────────────────────────
+// Light and dark themes live on the <html> element's data-theme attribute. The
+// default follows the operating system; a saved choice overrides it. Runs before
+// the rest of the dashboard paints so there is no flash of the wrong theme.
+(function themeToggle() {
+  const btn = document.getElementById("theme-btn");
+  if (!btn) return;
+  const saved = localStorage.getItem("theme");
+  const current = saved || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  document.documentElement.dataset.theme = current;
+  const updateIcon = () => {
+    const name = document.documentElement.dataset.theme === "dark" ? "sun" : "moon";
+    btn.querySelector(".ic").style.setProperty("--i", `url(/icons/${name}.svg)`);
+  };
+  updateIcon();
+  btn.addEventListener("click", () => {
+    const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    localStorage.setItem("theme", next);
+    updateIcon();
+  });
+})();
+
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, html) => {
   const n = document.createElement(tag);
