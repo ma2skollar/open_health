@@ -148,37 +148,42 @@
           <div id="device" class="device"><div class="skeleton skeleton-block"></div></div>
         </section>
 
-        <section class="panel" id="research-panel">
-          <div class="panel-head"><h2><span class="ic" style="--i:url(/icons/cpu.svg)"></span>Research export</h2></div>
-          <form id="research-form" class="research">
-            <p class="muted">Raw ring data as CSV files (one row per beat or per 30 s window), on the corrected clock. Same files as the iOS export.</p>
-            <label for="rx-start">From</label><input id="rx-start" type="datetime-local" required>
-            <label for="rx-end">To</label><input id="rx-end" type="datetime-local" required>
-            <fieldset id="rx-streams"><legend>Data</legend>
-              <label><input type="checkbox" value="rr_intervals" checked> Every heart beat (RR intervals)</label>
-              <label><input type="checkbox" value="rr_quality"> Beats with quality flag</label>
-              <label><input type="checkbox" value="sleep_movement_30s" checked> Movement during sleep (30 s)</label>
-              <label><input type="checkbox" value="motion_30s" checked> Movement and posture (30 s)</label>
-              <label><input type="checkbox" value="spo2_raw"> SpO2 raw ratio</label>
-              <label><input type="checkbox" value="skin_temperature"> Skin temperature</label>
-            </fieldset>
-            <button class="btn-primary" type="submit">Download ZIP</button>
-            <label for="rx-label">Marker label</label><input id="rx-label" type="text" maxlength="200" placeholder="e.g. audio recording started">
-            <button class="btn-text" id="rx-mark" type="button">Mark now</button>
-            <p id="rx-status" class="muted" role="status"></p>
-          </form>
-        </section>
       </aside>
     </main>
 
-    <!-- recent entries: the full log, at the bottom. -->
-    <section class="panel manual-recent" id="manual-recent-section" aria-labelledby="recent-title">
-      <div class="panel-head">
-        <h2 id="recent-title"><span class="ic" style="--i:url(/icons/arrows-clockwise.svg)"></span>Recent entries</h2>
-        <a class="manual-export" id="manual-export" href="/api/manual/export" download="manual-entries.csv">Export CSV</a>
-      </div>
-      <div id="manual-recent"><p class="manual-empty">No entries yet.</p></div>
-    </section>
+    <!-- bottom: recent entries + research, both behind dropdowns -->
+    <div class="bottom-section">
+      <details class="panel manual-recent" id="manual-recent-section" aria-labelledby="recent-title">
+        <summary class="panel-head">
+          <h2 id="recent-title"><span class="ic" style="--i:url(/icons/arrows-clockwise.svg)"></span>Recent entries</h2>
+          <a class="manual-export" id="manual-export" href="/api/manual/export" download="manual-entries.csv">Export CSV</a>
+        </summary>
+        <div id="manual-recent"><p class="manual-empty">No entries yet.</p></div>
+      </details>
+
+      <details class="panel" id="research-panel">
+        <summary class="panel-head">
+          <h2><span class="ic" style="--i:url(/icons/cpu.svg)"></span>Research export</h2>
+        </summary>
+        <form id="research-form" class="research">
+          <p class="muted">Raw ring data as CSV files (one row per beat or per 30 s window), on the corrected clock. Same files as the iOS export.</p>
+          <label for="rx-start">From</label><input id="rx-start" type="datetime-local" required>
+          <label for="rx-end">To</label><input id="rx-end" type="datetime-local" required>
+          <fieldset id="rx-streams"><legend>Data</legend>
+            <label><input type="checkbox" value="rr_intervals" checked> Every heart beat (RR intervals)</label>
+            <label><input type="checkbox" value="rr_quality"> Beats with quality flag</label>
+            <label><input type="checkbox" value="sleep_movement_30s" checked> Movement during sleep (30 s)</label>
+            <label><input type="checkbox" value="motion_30s" checked> Movement and posture (30 s)</label>
+            <label><input type="checkbox" value="spo2_raw"> SpO2 raw ratio</label>
+            <label><input type="checkbox" value="skin_temperature"> Skin temperature</label>
+          </fieldset>
+          <button class="btn-primary" type="submit">Download ZIP</button>
+          <label for="rx-label">Marker label</label><input id="rx-label" type="text" maxlength="200" placeholder="e.g. audio recording started">
+          <button class="btn-text" id="rx-mark" type="button">Mark now</button>
+          <p id="rx-status" class="muted" role="status"></p>
+        </form>
+      </details>
+    </div>
 
     <!-- add/edit entry modal -->
     <dialog id="manual-dialog" class="dialog manual-dialog">

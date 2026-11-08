@@ -2377,7 +2377,7 @@ load();
     const bars = pts.map((p, i) => {
       const bh = Math.max(1.5, (p.value / max) * (H - 6));
       const x = i * bw + bw * 0.18;
-      return `<rect x="${x.toFixed(2)}" y="${(base - bh).toFixed(2)}" width="${(bw * 0.64).toFixed(2)}" height="${bh.toFixed(2)}" rx="1.5"></rect>`;
+      return `<rect x="${x.toFixed(2)}" y="${(base - bh).toFixed(2)}" width="${(bw * 0.64).toFixed(2)}" height="${bh.toFixed(2)}" rx="1.5"><title>${esc(p.date)}: ${Math.round(p.value).toLocaleString()} kcal</title></rect>`;
     }).join("");
     const idx = new Map(pts.map((p, i) => [p.date, i]));
     const xOf = (i) => i * bw + bw / 2;
@@ -2409,14 +2409,13 @@ load();
     const xOf = (p) => ((ymdToDay(p.date) - d0) / span) * W;
     const yOf = (v) => padT + (1 - (v - min) / rng) * (H - padT - padB);
     const at = (p) => [xOf(p), yOf(p.value)];
-    const line = pts.length > 1 ? `<path class="manual-line" d="${smoothPath(pts.map(at))}"></path>` : "";
     const trendLine = tpts.length > 1 ? `<path class="manual-trend" d="${smoothPath(tpts.map(at))}"></path>` : "";
     const dots = pts.map((p) => {
       const [x, y] = at(p);
-      return `<circle class="manual-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.6"></circle>`;
+      return `<circle class="manual-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.6"><title>${esc(p.date)}: ${round2(p.value).toFixed(2)} ${UNIT}</title></circle>`;
     }).join("");
     return {
-      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Weight and its rolling trend">${line}${trendLine}${dots}</svg>`,
+      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Weight and its rolling trend">${trendLine}${dots}</svg>`,
       hasTrend: tpts.length > 1,
     };
   }
