@@ -633,47 +633,114 @@ fn entry_to_json(e: &ManualEntry) -> Value {
     })
 }
 
+/// A 7-entry rolling mean over consecutive stored points. Emitted only where a
+/// full window exists: fewer stored values are not a mean, and nothing is
+/// invented to reach seven. Dates come from the window's last point.
+fn rolling_mean<'a>(pts: &'a [(&'a str, f64)], window: usize) -> Vec<(&'a str, f64)> {
+    if pts.len() < window {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(pts.len() - window + 1);
+    for i in window - 1..pts.len() {
+        let mean = pts[i + 1 - window..=i].iter().map(|(_, v)| v).sum::<f64>() / window as f64;
+        out.push((pts[i].0, mean));
+    }
+    out
+}
+
+/// Four-week comparison block: the trailing 28-day average, the trailing 7-day
+/// average, the four weekly averages oldest-to-newest, and the change from the
+/// first week to the last. Empty when there are no stored points.
+fn four_week_summary(pts: &[(&str, f64)], unit: Option<WeightUnit>) -> Value {
+    if pts.is_empty() {
+        return json!({});
+    }
+    let n = pts.len();
+    let avg = |slice: &[(&str, f64)]| -> f64 {
+        slice.iter().map(|(_, v)| v).sum::<f64>() / slice.len() as f64
+    };
+    let last28 = &pts[n.saturating_sub(28)..];
+    let last7 = &pts[n.saturating_sub(7)..];
+    let avg28 = avg(last28);
+    let avg7 = avg(last7);
+    let mut weekly = Vec::new();
+    for w in 0..4 {
+        let end = n.saturating_sub((3 - w) * 7);
+        let start = end.saturating_sub(7);
+        if start < end {
+            let mean = avg(&pts[start..end]);
+            let value = match unit {
+                Some(u) => round1(u.display_value(mean)),
+                None => round1(mean),
+            };
+            weekly.push(json!({ "week": w, "value": value }));
+        }
+    }
+    let change = if weekly.len() >= 2 {
+        let first = weekly[0]["value"].as_f64().unwrap_or(0.0);
+        let last = weekly[weekly.len() - 1]["value"].as_f64().unwrap_or(0.0);
+        Some(last - first)
+    } else {
+        None
+    };
+    let avg28_shown = match unit {
+        Some(u) => round1(u.display_value(avg28)),
+        None => round1(avg28),
+    };
+    let avg7_shown = match unit {
+        Some(u) => round1(u.display_value(avg7)),
+        None => round1(avg7),
+    };
+    json!({
+        "avg_28": avg28_shown,
+        "avg_7": avg7_shown,
+        "weekly": weekly,
+        "change": change.map(round1),
+    })
+}
+
 /// The chart payload: canonical calories, weight in the display unit, imported
-/// steps in their stored unit, and the trailing 7-entry mean of the *stored*
-/// weights (nothing interpolated or filled).
+/// steps in their stored unit, the trailing 7-entry mean of the stored values,
+/// and a four-week comparison summary for calories and weight (nothing
+/// interpolated or filled).
 fn manual_series_json(entries: &[ManualEntry], unit: WeightUnit) -> Value {
-    let mut calories = Vec::new();
+    let mut calories: Vec<(&str, f64)> = Vec::new();
     let mut steps = Vec::new();
     let mut weight_pts: Vec<(&str, f64)> = Vec::new();
     for e in entries {
         match e.kind {
-            MetricKind::CaloriesEaten => {
-                calories.push(json!({ "date": e.local_date, "value": e.value }))
-            }
+            MetricKind::CaloriesEaten => calories.push((&e.local_date, e.value)),
             // Imported history only. The ring's own step figure is estimated from
             // MET bands and is served with the ring summary, not here.
             MetricKind::Steps => steps.push(json!({ "date": e.local_date, "value": e.value })),
             MetricKind::WeightKg => weight_pts.push((&e.local_date, e.value)),
         }
     }
+    let calories_json = calories
+        .iter()
+        .map(|(d, v)| json!({ "date": d, "value": round1(*v) }))
+        .collect::<Vec<_>>();
     let weight = weight_pts
         .iter()
         .map(|(d, kg)| json!({ "date": d, "value": round1(unit.display_value(*kg)) }))
         .collect::<Vec<_>>();
-    // Emitted only where a full window of stored weights exists: fewer stored
-    // values are not a 7-entry mean, and nothing is invented to reach seven.
     const WINDOW: usize = 7;
-    let mut weight_trend = Vec::new();
-    if weight_pts.len() >= WINDOW {
-        for i in WINDOW - 1..weight_pts.len() {
-            let mean =
-                weight_pts[i + 1 - WINDOW..=i].iter().map(|(_, kg)| kg).sum::<f64>() / WINDOW as f64;
-            weight_trend.push(json!({
-                "date": weight_pts[i].0,
-                "value": round1(unit.display_value(mean)),
-            }));
-        }
-    }
+    let calories_trend = rolling_mean(&calories, WINDOW)
+        .into_iter()
+        .map(|(d, v)| json!({ "date": d, "value": round1(v) }))
+        .collect::<Vec<_>>();
+    let weight_trend = rolling_mean(&weight_pts, WINDOW)
+        .into_iter()
+        .map(|(d, kg)| json!({ "date": d, "value": round1(unit.display_value(kg)) }))
+        .collect::<Vec<_>>();
     json!({
-        "calories": calories,
+        "calories": calories_json,
+        "calories_trend": calories_trend,
+        "calories_summary": four_week_summary(&calories, None),
         "steps": steps,
         "weight": weight,
         "weight_trend": weight_trend,
+        "weight_summary": four_week_summary(&weight_pts, Some(unit)),
         "unit": unit.as_str(),
     })
 }

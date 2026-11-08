@@ -71,7 +71,16 @@ function update_script() {
 
   msg_info "Updating ${APP}"
   cd /root/oura || exit 1
-  git pull --ff-only
+  # A force-pushed history (for example removing committed data files) makes a
+  # plain --ff-only pull fail: the local commits are no longer ancestors of
+  # origin. This deployment checkout is ours to overwrite and carries no user
+  # edits, so when the pull cannot fast-forward, align with origin instead of
+  # aborting the update.
+  if ! git pull --ff-only; then
+    msg_info "fast-forward failed — aligning to origin/main"
+    git fetch origin
+    git reset --hard origin/main
+  fi
   # shellcheck disable=SC1091
   . "$HOME/.cargo/env"
   cargo build --release -p oura-cli -p oura-backup

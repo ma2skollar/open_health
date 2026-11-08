@@ -863,8 +863,45 @@ body.page-open { overflow: hidden; }
 .manual-legend span { display: inline-flex; align-items: center; gap: 6px; }
 .manual-sw { width: 14px; height: 0; border-top-width: 2.5px; border-top-style: solid; }
 .manual-sw.weight { border-color: var(--accent); }
+.manual-sw.calories { border-color: var(--accent); opacity: 0.55; }
 .manual-sw.trend { border-color: var(--muted); border-top-style: dashed; }
 .manual-empty { margin: 0; padding: var(--s5) 0; text-align: center; color: var(--faint); font-size: 13px; }
+
+/* ── four-week comparison: numbers first, then the week-by-week row ── */
+.manual-summary {
+  display: grid; grid-template-columns: 1fr 1fr; gap: var(--s4);
+  margin-bottom: var(--s5);
+}
+.manual-summary-card {
+  background: var(--surface-2); border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm); padding: var(--s3) var(--s4);
+}
+.manual-summary-head {
+  display: flex; justify-content: space-between; align-items: baseline;
+  font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--muted); margin-bottom: var(--s3);
+}
+.manual-summary-sub { font-size: 10px; color: var(--faint); letter-spacing: 0; text-transform: none; }
+.manual-summary-stats { display: flex; flex-direction: column; gap: var(--s2); }
+.manual-summary-stat { display: flex; justify-content: space-between; align-items: baseline; gap: var(--s2); }
+.manual-summary-label { font-size: 12px; color: var(--muted); }
+.manual-summary-value {
+  font-family: var(--mono); font-size: 14px; font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+.manual-summary-weeks {
+  display: flex; gap: var(--s2); margin-top: var(--s3); padding-top: var(--s3);
+  border-top: 1px solid var(--line-soft); flex-wrap: wrap;
+}
+.manual-week { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 42px; }
+.manual-week-label {
+  font-size: 9.5px; letter-spacing: 0.06em; text-transform: uppercase;
+  color: var(--faint);
+}
+.manual-week-value {
+  font-family: var(--mono); font-size: 12px; font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
 
 .manual-table { display: flex; flex-direction: column; }
 .manual-thead, .manual-trow {
@@ -889,6 +926,7 @@ body.page-open { overflow: hidden; }
 
 @media (max-width: 760px) {
   .manual-charts { grid-template-columns: 1fr; gap: var(--s4); }
+  .manual-summary { grid-template-columns: 1fr; gap: var(--s3); }
 }
 @media (max-width: 560px) {
   .manual-row { grid-template-columns: 64px minmax(0, 1fr); }

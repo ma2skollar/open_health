@@ -2326,8 +2326,10 @@ load();
   const wtUnit = $("manual-weight-unit");
   const wtChartUnit = $("manual-weight-chart-unit");
   const wtLegend = $("manual-weight-legend");
+  const calLegend = $("manual-calories-legend");
   const calChart = $("manual-calories-chart");
   const wtChart = $("manual-weight-chart");
+  const summary = $("manual-summary");
   const recent = $("manual-recent");
   const EMPTY = '<p class="manual-empty">No data yet.</p>';
 
@@ -2338,19 +2340,33 @@ load();
     p.classList.toggle("is-error", !!isError);
   };
 
-  // Calories as bars. Each bar is a stored value; a missing day has no bar.
-  function caloriesSvg(points) {
+  // Calories as bars plus a rolling-trend line. Each bar is a stored value; a
+  // missing day has no bar. The trend is drawn only where the window covers
+  // stored points.
+  function caloriesSvg(points, trend) {
     const pts = (points || []).filter((p) => p && p.value != null);
-    if (!pts.length) return "";
+    if (!pts.length) return { svg: "", hasTrend: false };
+    const tpts = (trend || []).filter((p) => p && p.value != null);
     const W = 600, H = 120, base = H - 1;
-    const max = Math.max(1, ...pts.map((p) => p.value));
+    const max = Math.max(1, ...pts.map((p) => p.value), ...tpts.map((p) => p.value));
     const bw = W / pts.length;
     const bars = pts.map((p, i) => {
       const bh = Math.max(1.5, (p.value / max) * (H - 6));
       const x = i * bw + bw * 0.18;
       return `<rect x="${x.toFixed(2)}" y="${(base - bh).toFixed(2)}" width="${(bw * 0.64).toFixed(2)}" height="${bh.toFixed(2)}" rx="1.5"></rect>`;
     }).join("");
-    return `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Calories per day"><g class="manual-bars">${bars}</g></svg>`;
+    const idx = new Map(pts.map((p, i) => [p.date, i]));
+    const xOf = (i) => i * bw + bw / 2;
+    const yOf = (v) => base - (v / max) * (H - 6);
+    const trendPts = tpts.filter((p) => idx.has(p.date)).map((p) => {
+      const i = idx.get(p.date);
+      return [xOf(i), yOf(p.value)];
+    });
+    const trendLine = trendPts.length > 1 ? `<path class="manual-trend" d="${smoothPath(trendPts)}"></path>` : "";
+    return {
+      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Calories per day and their rolling trend"><g class="manual-bars">${bars}</g>${trendLine}</svg>`,
+      hasTrend: trendPts.length > 1,
+    };
   }
 
   // Weight line plus a visually distinct rolling-trend line, both drawn only
@@ -2381,8 +2397,45 @@ load();
     };
   }
 
+  // "1,940" with a sign only when the value is not zero. Null means "no
+  // comparison period", which reads as an em dash, not as zero.
+  function formatChange(v, unit) {
+    if (v == null) return "—";
+    const sign = v > 0 ? "+" : "";
+    return `${sign}${Math.round(v).toLocaleString()} ${unit}`;
+  }
+
+  // Four-week comparison numbers. The backend sends averages already in the
+  // display unit; this only formats them. The block stays hidden when there is
+  // nothing to compare.
+  function renderSummary(series) {
+    const cal = series.calories_summary;
+    const wt = series.weight_summary;
+    const hasCal = cal && cal.avg_28 != null;
+    const hasWt = wt && wt.avg_28 != null;
+    summary.hidden = !(hasCal || hasWt);
+    if (hasCal) {
+      $("manual-cal-avg28").textContent = `${Math.round(cal.avg_28).toLocaleString()} kcal`;
+      $("manual-cal-avg7").textContent = `${Math.round(cal.avg_7).toLocaleString()} kcal`;
+      $("manual-cal-change").textContent = formatChange(cal.change, "kcal");
+      $("manual-cal-weeks").innerHTML = (cal.weekly || [])
+        .map((w) => `<span class="manual-week"><span class="manual-week-label">W${w.week + 1}</span><span class="manual-week-value">${Math.round(w.value).toLocaleString()}</span></span>`)
+        .join("");
+    }
+    if (hasWt) {
+      $("manual-wt-avg28").textContent = `${round1(wt.avg_28).toFixed(1)} ${UNIT}`;
+      $("manual-wt-avg7").textContent = `${round1(wt.avg_7).toFixed(1)} ${UNIT}`;
+      $("manual-wt-change").textContent = formatChange(wt.change, UNIT);
+      $("manual-wt-weeks").innerHTML = (wt.weekly || [])
+        .map((w) => `<span class="manual-week"><span class="manual-week-label">W${w.week + 1}</span><span class="manual-week-value">${round1(w.value).toFixed(1)}</span></span>`)
+        .join("");
+    }
+  }
+
   function renderCharts(series) {
-    calChart.innerHTML = caloriesSvg(series.calories) || EMPTY;
+    const cal = caloriesSvg(series.calories, series.calories_trend);
+    calChart.innerHTML = cal && cal.svg ? cal.svg : EMPTY;
+    calLegend.hidden = !(cal && cal.hasTrend);
     const wt = weightSvg(series.weight, series.weight_trend);
     wtChart.innerHTML = wt ? wt.svg : EMPTY;
     wtLegend.hidden = !(wt && wt.hasTrend);
@@ -2503,12 +2556,15 @@ load();
       wtUnit.textContent = UNIT;
       wtChartUnit.textContent = UNIT;
       ENTRIES = listed.entries || [];
+      renderSummary(series);
       renderCharts(series);
       renderRecent();
     } catch {
       calChart.innerHTML = EMPTY;
       wtChart.innerHTML = EMPTY;
       wtLegend.hidden = true;
+      calLegend.hidden = true;
+      summary.hidden = true;
       recent.replaceChildren(el("p", "manual-empty", "Could not load entries."));
     }
   }
