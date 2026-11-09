@@ -220,6 +220,11 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
   `docs/DECISIONS/0003-separate-manual-metric-store.md`). It works with **no ring and no
   ring database**. Deliberately web-only for now — the native app has no manual-metric UI
   yet, and the metric is not part of `oura-summary`'s JSON (it is its own store).
+  Decimal-comma weight entry, independent bottom disclosures, responsive date fields,
+  and bounded web dialogs are web-only fixes to this existing surface. They add no
+  shared summary field and do not change native iOS behavior. Chromium device-size
+  checks do not replace a real iPhone Safari check of the native date picker,
+  visual viewport, keyboard, and dialog scrolling before deployment.
 - **One-page day view**: web shows Sleep, Activity and Heart rate on one scrolling page, every
   chart on one time axis (`dayAxis`) with a shared cursor (`dayCursor`), plus ‹ › / ← → to step
   through days with data; iOS `DayReportView` keeps tabs and reaches days via `AllDaysView`.

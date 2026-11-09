@@ -142,13 +142,11 @@ dashboard from the container itself:
 pct exec <ctid> -- /root/oura/deploy/health.sh
 ```
 
-Two things make the container's LAN address the wrong one to open. The listener
-binds `[IP_ADDRESS]` only, so `http://<lxc-lan-ip>:8090` finds nothing listening;
-and the dashboard answers only when the request's `Host` header is
-`[IP_ADDRESS]:<port>` or `localhost:<port>` (a DNS-rebind guard) — anything else
-gets `403 Forbidden`. Both are deliberate. A reverse proxy therefore has to
-rewrite `Host` to `[IP_ADDRESS]:8090` instead of passing the client's hostname
-through.
+The loopback listener cannot be reached through the LXC LAN address directly.
+The Host guard rejects unrecognized authorities. A reverse proxy must rewrite
+the upstream Host to `localhost:8090`, and the dashboard must explicitly allow
+the browser's external origin through `OURA_PUBLIC_ORIGIN` (option C). Rewriting
+Host alone does not authorize a browser's HTTPS Origin on writes.
 
 ### Option A — SSH tunnel (fastest, no extra service)
 
@@ -197,10 +195,43 @@ unless you reach it through a proxy that rewrites `Host` to that address and por
 
 ### Option C — reverse proxy on the LXC (LAN/VPN only)
 
-Run a proxy on the LXC that terminates TLS and forwards to `127.0.0.1:8090`.
-Bind the proxy to the LXC's LAN address and restrict it to your LAN or VPN
-subnet with the LXC firewall. The project does not ship a proxy configuration;
-choose one and document the choice.
+Run a TLS proxy on the LXC, bound to its LAN address and restricted to your LAN
+or VPN subnet. The dashboard has no authentication; do not publish it openly.
+Configure the exact browser origin, with scheme and non-default port if used:
+
+```sh
+# /etc/oura/oura.env; restart oura-dashboard.service after editing
+OURA_PUBLIC_ORIGIN=https://health.example.com
+# Direct CLI equivalent:
+oura dashboard --public-origin https://health.example.com
+```
+
+Example nginx server (replace hostname and certificate paths):
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name health.example.com;
+    ssl_certificate /etc/nginx/tls/health.crt;
+    ssl_certificate_key /etc/nginx/tls/health.key;
+    location / {
+        proxy_pass http://localhost:8090;
+        proxy_set_header Host localhost:8090;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host $http_host;
+    }
+}
+```
+
+Forwarded headers do not independently grant access. Keep `X-Oura-Dash` and
+`Origin` intact; the dashboard validates the configured public origin. Test a
+real save through the HTTPS URL, not only `GET /`. Also test a foreign Origin
+and bad Host, which must remain rejected. Rebuild the binary after changing web
+assets so deployments outside the checkout use the fresh embedded copy.
+
+Before iPhone rollout, check Safari with its software keyboard open: date field
+width, modal scrolling, landscape height, both decimal separators, and independent
+bottom disclosures. Chromium viewport checks cannot certify native Safari UI.
 
 ### Option D — VPN into the LAN
 

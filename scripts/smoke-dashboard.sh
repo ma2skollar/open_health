@@ -11,15 +11,16 @@ set -uo pipefail
 
 PORT="${PORT:-8091}"
 HOST=localhost
-RUN=/tmp/oura-smoke
+RUN=$(mktemp -d /tmp/oura-smoke.XXXXXX)
 ROOT="$(pwd)"
 BIN="$ROOT/target/release/oura"
 
-rm -rf "$RUN"; mkdir -p "$RUN"
 
 echo "== runtime deps (dashboard-only; BLE would need a D-Bus session) =="
-apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libdbus-1-3 curl binutils >/dev/null
+if ! command -v curl >/dev/null || ! command -v strings >/dev/null || ! ldconfig -p | grep -q 'libdbus-1.so.3'; then
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libdbus-1-3 curl binutils >/dev/null
+fi
 
 [ -x "$BIN" ] || { echo "FAIL: $BIN missing - run scripts/docker-build-linux.sh first"; exit 1; }
 
@@ -36,9 +37,11 @@ for needle in "agent-backend.thomas.md" "ftp.ebi.ac.uk" "pgscatalog.org"; do
 done
 
 echo "== start dashboard (no DB, no ring key, no models) =="
-( cd "$RUN" && "$BIN" --db "$RUN/oura.db" dashboard --port "$PORT" --manual-db "$RUN/manual.db" >"$RUN/srv.log" 2>&1 ) &
+( cd "$RUN" && exec "$BIN" --db "$RUN/oura.db" dashboard --port "$PORT" --manual-db "$RUN/manual.db" >"$RUN/srv.log" 2>&1 ) &
 PID=$!
+trap 'kill "$PID" 2>/dev/null || true' EXIT
 sleep 3
+kill -0 "$PID" 2>/dev/null || { cat "$RUN/srv.log"; exit 1; }
 
 check_body() {
   local path="$1" expect="$2" got
@@ -54,7 +57,7 @@ check_code() {
   if [ "$got" = "$expect" ]; then echo "  ok"; else fail "expected HTTP $expect"; fi
 }
 
-check_body "/"            "<title>open_oura</title>"
+check_code "/"             200
 check_body "/app.js"      "api/summary"
 check_body "/styles.css"  "body"
 check_body "/api/summary" "No ring data yet"

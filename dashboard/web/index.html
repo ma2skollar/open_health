@@ -20,7 +20,7 @@
       </div>
       <div class="actions">
         <span id="batt" class="batt" title="Ring battery"></span>
-        <button id="sync-btn" class="action" title="Sync the ring over Bluetooth">
+        <button id="sync-btn" class="action" title="Sync the ring over Bluetooth" aria-label="Sync ring">
           <span class="ic" style="--i:url(/icons/arrows-clockwise.svg)"></span>
           <span id="sync-label">Sync</span>
         </button>
@@ -206,7 +206,7 @@
         <div class="manual-row">
           <label for="manual-weight">Weight</label>
           <div class="manual-input">
-            <input id="manual-weight" name="weight" type="number" inputmode="decimal" min="0" step="0.1" placeholder="0" />
+            <input id="manual-weight" name="weight" type="text" inputmode="decimal" placeholder="0" />
             <span class="manual-unit" id="manual-weight-unit">kg</span>
           </div>
         </div>
@@ -246,7 +246,7 @@
       </div>
       <div class="field-row">
         <div class="field"><label for="f-height">Height (m)</label><input id="f-height" name="height_m" type="number" min="1" max="2.3" step="0.01" /></div>
-        <div class="field"><label for="f-weight">Weight (kg)</label><input id="f-weight" name="weight_kg" type="number" min="20" max="250" step="1" /></div>
+        <div class="field"><label for="f-weight">Weight (kg)</label><input id="f-weight" name="weight_kg" type="text" inputmode="decimal" /></div>
       </div>
       <div class="dialog-actions">
         <button type="button" id="profile-cancel" class="btn-text">Cancel</button>

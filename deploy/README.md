@@ -39,8 +39,10 @@ replace every `__PLACEHOLDER__`. The ring authentication key is **never** stored
 in this file, in this repository, or in a unit file: it lives on the collector,
 `0600`, and only there.
 
-`--manual-db` is not yet on `ExecStart`; add it when the manual-metrics routes
-land (D3), because `oura dashboard` does not accept the flag yet.
+`oura dashboard` accepts `--manual-db`; the dashboard unit passes
+`OURA_MANUAL_DB` to keep manual metrics separate from ring data. For TLS access,
+set `OURA_PUBLIC_ORIGIN` to the exact browser origin and restart the service.
+See `docs/DEPLOY_LXC.md`, option C, for nginx configuration and write checks.
 
 ## Health
 

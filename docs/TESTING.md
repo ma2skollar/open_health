@@ -1,5 +1,68 @@
 # TESTING
 
+## Dashboard changes: required Docker verification loop
+
+Production runs in LXC; the checkout is local only. Verify every dashboard change
+in a Docker instance, not only a native process. Use an isolated manual database;
+never mount production health data into a smoke run. Rebuild after asset changes,
+because release binaries embed the web files.
+
+In a Linux Rust container with the repository at `/w`, persistent Cargo registry
+and target volumes, and pkg-config, libsqlite3-dev, libdbus-1-dev installed:
+
+```sh
+cargo test --locked -p oura-cli dashboard::
+cargo build --release --locked -p oura-cli
+PORT=8094 bash scripts/smoke-dashboard.sh
+```
+
+Start an isolated dashboard, then run framing probes in the same container:
+
+```sh
+mkdir -p /tmp/dashboard-check
+cd /tmp/dashboard-check
+/w/target/release/oura --db /tmp/dashboard-check/oura.db dashboard \
+  --port 8092 --manual-db /tmp/dashboard-check/manual.db \
+  --public-origin https://localhost:18443
+# In another container shell:
+python3 /w/scripts/check-dashboard-framing.py localhost 8092 https://localhost:18443
+```
+
+For browser verification, put a TLS proxy in the dashboard's network namespace;
+`scripts/dashboard-proxy-test.conf` expects disposable certificate/key files at
+`/tmp/health-proxy.crt` and `/tmp/health-proxy.key`. Publish TLS port 8443 as 18443.
+Exercise create/edit/delete and decimal-comma input through the proxy, then check
+independent disclosures and dialog bounds at phone, tablet, desktop and short
+landscape sizes. Follow `DEPLOY_LXC.md` for production proxy configuration.
+
+Observed on 2026-11-09, using `health-build-1109` and `health-runtime-1109` Docker
+containers: locked release build passed; API smoke passed; all 15 framing probes
+passed, including delayed/split headers and bodies, chunked bodies, size limits,
+ambiguous framing, and public/foreign origins. Commands:
+
+```sh
+docker exec health-build-1109 sh -c "cargo test --locked -p oura-cli dashboard:: && cargo build --release --locked -p oura-cli"
+docker exec -e PORT=8094 health-build-1109 bash /w/scripts/smoke-dashboard.sh
+docker exec health-runtime-1109 python3 /w/scripts/check-dashboard-framing.py localhost 8092 https://localhost:18443
+```
+
+Raw final output:
+
+```text
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.16s
+== result: PASS ==
+PASS public origin with foreign Host: HTTP/1.1 403 Forbidden
+PASS all framing probes
+```
+
+All commands exited 0. Chromium through nginx HTTPS saved `75,5` as 75.5 kg,
+saved calories and profile weight, and rejected malformed `75,5.0`. Viewports
+320, 375, 390, 768 and 1280 pixels wide plus 667×375 landscape had no horizontal
+overflow; dialog/date bounds and independent disclosure state were checked.
+Native iPhone Safari, its date-picker popup/software keyboard, and populated ring
+reports still require device/data acceptance; this run used synthetic manual data.
+
+
 Test inventory, mapped to phases. Status is only what was actually run.
 
 ## Executed so far

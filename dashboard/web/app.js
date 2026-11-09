@@ -69,6 +69,34 @@ function deleteDash(url) {
   return fetch(url, { method: "DELETE", headers: { ...DASH_HEADERS } });
 }
 
+// Parse a typed decimal. `comma: true` also accepts "75,5" (iPhone decimal
+// keypad). Exactly one separator, no grouping, signs, exponents, or non-finite
+// input; anything else returns null so callers can reject it.
+function parseDecimal(raw, { comma = false } = {}) {
+  const s = String(raw ?? "").trim();
+  const re = comma ? /^(\d+([.,]\d*)?|[.,]\d+)$/ : /^(\d+(\.\d*)?|\.\d+)$/;
+  if (!re.test(s)) return null;
+  const n = Number(s.replace(",", "."));
+  return Number.isFinite(n) ? n : null;
+}
+
+// Read a dashboard response as JSON. A non-JSON body (proxy page, crash text)
+// becomes a readable { error } instead of a raw JSON parse error. Real JSON
+// errors from the backend pass through unchanged.
+async function readJsonResponse(r) {
+  const text = await r.text();
+  let j = null;
+  try { j = JSON.parse(text); } catch { j = null; }
+  if (!j || typeof j !== "object") {
+    return { ok: false, error: `The dashboard server replied HTTP ${r.status} without a JSON answer. Check that oura dashboard is running.` };
+  }
+  if (!r.ok) {
+    j.ok = false;
+    if (!j.error) j.error = `The dashboard server replied HTTP ${r.status}.`;
+  }
+  return j;
+}
+
 // Smooth curve THROUGH the points using a monotone cubic Hermite spline
 // (Fritsch–Carlson). Monotone = the curve never overshoots past a data point, so it
 // won't invent peaks/valleys the data doesn't have — the right call for real metrics.
@@ -2058,21 +2086,25 @@ function openProfile() {
 }
 async function saveProfile(e) {
   e.preventDefault();
+  const weight = parseDecimal($("f-weight").value, { comma: true });
+  if (weight === null || weight < 20 || weight > 500) {
+    toast("Enter weight in kg as a number between 20 and 500, for example 75.5 or 75,5.", "error");
+    return;
+  }
   const body = {
     sex: $("f-sex").value,
     age: +$("f-age").value,
     height_m: +$("f-height").value,
-    weight_kg: +$("f-weight").value,
+    weight_kg: weight,
     ring_size: (CURRENT_PROFILE && CURRENT_PROFILE.ring_size) || 10, // not on the ring; kept default
   };
   $("profile-save").disabled = true;
   try {
-    const r = await postDash("/api/profile", body);
-    const j = await r.json().catch(() => ({}));
-    // the server replies 200 with an { error } body on write failures — surface it
-    // and keep the dialog open instead of pretending the save succeeded.
-    if (!r.ok || j.error) {
-      toast(j.error || "Couldn't save profile.", "error");
+    // the server replies 200 with an { error } body on write failures; a non-JSON
+    // HTTP error becomes a readable { error } too (readJsonResponse)
+    const j = await postDash("/api/profile", body).then(readJsonResponse);
+    if (j.error) {
+      toast(j.error, "error");
       return;
     }
     $("profile-dialog").close();
@@ -2524,8 +2556,9 @@ load();
   }
 
   // Save both fields in one submit. Empty fields are skipped; at least one
-  // value must be present. Each request runs in parallel and the dialog only
-  // closes after every response reports success.
+  // value must be present. Both requests run in parallel. If one fails, a
+  // successful one stays stored: the table refreshes, and the dialog stays
+  // open with the error and the typed values for a retry.
   async function saveModal() {
     const date = dateInput.value || localToday();
     if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) {
@@ -2534,15 +2567,22 @@ load();
     }
     const calRaw = calInput.value.trim();
     const wtRaw = wtInput.value.trim();
-    const cal = calRaw === "" ? null : Number(calRaw);
-    const wt = wtRaw === "" ? null : Number(wtRaw);
-    if (cal !== null && (!Number.isFinite(cal) || cal < 0)) {
-      msg("Enter calories that are not negative.", true);
+    const cal = calRaw === "" ? null : parseDecimal(calRaw, { comma: false });
+    const wt = wtRaw === "" ? null : parseDecimal(wtRaw, { comma: true });
+    if (calRaw !== "" && cal === null) {
+      msg("Enter calories as a number, for example 1940 or 1940.5. Do not use thousands separators.", true);
       return;
     }
-    if (wt !== null && (!Number.isFinite(wt) || wt < 0)) {
-      msg(`Enter a weight in ${UNIT} that is not negative.`, true);
-      return;
+    if (wtRaw !== "") {
+      const [lo, hi] = UNIT === "lb" ? [44, 1100] : [20, 500];
+      if (wt === null) {
+        msg(`Enter a weight in ${UNIT} as a number, for example 75.5 or 75,5.`, true);
+        return;
+      }
+      if (wt < lo || wt > hi) {
+        msg(`Enter a weight in ${UNIT} between ${lo} and ${hi}.`, true);
+        return;
+      }
     }
     if (cal === null && wt === null) {
       msg("Enter calories or a weight.", true);
@@ -2552,55 +2592,68 @@ load();
     const payloads = [];
     if (cal !== null) payloads.push({ local_date: date, kind: "calories_eaten", value: cal, note });
     if (wt !== null) payloads.push({ local_date: date, kind: "weight_kg", value: storeWeight(wt), note });
+    let results;
     try {
-      const results = await Promise.all(payloads.map((p) => postDash("/api/manual/entries", p).then((r) => r.json())));
-      for (const j of results) {
-        if (!j.ok) {
-          msg(j.error || "Could not save.", true);
-          return;
-        }
-      }
-      dlg.close();
-      await refresh();
+      results = await Promise.all(payloads.map((p) => postDash("/api/manual/entries", p).then(readJsonResponse)));
     } catch {
       msg("Couldn't reach the local server.", true);
+      return;
     }
+    const label = { calories_eaten: "Calories", weight_kg: "Weight" };
+    const errors = results
+      .map((j, i) => (j.ok ? null : `${label[payloads[i].kind]} not saved: ${j.error || "Could not save."}`))
+      .filter(Boolean);
+    if (errors.length) {
+      // keep what succeeded: refresh its row; the dialog and typed values stay
+      if (errors.length < results.length) await refresh();
+      msg(errors.join(" "), true);
+      return;
+    }
+    dlg.close();
+    await refresh();
   }
 
   async function removeDate(date) {
     if (!window.confirm(`Delete the entries for ${date}?`)) return;
+    const kinds = ["calories_eaten", "weight_kg"];
+    let results;
     try {
-      await Promise.all(["calories_eaten", "weight_kg"].map((kind) =>
-        deleteDash(`/api/manual/entries?date=${encodeURIComponent(date)}&kind=${kind}`)));
-      await refresh();
-      msg("");
+      results = await Promise.all(kinds.map((kind) =>
+        deleteDash(`/api/manual/entries?date=${encodeURIComponent(date)}&kind=${kind}`).then(readJsonResponse)));
     } catch {
       toast("Couldn't reach the local server.", "error");
+      return;
     }
+    // a failed delete must not look like success; refresh whatever was removed
+    if (results.some((j) => j.ok)) await refresh();
+    const failed = results.filter((j) => !j.ok);
+    if (failed.length) {
+      toast(failed.map((j) => j.error || "Could not delete entries.").join(" "), "error");
+      return;
+    }
+    msg("");
   }
 
   async function refresh() {
     try {
       const [sr, er] = await Promise.all([
-        fetch("/api/manual/series?days=180"),
-        fetch(`/api/manual/entries?from=${shiftDays(localToday(), -29)}&to=${localToday()}`),
+        fetch("/api/manual/series?days=180").then(readJsonResponse),
+        fetch(`/api/manual/entries?from=${shiftDays(localToday(), -29)}&to=${localToday()}`).then(readJsonResponse),
       ]);
-      const series = await sr.json();
-      const listed = await er.json();
-      if (series.error || listed.error) throw new Error(series.error || listed.error);
-      UNIT = series.unit || "kg";
+      if (sr.error || er.error) throw new Error(sr.error || er.error);
+      UNIT = sr.unit || "kg";
       wtUnit.textContent = UNIT;
-      ENTRIES = listed.entries || [];
-      renderSummary(series);
-      renderCharts(series);
+      ENTRIES = er.entries || [];
+      renderSummary(sr);
+      renderCharts(sr);
       renderRecent();
-    } catch {
+    } catch (err) {
       calChart.innerHTML = EMPTY;
       wtChart.innerHTML = EMPTY;
       wtLegend.hidden = true;
       calLegend.hidden = true;
       summary.hidden = true;
-      recent.replaceChildren(el("p", "manual-empty", "Could not load entries."));
+      recent.replaceChildren(el("p", "manual-empty", esc(`Could not load entries: ${err.message}`)));
     }
   }
 

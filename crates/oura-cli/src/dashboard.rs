@@ -11,7 +11,7 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
@@ -364,6 +364,7 @@ pub async fn serve(
     seed: Demographics,
     manual_db: PathBuf,
     weight_unit: WeightUnit,
+    public_origin: String,
 ) -> Result<()> {
     // seed profile.json from the CLI demographics on first run; afterwards the
     // file is the editable source of truth.
@@ -391,6 +392,7 @@ pub async fn serve(
     } else {
         bind
     };
+    let public = PublicOrigin::parse(&public_origin)?.map(Arc::new);
     let listener = TcpListener::bind((bind.as_str(), port))
         .await
         .with_context(|| format!("binding {bind}:{port}"))?;
@@ -405,8 +407,9 @@ pub async fn serve(
         let (sock, _) = listener.accept().await?;
         let (db, name, key_file) = (db.clone(), name.clone(), key_file.clone());
         let manual = manual.clone();
+        let public = public.clone();
         tokio::spawn(async move {
-            let _ = handle(sock, port, db, tz, name, key_file, manual, weight_unit).await;
+            let _ = handle(sock, port, db, tz, name, key_file, manual, weight_unit, public).await;
         });
     }
 }
@@ -480,6 +483,230 @@ fn split_request(req: &str) -> (&str, &str) {
     }
 }
 
+/// Largest request head (request line + headers) accepted before the body.
+const MAX_HEAD_BYTES: usize = 16 * 1024;
+/// Largest decoded request body. Dashboard payloads are small JSON objects.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
+/// Longest chunk-size or trailer line accepted in a chunked body.
+const MAX_CHUNK_LINE: usize = 1024;
+/// Wall-clock budget to receive one complete request; bounds trickling clients.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Why a request was refused before routing. Each maps to one status line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestError {
+    Malformed,
+    HeadTooLarge,
+    TooLarge,
+    Unsupported,
+    Timeout,
+}
+
+impl RequestError {
+    fn status(self) -> &'static str {
+        match self {
+            Self::Malformed => "400 Bad Request",
+            Self::HeadTooLarge => "431 Request Header Fields Too Large",
+            Self::TooLarge => "413 Payload Too Large",
+            Self::Unsupported => "501 Not Implemented",
+            Self::Timeout => "408 Request Timeout",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed request",
+            Self::HeadTooLarge => "request headers too large",
+            Self::TooLarge => "request body too large",
+            Self::Unsupported => "unsupported transfer coding; use Content-Length or chunked",
+            Self::Timeout => "request not received in time",
+        }
+    }
+}
+
+/// How the body is framed. Exactly one of these applies to every request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    Empty,
+    Length(usize),
+    Chunked,
+}
+
+/// Every value of a header, in order. Repeats stay visible so the framing check
+/// can refuse disagreeing `Content-Length` lines instead of picking one.
+fn header_values<'a>(head: &'a str, name: &str) -> Vec<&'a str> {
+    head.lines()
+        .skip(1)
+        .filter_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.trim().eq_ignore_ascii_case(name).then(|| v.trim())
+        })
+        .collect()
+}
+
+/// Body framing from the header block. `Transfer-Encoding` must be exactly
+/// `chunked`, and it may not coexist with `Content-Length` (request smuggling).
+fn framing_of(head: &str) -> std::result::Result<Framing, RequestError> {
+    let te = header_values(head, "transfer-encoding");
+    let cl = header_values(head, "content-length");
+    if !te.is_empty() && !cl.is_empty() {
+        return Err(RequestError::Malformed);
+    }
+    if !te.is_empty() {
+        return match te.as_slice() {
+            [coding] if coding.eq_ignore_ascii_case("chunked") => Ok(Framing::Chunked),
+            _ => Err(RequestError::Unsupported),
+        };
+    }
+    match cl.as_slice() {
+        [] => Ok(Framing::Empty),
+        [len] if !len.is_empty() && len.bytes().all(|b| b.is_ascii_digit()) => {
+            let len: usize = len.parse().map_err(|_| RequestError::TooLarge)?;
+            if len > MAX_BODY_BYTES {
+                Err(RequestError::TooLarge)
+            } else {
+                Ok(Framing::Length(len))
+            }
+        }
+        _ => Err(RequestError::Malformed),
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn expects_continue(head: &str) -> bool {
+    header(head, "expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
+}
+
+/// Decode a complete chunked body from `data`. `Ok(None)` means the terminal
+/// chunk has not arrived yet. Any framing violation is an error, never a guess.
+fn decode_chunked(data: &[u8]) -> std::result::Result<Option<Vec<u8>>, RequestError> {
+    if data.len() > MAX_BODY_BYTES * 4 {
+        return Err(RequestError::TooLarge);
+    }
+    let mut out = Vec::new();
+    let mut pos = 0;
+    loop {
+        let Some(eol) = find_subslice(&data[pos..], b"\r\n") else {
+            return if data.len() - pos > MAX_CHUNK_LINE {
+                Err(RequestError::Malformed)
+            } else {
+                Ok(None)
+            };
+        };
+        let size_line = &data[pos..pos + eol];
+        pos += eol + 2;
+        // Chunk extensions (`;name=value`) are allowed and ignored.
+        let size_bytes = size_line.split(|&b| b == b';').next().unwrap_or_default();
+        let size_hex = std::str::from_utf8(size_bytes)
+            .map_err(|_| RequestError::Malformed)?
+            .trim_matches(|c| c == ' ' || c == '\t');
+        if size_hex.is_empty() || size_hex.len() > 8 || !size_hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(RequestError::Malformed);
+        }
+        let size = usize::from_str_radix(size_hex, 16).map_err(|_| RequestError::Malformed)?;
+        if size == 0 {
+            // Trailer section: header-like lines, ended by an empty line. Ignored.
+            loop {
+                let Some(eol) = find_subslice(&data[pos..], b"\r\n") else {
+                    return if data.len() - pos > MAX_CHUNK_LINE {
+                        Err(RequestError::Malformed)
+                    } else {
+                        Ok(None)
+                    };
+                };
+                pos += eol + 2;
+                if eol == 0 {
+                    return Ok(Some(out));
+                }
+            }
+        }
+        if out.len() + size > MAX_BODY_BYTES {
+            return Err(RequestError::TooLarge);
+        }
+        if data.len() < pos + size + 2 {
+            return Ok(None);
+        }
+        if data[pos + size..pos + size + 2] != *b"\r\n" {
+            return Err(RequestError::Malformed);
+        }
+        out.extend_from_slice(&data[pos..pos + size]);
+        pos += size + 2;
+    }
+}
+
+async fn read_more(sock: &mut TcpStream, chunk: &mut [u8]) -> std::result::Result<usize, RequestError> {
+    match sock.read(chunk).await {
+        Ok(0) | Err(_) => Err(RequestError::Malformed),
+        Ok(n) => Ok(n),
+    }
+}
+
+/// Read one complete request and return it as header block, CRLFCRLF, then the
+/// decoded body, so `split_request` works on the result unchanged.
+///
+/// Reads accumulate until the framing says the request is complete: TCP and
+/// reverse proxies may split the head or body at any byte. Limits: head
+/// [`MAX_HEAD_BYTES`], body [`MAX_BODY_BYTES`] decoded, whole request within
+/// [`REQUEST_TIMEOUT`]. Only `Content-Length` and `Transfer-Encoding: chunked`
+/// are accepted; other codings get 501, and conflicting framing gets 400.
+async fn read_request(sock: &mut TcpStream) -> std::result::Result<String, RequestError> {
+    tokio::time::timeout(REQUEST_TIMEOUT, read_request_framed(sock))
+        .await
+        .unwrap_or(Err(RequestError::Timeout))
+}
+
+async fn read_request_framed(sock: &mut TcpStream) -> std::result::Result<String, RequestError> {
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+            break pos;
+        }
+        if buf.len() > MAX_HEAD_BYTES {
+            return Err(RequestError::HeadTooLarge);
+        }
+        let n = read_more(sock, &mut chunk).await?;
+        buf.extend_from_slice(&chunk[..n]);
+    };
+    if head_end > MAX_HEAD_BYTES {
+        return Err(RequestError::HeadTooLarge);
+    }
+    let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    let mut pending = buf.split_off(head_end + 4);
+    let framing = framing_of(&head)?;
+    if framing != Framing::Empty && pending.is_empty() && expects_continue(&head) {
+        sock.write_all(b"HTTP/1.1 100 Continue\r\n\r\n")
+            .await
+            .map_err(|_| RequestError::Malformed)?;
+    }
+    let body = match framing {
+        Framing::Empty => Vec::new(),
+        Framing::Length(len) => {
+            while pending.len() < len {
+                let n = read_more(sock, &mut chunk).await?;
+                pending.extend_from_slice(&chunk[..n]);
+            }
+            pending.truncate(len);
+            pending
+        }
+        Framing::Chunked => loop {
+            if let Some(body) = decode_chunked(&pending)? {
+                break body;
+            }
+            let n = read_more(sock, &mut chunk).await?;
+            pending.extend_from_slice(&chunk[..n]);
+        },
+    };
+    let mut req = head;
+    req.push_str("\r\n\r\n");
+    req.push_str(&String::from_utf8_lossy(&body));
+    Ok(req)
+}
+
+
 /// Loopback-only guard (DNS-rebind protection), applied before any routing.
 ///
 /// The dashboard answers only when the request's `Host` is the address the client
@@ -517,17 +744,101 @@ fn host_header_ok(host: Option<&str>, local_ip: Option<IpAddr>, port: u16) -> bo
     }
 }
 
+/// `host_header_ok`, or the `Host` of the configured public origin. A reverse proxy
+/// connects from loopback and forwards the public name, so only that exact name is
+/// added. `X-Forwarded-*` headers are never read.
+fn host_allowed(
+    host: Option<&str>,
+    local_ip: Option<IpAddr>,
+    port: u16,
+    public: Option<&PublicOrigin>,
+) -> bool {
+    host_header_ok(host, local_ip, port)
+        || host.is_some_and(|h| public.is_some_and(|p| p.matches_host(h)))
+}
+
+/// The browser-facing origin of a reverse proxy, from `--public-origin`.
+///
+/// Only `https://host[:port]` is accepted (no path, query, or userinfo), so the
+/// guard compares exact strings. A default `:443` is elided, because a proxy's
+/// `Host` header and a browser's `Origin` both omit it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicOrigin {
+    origin: String,
+    authority: String,
+}
+
+impl PublicOrigin {
+    /// Parse the `--public-origin` value. Empty means no public origin.
+    pub fn parse(raw: &str) -> Result<Option<Self>> {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let rest = raw
+            .strip_prefix("https://")
+            .ok_or_else(|| anyhow!("--public-origin must start with https:// (got {raw:?})"))?;
+        let rest = rest.strip_suffix('/').unwrap_or(rest);
+        if rest
+            .chars()
+            .any(|c| matches!(c, '/' | '?' | '#' | '@') || c.is_whitespace() || c.is_control())
+        {
+            return Err(anyhow!(
+                "--public-origin must be https://host[:port] with no path, query, or userinfo (got {raw:?})"
+            ));
+        }
+        let (host, port_text) = if rest.starts_with('[') {
+            let end = rest.find(']').ok_or_else(|| anyhow!("--public-origin has an unterminated IPv6 literal"))?;
+            rest[1..end].parse::<std::net::Ipv6Addr>()
+                .map_err(|_| anyhow!("--public-origin has an invalid IPv6 literal"))?;
+            let suffix = &rest[end + 1..];
+            let port = if suffix.is_empty() { None } else {
+                Some(suffix.strip_prefix(':').ok_or_else(|| anyhow!("--public-origin has an invalid authority"))?)
+            };
+            (&rest[..=end], port)
+        } else {
+            match rest.rsplit_once(':') {
+                Some((host, port)) => (host, Some(port)),
+                None => (rest, None),
+            }
+        };
+        let port = port_text.map(|text| text.parse::<u16>()
+            .map_err(|_| anyhow!("--public-origin has an invalid port (got {raw:?})"))).transpose()?;
+        if host.is_empty() {
+            return Err(anyhow!("--public-origin has no host (got {raw:?})"));
+        }
+        let host = host.to_ascii_lowercase();
+        let authority = match port {
+            None | Some(443) => host,
+            Some(port) => format!("{host}:{port}"),
+        };
+        let origin = format!("https://{authority}");
+        Ok(Some(Self { origin, authority }))
+    }
+
+    /// Whether a `Host` header names this public origin.
+    fn matches_host(&self, host: &str) -> bool {
+        host.eq_ignore_ascii_case(&self.authority)
+    }
+
+    /// Whether an `Origin` header is this public origin.
+    fn matches_origin(&self, origin: &str) -> bool {
+        origin.eq_ignore_ascii_case(&self.origin)
+    }
+}
+
 /// Same-origin guard for mutating/action endpoints.
 ///
 /// Evaluated on the header block **only**: a request body line such as
 /// `X-Oura-Dash: 1` must never satisfy the guard. When the browser sends
-/// `Origin`, it must match the (already loopback-validated) `Host`.
-fn same_origin_write_ok(req: &str) -> bool {
+/// `Origin`, it must match the (already loopback-validated) `Host`, or the configured public origin.
+fn same_origin_write_ok(req: &str, public: Option<&PublicOrigin>) -> bool {
     let (head, _) = split_request(req);
     let origin_ok = match header(head, "origin") {
         None => true,
         Some(origin) => {
             header(head, "host").is_some_and(|host| origin == format!("http://{host}"))
+                || public.is_some_and(|p| p.matches_origin(origin))
         }
     };
     origin_ok && header(head, "x-oura-dash").is_some()
@@ -891,7 +1202,7 @@ mod request_guard_tests {
         // so a body line named like the CSRF header passed the check.
         let req = "POST /api/sync HTTP/1.1\r\nHost: localhost:8090\r\n\r\nX-Oura-Dash: 1\r\n";
         assert!(
-            !same_origin_write_ok(req),
+            !same_origin_write_ok(req, None),
             "a request body must not be able to satisfy the guard"
         );
     }
@@ -899,37 +1210,37 @@ mod request_guard_tests {
     #[test]
     fn a_real_header_satisfies_the_guard() {
         let req = "POST /api/sync HTTP/1.1\r\nHost: localhost:8090\r\nX-Oura-Dash: 1\r\n\r\n";
-        assert!(same_origin_write_ok(req));
+        assert!(same_origin_write_ok(req, None));
     }
 
     #[test]
     fn a_missing_header_is_refused() {
         let req = "GET /api/ring-key HTTP/1.1\r\nHost: localhost:8090\r\n\r\n";
-        assert!(!same_origin_write_ok(req));
+        assert!(!same_origin_write_ok(req, None));
     }
 
     #[test]
     fn header_names_are_case_insensitive() {
         let req = "POST /api/sync HTTP/1.1\r\nHOST: localhost:8090\r\nx-oura-dash: 1\r\n\r\n";
-        assert!(same_origin_write_ok(req));
+        assert!(same_origin_write_ok(req, None));
     }
 
     #[test]
     fn a_matching_origin_is_accepted() {
         let req = "POST /api/sync HTTP/1.1\r\nHost: localhost:8090\r\nOrigin: http://localhost:8090\r\nX-Oura-Dash: 1\r\n\r\n";
-        assert!(same_origin_write_ok(req));
+        assert!(same_origin_write_ok(req, None));
     }
 
     #[test]
     fn a_foreign_origin_is_refused() {
         let req = "POST /api/sync HTTP/1.1\r\nHost: localhost:8090\r\nOrigin: http://evil.example\r\nX-Oura-Dash: 1\r\n\r\n";
-        assert!(!same_origin_write_ok(req));
+        assert!(!same_origin_write_ok(req, None));
     }
 
     #[test]
     fn a_foreign_origin_in_the_body_is_ignored() {
         let req = "POST /api/sync HTTP/1.1\r\nHost: localhost:8090\r\nX-Oura-Dash: 1\r\n\r\nOrigin: http://evil.example\r\n";
-        assert!(same_origin_write_ok(req), "only the header block counts");
+        assert!(same_origin_write_ok(req, None), "only the header block counts");
     }
 
     #[test]
@@ -991,6 +1302,100 @@ mod request_guard_tests {
         assert!(!host_header_ok(Some("localhost:http"), LOOPBACK, 8090));
         assert!(!host_header_ok(Some(""), LOOPBACK, 8090));
     }
+
+    // ── framing and public origin ─────────────────────────────────────────────
+
+    #[test]
+    fn chunked_body_is_reassembled_across_chunks() {
+        let wire = b"4\r\nWiki\r\n5;ext=1\r\npedia\r\n0\r\nX-Trailer: 1\r\n\r\n";
+        assert_eq!(decode_chunked(wire).unwrap().as_deref(), Some(&b"Wikipedia"[..]));
+    }
+
+    #[test]
+    fn an_incomplete_chunked_body_asks_for_more() {
+        assert_eq!(decode_chunked(b"4\r\nWi").unwrap(), None);
+        assert_eq!(decode_chunked(b"4\r\nWiki\r\n").unwrap(), None);
+        assert_eq!(decode_chunked(b"4\r\nWiki\r\n0\r\n").unwrap(), None);
+    }
+
+    #[test]
+    fn malformed_chunk_framing_is_refused() {
+        assert_eq!(decode_chunked(b"zz\r\nab\r\n"), Err(RequestError::Malformed));
+        assert_eq!(decode_chunked(b"2\r\nabXY0\r\n\r\n"), Err(RequestError::Malformed));
+    }
+
+    #[test]
+    fn conflicting_or_unknown_framing_is_refused() {
+        let both = "POST /x HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked";
+        assert_eq!(framing_of(both), Err(RequestError::Malformed));
+        let twice = "POST /x HTTP/1.1\r\nContent-Length: 4\r\nContent-Length: 9";
+        assert_eq!(framing_of(twice), Err(RequestError::Malformed));
+        let gzip = "POST /x HTTP/1.1\r\nTransfer-Encoding: gzip, chunked";
+        assert_eq!(framing_of(gzip), Err(RequestError::Unsupported));
+        let big = format!("POST /x HTTP/1.1\r\nContent-Length: {}", MAX_BODY_BYTES + 1);
+        assert_eq!(framing_of(&big), Err(RequestError::TooLarge));
+        assert_eq!(
+            framing_of("POST /x HTTP/1.1\r\nContent-Length: 12"),
+            Ok(Framing::Length(12))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_split_across_writes_is_read_whole() {
+        // Regression: the request used to be read with one `read`, so a body that
+        // arrived in a later packet was missing and the handler answered 400.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let body = r#"{"value":1.5}"#;
+        let head = format!(
+            "POST /api/manual/entries HTTP/1.1\r\nHost: localhost:8090\r\nX-Oura-Dash: 1\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let (first, rest) = body.split_at(5);
+        let client = async {
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            c.write_all(format!("{head}{first}").as_bytes()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            c.write_all(rest.as_bytes()).await.unwrap();
+        };
+        let server = async {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            read_request(&mut sock).await
+        };
+        let ((), req) = tokio::join!(client, server);
+        let req = req.unwrap();
+        assert_eq!(split_request(&req).1, body);
+    }
+
+    #[test]
+    fn public_origin_supports_bracketed_ipv6() {
+        let p = PublicOrigin::parse("https://[::1]").unwrap().unwrap();
+        assert!(p.matches_host("[::1]"));
+        assert!(p.matches_origin("https://[::1]"));
+        let p = PublicOrigin::parse("https://[::1]:8443").unwrap().unwrap();
+        assert!(p.matches_host("[::1]:8443"));
+        assert!(PublicOrigin::parse("https://[::1").is_err());
+        assert!(PublicOrigin::parse("https://[not-an-ip]").is_err());
+    }
+
+    #[test]
+    fn public_origin_accepts_only_the_https_origin_form() {
+        let p = PublicOrigin::parse("https://Health.Example.com:443/").unwrap().unwrap();
+        assert!(host_allowed(Some("health.example.com"), LOOPBACK, 8090, Some(&p)));
+        assert!(same_origin_write_ok(
+            "POST /api/sync HTTP/1.1\r\nHost: health.example.com\r\nOrigin: https://health.example.com\r\nX-Oura-Dash: 1\r\n\r\n",
+            Some(&p)
+        ));
+        assert!(!host_allowed(Some("evil.example"), LOOPBACK, 8090, Some(&p)));
+        assert!(!same_origin_write_ok(
+            "POST /api/sync HTTP/1.1\r\nHost: health.example.com\r\nOrigin: https://evil.example\r\nX-Oura-Dash: 1\r\n\r\n",
+            Some(&p)
+        ));
+        assert_eq!(PublicOrigin::parse("").unwrap(), None);
+        assert!(PublicOrigin::parse("http://health.example.com").is_err());
+        assert!(PublicOrigin::parse("https://health.example.com/dash").is_err());
+        assert!(PublicOrigin::parse("https://health.example.com?x=1").is_err());
+    }
 }
 
 async fn write_resp(sock: &mut TcpStream, status: &str, ctype: &str, body: &[u8]) -> Result<()> {
@@ -1022,10 +1427,17 @@ async fn handle(
     key_file: Option<PathBuf>,
     manual: Option<Arc<Mutex<ManualStore>>>,
     weight_unit: WeightUnit,
+    public: Option<Arc<PublicOrigin>>,
 ) -> Result<()> {
-    let mut buf = [0u8; 8192];
-    let n = sock.read(&mut buf).await?;
-    let req = String::from_utf8_lossy(&buf[..n]);
+    // Header block and body, read to the framing's end (see `read_request`).
+    let req = match read_request(&mut sock).await {
+        Ok(req) => req,
+        Err(e) => {
+            let body = json!({ "ok": false, "error": e.message() });
+            let _ = json_status(&mut sock, e.status(), &body).await;
+            return Ok(());
+        }
+    };
     let method = req.split_whitespace().next().unwrap_or("GET");
     let target = req.split_whitespace().nth(1).unwrap_or("/");
     // route on the path only — a query string (e.g. cache-buster) must not 404 the API
@@ -1039,7 +1451,7 @@ async fn handle(
     // connection's own local address is what the client put in `Host`, so that is
     // what it is compared against.
     let local_ip = sock.local_addr().ok().map(|a| a.ip());
-    if !host_header_ok(header(head, "host"), local_ip, port) {
+    if !host_allowed(header(head, "host"), local_ip, port, public.as_deref()) {
         return write_resp(&mut sock, "403 Forbidden", "text/plain", b"forbidden").await;
     }
     // vendored SVG icons (Phosphor). Embedded at build time, so the packaged
@@ -1062,7 +1474,7 @@ async fn handle(
     // header; an <img>/<form> or cross-origin fetch cannot (CORS preflight we never approve).
     // GET /api/ring-key is guarded too — it discloses the ring auth key, so only the
     // dashboard's own same-origin page (which sets the header) may read it.
-    let csrf_ok = same_origin_write_ok(&req);
+    let csrf_ok = same_origin_write_ok(&req, public.as_deref());
     let forbid = matches!(
         (method, path),
         ("POST", "/api/profile")

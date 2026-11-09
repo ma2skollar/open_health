@@ -15,6 +15,8 @@ EnvironmentFile=-/etc/oura/oura.env
 # the binary's default applies: loopback only. Set it to this host's LAN address
 # to serve other machines, which is only safe behind a firewall or a VPN — see
 # docs/DEPLOY_LXC.md.
+# OURA_PUBLIC_ORIGIN is also read directly by the binary. Set it to the exact
+# external HTTPS origin when using a LAN/VPN reverse proxy; see option C there.
 ExecStart=/srv/oura/bin/oura --db ${OURA_RING_DB} dashboard --port ${OURA_PORT} --tz-offset ${OURA_TZ_OFFSET} --manual-db ${OURA_MANUAL_DB}
 Restart=on-failure
 RestartSec=3

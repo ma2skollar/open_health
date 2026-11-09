@@ -262,6 +262,11 @@ enum Command {
         /// a `Host` that is not the address you connected to is still refused.
         #[arg(long, env = "OURA_BIND", default_value = "127.0.0.1")]
         bind: String,
+        /// Public browser origin when a reverse proxy serves the dashboard over HTTPS,
+        /// e.g. `https://health.example.com`. Must be `https://host[:port]` with no path.
+        /// Only this exact host/origin is added to the guard; `X-Forwarded-*` is never read.
+        #[arg(long, env = "OURA_PUBLIC_ORIGIN", default_value = "")]
+        public_origin: String,
         /// Timezone offset (hours from UTC) for displayed times.
         #[arg(long, default_value_t = local_tz_offset_hours(), value_parser = parse_tz_offset, allow_hyphen_values = true)]
         tz_offset: f64,
@@ -513,6 +518,7 @@ async fn main() -> Result<()> {
         Command::Dashboard {
             port,
             bind,
+            public_origin,
             tz_offset,
             sex,
             age,
@@ -546,6 +552,7 @@ async fn main() -> Result<()> {
                 seed,
                 manual_path,
                 unit,
+                public_origin.clone(),
             )
             .await
         }
