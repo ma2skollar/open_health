@@ -39,3 +39,9 @@ semantics; provenance on every write; no silent rewrite of history.
 - The relationship between `profile.json` weight and dated `weight_kg` entries is
   explicit: dated entries win for derived calculations; the profile value is a
   seed/default only.
+  The web dashboard resolves the arithmetic mean of the latest 28 dated weight
+  observations within the preceding 180 calendar days (including today, excluding
+  future dates). Resolution uses canonical kg from the configured manual store,
+  not rounded display values. This effective weight feeds the summary and models
+  without replacing the saved fallback. Profile GET/POST expose its source and
+  observation count even when the ring database is absent.

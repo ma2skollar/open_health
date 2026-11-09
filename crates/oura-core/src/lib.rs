@@ -38,6 +38,7 @@ pub fn summary_json(db_path: String, tz_offset: i64) -> String {
         std::path::Path::new(&db_path),
         tz_offset,
         &oura_summary::NoModelRunner,
+        &oura_summary::read_profile(std::path::Path::new(&db_path)),
     ) {
         Ok(v) => v.to_string(),
         Err(e) => json!({ "error": e.to_string() }).to_string(),

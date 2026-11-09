@@ -2068,12 +2068,14 @@ fn make_digest(hrv: &VitalStat, rhr: &VitalStat) -> String {
     s
 }
 
-/// Assemble the full dashboard summary as a JSON value. The torch models are
-/// supplied by `runner` (Python subprocess on desktop, `.ptl` on-device).
+/// Assemble the full dashboard summary as a JSON value using the supplied profile.
+/// The torch models are supplied by `runner` (Python subprocess on desktop,
+/// `.ptl` on-device); callers resolve demographics before invoking this function.
 pub fn build_summary(
     db: &Path,
     tz: impl Into<OffsetHours>,
     runner: &dyn ModelRunner,
+    demo: &Demographics,
 ) -> Result<Value> {
     let tz = tz.into().0;
     anyhow::ensure!(
@@ -2086,7 +2088,6 @@ pub fn build_summary(
             .unwrap_or_else(|_| db.to_path_buf())
     });
     let db = db_abs.as_path();
-    let demo = read_profile(db);
     let _ = Store::migrate_if_writable(db);
     let store = Store::open_read_only(db).context("opening DB")?;
     let events = store.decoded_events().context("reading events")?;
@@ -2416,7 +2417,7 @@ pub fn build_summary(
     } = runner.run(ModelInputs {
         db,
         tz,
-        demo: &demo,
+        demo,
         sleep_ranges: &sleep_ranges,
     });
 
@@ -3700,7 +3701,7 @@ mod tests {
         }
         drop(conn);
 
-        let summary = build_summary(&db, 0.0, &NoModelRunner).unwrap();
+        let summary = build_summary(&db, 0.0, &NoModelRunner, &read_profile(&db)).unwrap();
         let dated = summary["nights"].as_array().unwrap();
         let undated = summary["clock"]["undated_nights"].as_array().unwrap();
         assert_eq!(
@@ -3798,7 +3799,7 @@ mod tests {
         }
         drop(conn);
 
-        let summary = build_summary(&db, 0.0, &NoModelRunner).unwrap();
+        let summary = build_summary(&db, 0.0, &NoModelRunner, &read_profile(&db)).unwrap();
         // Elapsed wall time is jul3..jul5 = 2.0 days (NOT 213.2 + 2.0 = 215.2 days!).
         assert_eq!(summary["device"]["days_of_data"], 2.0);
         assert_eq!(summary["device"]["elapsed_days"], 2.0);
@@ -3812,6 +3813,43 @@ mod tests {
         assert_eq!(undated.len(), 1);
         assert_eq!(undated[0]["reason"], "accelerated_counter");
         assert_eq!(undated[0]["recoverable"], false);
+
+        // Reuse the same event fixture to pin the explicit-profile contract. The
+        // on-disk fallback must not override the demographics a client resolves.
+        write_profile(&db, &Demographics::default().to_json()).unwrap();
+        struct ProfileRunner {
+            expected: Demographics,
+            called: std::cell::Cell<bool>,
+        }
+        impl ModelRunner for ProfileRunner {
+            fn run(&self, input: ModelInputs) -> ModelOutputs {
+                assert_eq!(input.demo.to_json(), self.expected.to_json());
+                self.called.set(true);
+                ModelOutputs::default()
+            }
+        }
+        for weight_kg in [83.123, 101.987] {
+            let supplied = Demographics {
+                sex: 'F',
+                age: 25.0,
+                height_m: 1.87,
+                weight_kg,
+                ring_size: 12.0,
+            };
+            let runner = ProfileRunner {
+                expected: supplied,
+                called: std::cell::Cell::new(false),
+            };
+            let resolved = build_summary(&db, 0.0, &runner, &supplied).unwrap();
+            assert!(runner.called.get());
+            assert_eq!(resolved["profile"], supplied.to_json());
+            let vo2max = oura_analysis::ported::metabolic::vo2max_jackson(
+                supplied.age,
+                true,
+                weight_kg,
+            );
+            assert_eq!(resolved["fitness"]["vo2max"], (vo2max * 10.0).round() / 10.0);
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3912,7 +3950,7 @@ mod tests {
         insert_session(&conn, 3, 10_000 + 3 * day_ds, 8 * 36_000, 54, 50);
         drop(conn);
 
-        let sum_before = build_summary(&db, 0.0, &FakeRunner).unwrap();
+        let sum_before = build_summary(&db, 0.0, &FakeRunner, &read_profile(&db)).unwrap();
         // `nights` in summary JSON is newest-first:
         // index 0 = Night 3 (4th main night, has 3 prior main nights -> physiology component present!)
         // index 1 = Night 2 (3rd main night, has only 2 prior main nights because nap is excluded -> NO physiology component!)
@@ -3943,7 +3981,7 @@ mod tests {
         insert_session(&conn, 4, 10_000 + 4 * day_ds, 8 * 36_000, 99, 8);
         drop(conn);
 
-        let sum_after = build_summary(&db, 0.0, &FakeRunner).unwrap();
+        let sum_after = build_summary(&db, 0.0, &FakeRunner, &read_profile(&db)).unwrap();
         let nights_after = sum_after["nights"].as_array().unwrap();
         assert_eq!(nights_after.len(), 6);
         // nights_after[1..] correspond to nights_before[0..]
@@ -4073,7 +4111,7 @@ mod tests {
             Some(292_000),
         )
         .unwrap();
-        let sum = build_summary(&db, 0.0, &NoModelRunner).unwrap();
+        let sum = build_summary(&db, 0.0, &NoModelRunner, &read_profile(&db)).unwrap();
         let night = &sum["nights"].as_array().unwrap()[0];
         assert_eq!(night["start_ds"], 16_000);
         assert_eq!(night["end_ds"], 292_000);
@@ -4082,7 +4120,7 @@ mod tests {
         assert_eq!(night["bedtime_manual"], true);
 
         write_bedtime_override(&db, 10_000, Some(base_unix + 30_000), None, None).unwrap();
-        let sum_reset = build_summary(&db, 0.0, &NoModelRunner).unwrap();
+        let sum_reset = build_summary(&db, 0.0, &NoModelRunner, &read_profile(&db)).unwrap();
         let night_reset = &sum_reset["nights"].as_array().unwrap()[0];
         assert_eq!(night_reset["start_ds"], 10_000);
         assert_eq!(night_reset["end_ds"], 298_000);

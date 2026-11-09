@@ -225,6 +225,14 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
   shared summary field and do not change native iOS behavior. Chromium device-size
   checks do not replace a real iPhone Safari check of the native date picker,
   visual viewport, keyboard, and dialog scrolling before deployment.
+  Web profile readback also works without ring data. The web uses the canonical-kg
+  average of the latest 28 logged weights within 180 calendar days for shared
+  summary calculations and model inputs; the saved profile weight remains the
+  fallback. iOS has no manual store and continues to use its saved profile weight.
+  Manual calorie and weight plots now use 220px desktop / 200px mobile heights,
+  with nearest-observation hover/tap readouts and arrow/Home/End keyboard inspection.
+  Readouts show date, value, unit, and rolling trend when present. This remains
+  web-only because native iOS has no manual-metric surface.
 - **One-page day view**: web shows Sleep, Activity and Heart rate on one scrolling page, every
   chart on one time axis (`dayAxis`) with a shared cursor (`dayCursor`), plus ‹ › / ← → to step
   through days with data; iOS `DayReportView` keeps tabs and reaches days via `AllDaysView`.

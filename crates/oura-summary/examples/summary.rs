@@ -31,7 +31,13 @@ fn main() {
     let value = if what == "hourly_hr" {
         oura_summary::hourly_hr::hourly_hr(Path::new(&db), tz, 0)
     } else {
-        oura_summary::build_summary(Path::new(&db), tz, &oura_summary::NoModelRunner)
+        let db = Path::new(&db);
+        oura_summary::build_summary(
+            db,
+            tz,
+            &oura_summary::NoModelRunner,
+            &oura_summary::read_profile(db),
+        )
     };
     match value {
         Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap()),

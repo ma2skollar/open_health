@@ -881,7 +881,8 @@ body.page-open { overflow: hidden; }
 .manual-bars rect { fill: var(--muted); opacity: 0.45; }
 .manual-line { fill: none; stroke: var(--muted); stroke-width: 1.6; vector-effect: non-scaling-stroke; }
 .manual-trend { fill: none; stroke: var(--wake); stroke-width: 1.8; stroke-dasharray: none; vector-effect: non-scaling-stroke; }
-.manual-dot { fill: var(--muted); opacity: 0.7; }
+.manual-dot { fill: none; stroke: var(--muted); stroke-width: 5; stroke-linecap: round; vector-effect: non-scaling-stroke; }
+.manual-trend-dot { fill: var(--wake); }
 .manual-legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: var(--s2); font-size: var(--fs-base); color: var(--muted); }
 .manual-legend span { display: inline-flex; align-items: center; gap: 6px; }
 .manual-sw { width: 14px; height: 0; border-top-width: 2.5px; border-top-style: solid; }
@@ -919,7 +920,14 @@ body.page-open { overflow: hidden; }
   margin-bottom: var(--s2);
 }
 .manual-summary-chart { margin: var(--s2) 0 var(--s3); }
-.manual-summary-chart .manual-svg { height: 56px; }
+.manual-plot { position: relative; height: 220px; cursor: crosshair; touch-action: pan-y; }
+.manual-plot:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.manual-summary-chart .manual-svg { height: 100%; }
+.manual-crosshair { position: absolute; top: 0; bottom: 0; left: var(--manual-point-x); border-left: 1px dashed var(--muted); pointer-events: none; }
+.manual-selected-dot, .manual-selected-trend { position: absolute; left: var(--manual-point-x); top: var(--manual-point-y); width: 9px; height: 9px; border-radius: 50%; background: var(--text); transform: translate(-50%, -50%); pointer-events: none; }
+.manual-selected-trend { background: var(--wake); }
+.manual-chart-readout { min-height: 2.8em; margin: var(--s3) 0 var(--s2); font: var(--fs-base) var(--mono); overflow-wrap: anywhere; color: var(--text); }
+.manual-chart-hint { margin: 0; font-size: var(--fs-xs); color: var(--muted); }
 .manual-summary-chart .manual-empty { padding: var(--s3) 0; }
 .manual-summary-weeks {
   display: flex; gap: var(--s2); margin-top: var(--s3); padding-top: var(--s3);
@@ -965,6 +973,7 @@ body.page-open { overflow: hidden; }
 @media (max-width: 760px) {
   .manual-charts { grid-template-columns: 1fr; gap: var(--s4); }
   .manual-summary { grid-template-columns: 1fr; gap: var(--s3); }
+  .manual-plot { height: 200px; }
 }
 @media (max-width: 560px) {
   .manual-row { grid-template-columns: minmax(0, 1fr); gap: var(--s2); }

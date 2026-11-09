@@ -270,21 +270,97 @@ fn merge_sleep_fallback(python: Option<Value>, signals: Option<Value>) -> Option
     Some(Value::Array(merged))
 }
 
+/// Web demographics use the manual panel's latest 28 observations in its default
+/// 180-calendar-day window. Values stay in canonical kg, without display rounding.
+struct EffectiveProfile {
+    demo: Demographics,
+    weight_sample_count: usize,
+}
+
+impl EffectiveProfile {
+    fn to_json(&self) -> Value {
+        let mut profile = self.demo.to_json();
+        profile["weight_source"] = json!(if self.weight_sample_count > 0 {
+            "manual_average"
+        } else {
+            "profile"
+        });
+        profile["weight_sample_count"] = json!(self.weight_sample_count);
+        profile
+    }
+}
+
+fn resolve_profile(
+    mut demo: Demographics,
+    manual: Option<&Mutex<ManualStore>>,
+    today: i64,
+) -> Result<EffectiveProfile> {
+    let mut weight_sample_count = 0;
+    if let Some(manual) = manual {
+        let from = days_to_ymd(today - 179);
+        let to = days_to_ymd(today);
+        let entries = lock_manual(manual)
+            .list_entries(Some(&from), Some(&to), Some(MetricKind::WeightKg))
+            .context("reading manual weights for profile")?;
+        let latest = &entries[entries.len().saturating_sub(28)..];
+        weight_sample_count = latest.len();
+        if !latest.is_empty() {
+            demo.weight_kg = latest.iter().map(|entry| entry.value).sum::<f64>() / latest.len() as f64;
+        }
+    }
+    Ok(EffectiveProfile {
+        demo,
+        weight_sample_count,
+    })
+}
+
+fn effective_profile(
+    db: &Path,
+    manual: Option<&Mutex<ManualStore>>,
+    today: i64,
+) -> Result<EffectiveProfile> {
+    resolve_profile(read_profile(db), manual, today)
+}
+
+fn save_effective_profile(
+    db: &Path,
+    manual: Option<&Mutex<ManualStore>>,
+    today: i64,
+    value: &Value,
+) -> Result<EffectiveProfile> {
+    let saved = read_profile(db);
+    let mut effective = resolve_profile(saved, manual, today)?;
+    let mut updated = Demographics::from_json(value);
+    if value.get("ring_size").is_none() {
+        updated.ring_size = saved.ring_size;
+    }
+    if effective.weight_sample_count > 0 {
+        // The submitted weight is the displayed mean, not a new fallback value.
+        updated.weight_kg = saved.weight_kg;
+    }
+    let updated = write_profile(db, &updated.to_json())?;
+    let effective_weight = effective.demo.weight_kg;
+    effective.demo = updated;
+    if effective.weight_sample_count > 0 {
+        effective.demo.weight_kg = effective_weight;
+    }
+    Ok(effective)
+}
+
 /// `build_summary` for the web dashboard — runs the models via Python.
-fn build_summary(db: &Path, tz: f64) -> Result<Value> {
-    oura_summary::build_summary(db, tz, &PythonRunner)
+fn build_summary(db: &Path, tz: f64, demo: &Demographics) -> Result<Value> {
+    oura_summary::build_summary(db, tz, &PythonRunner, demo)
 }
 
 // ── summary cache ─────────────────────────────────────────────────────────────
 // build_summary spawns torch subprocesses (~seconds); without a cache every page
 // load re-pays that. We memoise the last result and reuse it until the inputs
-// change — the DB (a sync appends events) or profile.json (an edit changes the CVA
-// inputs / weight-based kcal). Both are cheap mtime stats, so a sync or profile
-// edit transparently invalidates the cache with no explicit wiring.
+// change — ring data, saved profile, effective manual weight, or other summary
+// inputs. Profile edits and logged-weight changes both invalidate the cache.
 struct SummaryCache {
     db: PathBuf,
     tz: f64,
-    token: CacheToken, // (db, profile.json, feature_modes.json, bedtime_overrides.json) mtimes
+    token: CacheToken,
     value: Arc<Value>,
 }
 
@@ -294,19 +370,20 @@ type CacheToken = (
     Option<SystemTime>,
     Option<SystemTime>,
     i64,
+    u64,
 );
 
-/// mtimes of every input the summary depends on plus the store decoder version — any
-/// change rebuilds it. Covers a sync (oura.db), a profile edit (profile.json), a
-/// feature toggle (feature_modes.json), a manual bedtime adjustment
-/// (bedtime_overrides.json), and historical decode migrations.
-fn summary_token(db: &Path) -> CacheToken {
+/// Every input's mtime, the store decoder version, and the effective weight — any
+/// change rebuilds it. Covers a sync, profile/feature/bedtime edits, historical
+/// decode migrations, and logged-weight changes (including window expiry).
+fn summary_token(db: &Path, demo: &Demographics) -> CacheToken {
     (
         mtime(db),
         mtime(&profile_path(db)),
         mtime(&feature_modes_path(db)),
         mtime(&bedtime_overrides_path(db)),
         oura_store::storage::DECODER_VERSION,
+        demo.weight_kg.to_bits(),
     )
 }
 
@@ -319,22 +396,27 @@ fn mtime(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).and_then(|m| m.modified()).ok()
 }
 
-/// Cached `build_summary`: recompute only when oura.db, profile.json, or
-/// feature_modes.json changes.
-fn cached_summary(db: &Path, tz: f64) -> Result<Arc<Value>> {
+/// Cached `build_summary`: recompute when persisted inputs or effective weight change.
+fn cached_summary(
+    db: &Path,
+    tz: f64,
+    manual: Option<&Mutex<ManualStore>>,
+) -> Result<Arc<Value>> {
     let _ = oura_store::storage::Store::migrate_if_writable(db);
-    let token = summary_token(db);
+    let profile = effective_profile(db, manual, local_today_days(tz))?;
+    let token = summary_token(db, &profile.demo);
     if let Some(c) = summary_cache().lock().unwrap().as_ref() {
         if c.db == db && c.tz == tz && c.token == token {
             return Ok(c.value.clone());
         }
     }
     // build outside the lock so concurrent first-loads don't serialise on it
-    let value = Arc::new(build_summary(db, tz)?);
+    let value = Arc::new(build_summary(db, tz, &profile.demo)?);
     // re-stat the inputs: if any changed while we were building (e.g. a sync landed),
     // the result may predate that change — don't cache it, so the next request
     // rebuilds against the new state instead of serving stale data.
-    let token_after = summary_token(db);
+    let profile_after = effective_profile(db, manual, local_today_days(tz))?;
+    let token_after = summary_token(db, &profile_after.demo);
     if token_after == token {
         let mut guard = summary_cache().lock().unwrap();
         // don't clobber a fresher entry a concurrent build already stored (compare
@@ -366,8 +448,8 @@ pub async fn serve(
     weight_unit: WeightUnit,
     public_origin: String,
 ) -> Result<()> {
-    // seed profile.json from the CLI demographics on first run; afterwards the
-    // file is the editable source of truth.
+    // Seed profile.json from the CLI demographics on first run; afterwards it
+    // stores editable demographics and the fallback weight for empty manual history.
     if !profile_path(&db).exists() {
         let _ = write_profile(&db, &seed.to_json());
     }
@@ -1550,9 +1632,11 @@ async fn handle(
         ("GET", "/api/summary") => {
             // building the summary shells out to torch models → off the async
             // executor; cached so only the first load (or post-sync/edit) pays for it.
-            let body = tokio::task::spawn_blocking(move || cached_summary(&db, effective_tz))
-                .await
-                .map_err(|e| anyhow!(e))?;
+            let body = tokio::task::spawn_blocking(move || {
+                cached_summary(&db, effective_tz, manual.as_deref())
+            })
+            .await
+            .map_err(|e| anyhow!(e))?;
             match body {
                 Ok(v) => json_resp(&mut sock, &v).await,
                 Err(e) => {
@@ -1653,12 +1737,30 @@ async fn handle(
                 Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
             }
         }
-        ("GET", "/api/profile") => json_resp(&mut sock, &read_profile(&db).to_json()).await,
+        ("GET", "/api/profile") => {
+            match effective_profile(&db, manual.as_deref(), local_today_days(effective_tz)) {
+                Ok(profile) => json_resp(&mut sock, &profile.to_json()).await,
+                Err(e) => json_status(
+                    &mut sock,
+                    "500 Internal Server Error",
+                    &json!({ "error": e.to_string() }),
+                ).await,
+            }
+        }
         ("POST", "/api/profile") => {
             match serde_json::from_str::<Value>(body.trim_end_matches('\0')) {
-                Ok(v) => match write_profile(&db, &v) {
-                    Ok(d) => json_resp(&mut sock, &d.to_json()).await,
-                    Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
+                Ok(v) => match save_effective_profile(
+                    &db,
+                    manual.as_deref(),
+                    local_today_days(effective_tz),
+                    &v,
+                ) {
+                    Ok(profile) => json_resp(&mut sock, &profile.to_json()).await,
+                    Err(e) => json_status(
+                        &mut sock,
+                        "500 Internal Server Error",
+                        &json!({ "error": e.to_string() }),
+                    ).await,
                 },
                 Err(e) => json_resp(&mut sock, &json!({ "error": e.to_string() })).await,
             }
@@ -2583,5 +2685,181 @@ mod manual_route_tests {
         assert_eq!(payload["steps"][0]["value"], 9000.0);
         // Fewer than seven stored weights means no trend is invented.
         assert!(payload["weight_trend"].as_array().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+
+    const TODAY: i64 = 21_000;
+
+    struct Fixture {
+        db: PathBuf,
+        manual: Mutex<ManualStore>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let unique = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let dir = std::env::temp_dir().join(format!(
+                "oura-profile-test-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let db = dir.join("oura.db");
+            write_profile(
+                &db,
+                &json!({
+                    "sex": "F", "age": 25.0, "height_m": 1.87,
+                    "weight_kg": 111.0, "ring_size": 12.0,
+                }),
+            ).unwrap();
+            Self {
+                db,
+                manual: Mutex::new(ManualStore::open_in_memory().unwrap()),
+            }
+        }
+
+        fn add(&self, day: i64, kind: MetricKind, value: f64) {
+            let body = json!({
+                "local_date": days_to_ymd(day),
+                "kind": kind.as_str(),
+                "value": value,
+            }).to_string();
+            let (status, response) = manual_post(&lock_manual(&self.manual), &body);
+            assert_eq!(status, "200 OK", "{response}");
+        }
+
+        fn profile(&self) -> EffectiveProfile {
+            effective_profile(&self.db, Some(&self.manual), TODAY).unwrap()
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(self.db.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn profile_readback_without_ring_uses_saved_fallback_for_missing_or_empty_manual_store() {
+        let fixture = Fixture::new();
+        assert!(!fixture.db.exists(), "profile reads must not require a ring DB");
+        for manual in [None, Some(&fixture.manual)] {
+            let profile = effective_profile(&fixture.db, manual, TODAY).unwrap().to_json();
+            assert_eq!(profile["sex"], "F");
+            assert_eq!(profile["age"], 25.0);
+            assert_eq!(profile["height_m"], 1.87);
+            assert_eq!(profile["weight_kg"], 111.0);
+            assert_eq!(profile["ring_size"], 12.0);
+            assert_eq!(profile["weight_source"], "profile");
+            assert_eq!(profile["weight_sample_count"], 0);
+        }
+        fixture.add(TODAY - 180, MetricKind::WeightKg, 80.0);
+        fixture.add(TODAY + 1, MetricKind::WeightKg, 90.0);
+        let profile = fixture.profile().to_json();
+        assert_eq!(profile["weight_kg"], 111.0);
+        assert_eq!(profile["weight_source"], "profile");
+        assert_eq!(profile["weight_sample_count"], 0);
+    }
+
+    #[test]
+    fn sparse_weights_average_observations_in_inclusive_window_through_today() {
+        let fixture = Fixture::new();
+        fixture.add(TODAY - 180, MetricKind::WeightKg, 300.0);
+        fixture.add(TODAY - 179, MetricKind::WeightKg, 70.125);
+        fixture.add(TODAY - 40, MetricKind::WeightKg, 80.25);
+        fixture.add(TODAY, MetricKind::WeightKg, 90.375);
+        fixture.add(TODAY + 1, MetricKind::WeightKg, 400.0);
+        fixture.add(TODAY, MetricKind::CaloriesEaten, 2500.0);
+
+        let profile = fixture.profile().to_json();
+        assert_eq!(profile["weight_kg"], 80.25);
+        assert_eq!(profile["weight_source"], "manual_average");
+        assert_eq!(profile["weight_sample_count"], 3);
+        assert_eq!(read_profile(&fixture.db).weight_kg, 111.0);
+    }
+
+    #[test]
+    fn weight_mean_uses_only_latest_twenty_eight_stored_observations() {
+        let fixture = Fixture::new();
+        for i in 0..35 {
+            fixture.add(TODAY - 2 * (34 - i), MetricKind::WeightKg, 60.0 + i as f64);
+        }
+        let profile = fixture.profile();
+        assert_eq!(profile.weight_sample_count, 28);
+        assert_eq!(profile.demo.weight_kg, 80.5);
+    }
+
+    #[test]
+    fn effective_weight_keeps_canonical_precision_independent_of_display_units() {
+        let fixture = Fixture::new();
+        fixture.add(TODAY - 10, MetricKind::WeightKg, 70.123);
+        fixture.add(TODAY, MetricKind::WeightKg, 80.987);
+        let expected = (70.123 + 80.987) / 2.0;
+        let entries = lock_manual(&fixture.manual).export_all().unwrap();
+        for unit in [WeightUnit::Kg, WeightUnit::Lb] {
+            let shown = manual_series_json(&entries, unit);
+            assert_eq!(shown["weight_summary"]["avg_28"], round1(unit.display_value(expected)));
+            assert_eq!(fixture.profile().demo.weight_kg, expected);
+        }
+        assert_ne!(fixture.profile().demo.weight_kg, round1(expected));
+    }
+
+    #[test]
+    fn profile_post_keeps_saved_fallback_while_mean_active_and_preserves_ring_size() {
+        let fixture = Fixture::new();
+        fixture.add(TODAY, MetricKind::WeightKg, 80.125);
+        let profile = save_effective_profile(
+            &fixture.db,
+            Some(&fixture.manual),
+            TODAY,
+            &json!({ "sex": "M", "age": 45.0, "height_m": 1.9, "weight_kg": 80.1 }),
+        ).unwrap().to_json();
+        assert_eq!(profile["weight_kg"], 80.125);
+        assert_eq!(profile["weight_source"], "manual_average");
+        assert_eq!(profile["weight_sample_count"], 1);
+        assert_eq!(profile["sex"], "M");
+        assert_eq!(profile["age"], 45.0);
+        assert_eq!(profile["height_m"], 1.9);
+        assert_eq!(profile["ring_size"], 12.0);
+        assert_eq!(read_profile(&fixture.db).weight_kg, 111.0);
+
+        lock_manual(&fixture.manual)
+            .delete_entry(&days_to_ymd(TODAY), MetricKind::WeightKg)
+            .unwrap();
+        assert_eq!(fixture.profile().demo.weight_kg, 111.0);
+        let profile = save_effective_profile(
+            &fixture.db,
+            Some(&fixture.manual),
+            TODAY,
+            &json!({ "sex": "M", "age": 45.0, "height_m": 1.9, "weight_kg": 95.5 }),
+        ).unwrap().to_json();
+        assert_eq!(profile["weight_kg"], 95.5);
+        assert_eq!(profile["weight_source"], "profile");
+        assert_eq!(profile["ring_size"], 12.0);
+        assert_eq!(read_profile(&fixture.db).weight_kg, 95.5);
+    }
+
+    #[test]
+    fn summary_cache_key_tracks_weight_edits_deletes_and_window_expiry() {
+        let fixture = Fixture::new();
+        let fallback = summary_token(&fixture.db, &fixture.profile().demo);
+        fixture.add(TODAY - 179, MetricKind::WeightKg, 80.0);
+        let first = summary_token(&fixture.db, &fixture.profile().demo);
+        assert_ne!(first, fallback);
+        fixture.add(TODAY - 179, MetricKind::WeightKg, 80.001);
+        let edited = summary_token(&fixture.db, &fixture.profile().demo);
+        assert_ne!(edited, first);
+        let expired = effective_profile(&fixture.db, Some(&fixture.manual), TODAY + 1).unwrap();
+        assert_eq!(summary_token(&fixture.db, &expired.demo), fallback);
+        lock_manual(&fixture.manual)
+            .delete_entry(&days_to_ymd(TODAY - 179), MetricKind::WeightKg)
+            .unwrap();
+        assert_eq!(summary_token(&fixture.db, &fixture.profile().demo), fallback);
     }
 }

@@ -1,5 +1,21 @@
 # TESTING
 
+## Profile persistence and logged-weight feedback (2026-11-09)
+
+Verified in Linux containers with an isolated ring-less database:
+
+- Dashboard tests: 56 passed; shared summary tests: 74 passed.
+- `cargo check --locked -p oura-core` and locked release CLI build passed.
+- `scripts/smoke-dashboard.sh` passed.
+- Chromium through the local nginx HTTPS proxy saved decimal-comma fallback
+  weight `82,5`, age and height; reopening, page reload, and server restart
+  retained the values without ring data.
+- With the manual panel configured for pounds, canonical entries of 90 kg and
+  94 kg produced a read-only 92 kg profile average. Saving age retained the
+  original fallback; deleting both observations restored 82.5 kg.
+- Desktop and 375×667 dialog screenshots checked; phone dialog had no horizontal
+  overflow. No native iOS runtime or populated production ring data was exercised.
+
 ## Dashboard changes: required Docker verification loop
 
 Production runs in LXC; the checkout is local only. Verify every dashboard change

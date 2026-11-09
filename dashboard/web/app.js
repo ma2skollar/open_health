@@ -2076,13 +2076,30 @@ function renderActions(d) {
 }
 
 // ── profile dialog ──────────────────────────────────────────
-function openProfile() {
-  const p = CURRENT_PROFILE || {};
-  $("f-sex").value = p.sex || "M";
-  $("f-age").value = p.age ?? 30;
-  $("f-height").value = p.height_m ?? 1.78;
-  $("f-weight").value = p.weight_kg ?? 75;
-  $("profile-dialog").showModal();
+async function openProfile() {
+  $("profile-btn").disabled = true;
+  try {
+    const p = await getDash(`/api/profile?tz=${browserTzOffset()}`).then(readJsonResponse);
+    if (p.error) {
+      toast(p.error, "error");
+      return;
+    }
+    CURRENT_PROFILE = p;
+    $("f-sex").value = p.sex;
+    $("f-age").value = p.age;
+    $("f-height").value = Number(p.height_m.toFixed(2));
+    $("f-weight").value = Number(p.weight_kg.toFixed(2));
+    const averaged = p.weight_source === "manual_average";
+    $("f-weight").readOnly = averaged;
+    $("profile-weight-help").textContent = averaged
+      ? `Using the average of ${p.weight_sample_count} logged weight ${p.weight_sample_count === 1 ? "entry" : "entries"}. Update weight in Daily entry.`
+      : "No recent logged weights. This weight is saved as a fallback; logged weights take priority.";
+    $("profile-dialog").showModal();
+  } catch {
+    toast("Couldn't load saved details. Check the dashboard server and try again.", "error");
+  } finally {
+    $("profile-btn").disabled = false;
+  }
 }
 async function saveProfile(e) {
   e.preventDefault();
@@ -2107,7 +2124,9 @@ async function saveProfile(e) {
       toast(j.error, "error");
       return;
     }
+    CURRENT_PROFILE = j;
     $("profile-dialog").close();
+    toast("Details saved on the dashboard server.");
     await load(); // re-runs CVA with the new demographics
   } catch {
     toast("Couldn't reach the local server.", "error");
@@ -2270,7 +2289,6 @@ async function load() {
     showLoadError(d.error);
     return;
   }
-  CURRENT_PROFILE = d.profile || null;
   CURRENT_TZ = d.tz || 0;
   LAST_DEVICE_SERIAL = d.device && d.device.serial;
   $("digest").classList.remove("skeleton", "skeleton-text");
@@ -2396,60 +2414,137 @@ load();
     p.classList.toggle("is-error", !!isError);
   };
 
-  // Calories as bars plus a rolling-trend line. Each bar is a stored value; a
-  // missing day has no bar. The trend is drawn only where the window covers
-  // stored points.
+  // Only stored dates receive marks or inspection targets. Trend segments stop
+  // at missing days rather than implying an observation inside a gap.
+  function manualTrendSvg(points, at) {
+    const runs = [];
+    for (const p of points) {
+      const run = runs.at(-1);
+      if (!run || ymdToDay(p.date) - ymdToDay(run.at(-1).date) !== 1) runs.push([p]);
+      else run.push(p);
+    }
+    return runs.map((run) => {
+      if (run.length > 1) return `<path class="manual-trend" d="${smoothPath(run.map(at))}"></path>`;
+      const [x, y] = at(run[0]);
+      return `<circle class="manual-trend-dot" cx="${x}" cy="${y}" r="2.5"></circle>`;
+    }).join("");
+  }
+
+  // Calories as bars plus a rolling-trend line. Empty days keep their place on
+  // the date axis, with no bar and no zero-valued inspection target.
   function caloriesSvg(points, trend) {
     const pts = (points || []).filter((p) => p && p.value != null);
-    if (!pts.length) return { svg: "", hasTrend: false };
-    const tpts = (trend || []).filter((p) => p && p.value != null);
-    const W = 600, H = 120, base = H - 1;
+    if (!pts.length) return null;
+    const dates = new Set(pts.map((p) => p.date));
+    const tpts = (trend || []).filter((p) => p && p.value != null && dates.has(p.date));
+    const W = 600, H = 220, base = H - 5;
     const max = Math.max(1, ...pts.map((p) => p.value), ...tpts.map((p) => p.value));
-    const bw = W / pts.length;
-    const bars = pts.map((p, i) => {
-      const bh = Math.max(1.5, (p.value / max) * (H - 6));
-      const x = i * bw + bw * 0.18;
-      return `<rect x="${x.toFixed(2)}" y="${(base - bh).toFixed(2)}" width="${(bw * 0.64).toFixed(2)}" height="${bh.toFixed(2)}" rx="1.5"><title>${esc(p.date)}: ${Math.round(p.value).toLocaleString()} kcal</title></rect>`;
+    const days = pts.map((p) => ymdToDay(p.date));
+    const d0 = Math.min(...days), span = Math.max(...days) - d0 + 1;
+    const bw = W / span;
+    const xOf = (p) => (ymdToDay(p.date) - d0 + 0.5) * bw;
+    const yOf = (v) => base - (v / max) * (H - 15);
+    const bars = pts.map((p) => {
+      const bh = Math.max(1, base - yOf(p.value));
+      return `<rect x="${(xOf(p) - bw * 0.32).toFixed(2)}" y="${(base - bh).toFixed(2)}" width="${(bw * 0.64).toFixed(2)}" height="${bh.toFixed(2)}" rx="1.5"></rect>`;
     }).join("");
-    const idx = new Map(pts.map((p, i) => [p.date, i]));
-    const xOf = (i) => i * bw + bw / 2;
-    const yOf = (v) => base - (v / max) * (H - 6);
-    const trendPts = tpts.filter((p) => idx.has(p.date)).map((p) => {
-      const i = idx.get(p.date);
-      return [xOf(i), yOf(p.value)];
-    });
-    const trendLine = trendPts.length > 1 ? `<path class="manual-trend" d="${smoothPath(trendPts)}"></path>` : "";
+    const trends = new Map(tpts.map((p) => [p.date, p.value]));
     return {
-      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Calories per day and their rolling trend"><g class="manual-bars">${bars}</g>${trendLine}</svg>`,
-      hasTrend: trendPts.length > 1,
+      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true"><g class="manual-bars">${bars}</g>${manualTrendSvg(tpts, (p) => [xOf(p), yOf(p.value)])}</svg>`,
+      points: pts.map((p) => ({ ...p, x: xOf(p), y: yOf(p.value), trend: trends.get(p.date), trendY: trends.has(p.date) ? yOf(trends.get(p.date)) : null })),
+      width: W, height: H, label: "Calories", unit: "kcal", decimals: 0,
+      hasTrend: tpts.length > 0,
     };
   }
 
-  // Weight line plus a visually distinct rolling-trend line, both drawn only
-  // through stored points (no interpolation, no filling of gaps).
+  // Weight observations stay separate dots; only the rolling trend has a line.
+  // Stretch both axes to the plot bounds so narrow cards do not letterbox.
   function weightSvg(points, trend) {
     const pts = (points || []).filter((p) => p && p.value != null);
     if (!pts.length) return null;
-    const tpts = (trend || []).filter((p) => p && p.value != null);
-    const W = 600, H = 130, padT = 10, padB = 12;
+    const dates = new Set(pts.map((p) => p.date));
+    const tpts = (trend || []).filter((p) => p && p.value != null && dates.has(p.date));
+    const W = 600, H = 220, padX = 8, padT = 10, padB = 12;
     const vals = pts.concat(tpts).map((p) => p.value);
     const min = Math.min(...vals), max = Math.max(...vals);
     const rng = Math.max(0.5, max - min);
     const days = pts.map((p) => ymdToDay(p.date));
-    const d0 = Math.min(...days);
-    const span = Math.max(1, Math.max(...days) - d0);
-    const xOf = (p) => ((ymdToDay(p.date) - d0) / span) * W;
-    const yOf = (v) => padT + (1 - (v - min) / rng) * (H - padT - padB);
+    const d0 = Math.min(...days), span = Math.max(...days) - d0;
+    const xOf = (p) => span ? padX + ((ymdToDay(p.date) - d0) / span) * (W - 2 * padX) : W / 2;
+    const yOf = (v) => padT + (1 - (v - min + (rng - (max - min)) / 2) / rng) * (H - padT - padB);
     const at = (p) => [xOf(p), yOf(p.value)];
-    const trendLine = tpts.length > 1 ? `<path class="manual-trend" d="${smoothPath(tpts.map(at))}"></path>` : "";
     const dots = pts.map((p) => {
       const [x, y] = at(p);
-      return `<circle class="manual-dot" cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.6"><title>${esc(p.date)}: ${round2(p.value).toFixed(2)} ${UNIT}</title></circle>`;
+      return `<path class="manual-dot" d="M${x.toFixed(2)} ${y.toFixed(2)}h0"></path>`;
     }).join("");
+    const trends = new Map(tpts.map((p) => [p.date, p.value]));
     return {
-      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="Weight and its rolling trend">${trendLine}${dots}</svg>`,
-      hasTrend: tpts.length > 1,
+      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">${manualTrendSvg(tpts, at)}${dots}</svg>`,
+      points: pts.map((p) => ({ ...p, x: xOf(p), y: yOf(p.value), trend: trends.get(p.date), trendY: trends.has(p.date) ? yOf(trends.get(p.date)) : null })),
+      width: W, height: H, label: "Weight", unit: UNIT, decimals: 2,
+      hasTrend: tpts.length > 0,
     };
+  }
+
+  function renderInteractiveChart(container, chart) {
+    if (!chart) {
+      container.innerHTML = EMPTY;
+      return;
+    }
+    const readoutId = `${container.id}-readout`, hintId = `${container.id}-hint`;
+    container.innerHTML = `<div class="manual-plot" tabindex="0" role="slider" aria-label="${chart.label} by date" aria-orientation="horizontal" aria-valuemin="1" aria-valuemax="${chart.points.length}" aria-describedby="${hintId} ${readoutId}">
+      ${chart.svg}<i class="manual-crosshair" aria-hidden="true"></i><i class="manual-selected-dot" aria-hidden="true"></i><i class="manual-selected-trend" aria-hidden="true" hidden></i>
+      </div><p class="manual-chart-readout" id="${readoutId}" aria-live="polite" aria-atomic="true"></p>
+      <p class="manual-chart-hint" id="${hintId}">Hover or tap to inspect. Use arrow keys, Home or End when focused.</p>`;
+    const plot = container.querySelector(".manual-plot");
+    const readout = container.querySelector(".manual-chart-readout");
+    const trendMarker = plot.querySelector(".manual-selected-trend");
+    let selected = -1;
+    const format = (value) => `${value.toLocaleString(undefined, { minimumFractionDigits: chart.decimals, maximumFractionDigits: chart.decimals })} ${chart.unit}`;
+    const select = (index) => {
+      if (index === selected) return;
+      selected = index;
+      const p = chart.points[index];
+      const text = `${p.date} · ${chart.label}: ${format(p.value)}${p.trend != null ? ` · 7-entry trend: ${format(p.trend)}` : ""}`;
+      plot.style.setProperty("--manual-point-x", `${p.x / chart.width * 100}%`);
+      plot.style.setProperty("--manual-point-y", `${p.y / chart.height * 100}%`);
+      trendMarker.hidden = p.trend == null;
+      if (p.trend != null) trendMarker.style.top = `${p.trendY / chart.height * 100}%`;
+      plot.setAttribute("aria-valuenow", String(index + 1));
+      plot.setAttribute("aria-valuetext", text);
+      readout.textContent = text;
+    };
+    const inspect = (event) => {
+      const box = plot.getBoundingClientRect();
+      const x = Math.max(0, Math.min(1, (event.clientX - box.left) / box.width)) * chart.width;
+      let nearest = 0;
+      for (let i = 1; i < chart.points.length; i++) {
+        if (Math.abs(chart.points[i].x - x) < Math.abs(chart.points[nearest].x - x)) nearest = i;
+      }
+      select(nearest);
+    };
+    plot.addEventListener("pointermove", (event) => {
+      if (event.pointerType !== "touch" || event.buttons) inspect(event);
+    });
+    plot.addEventListener("pointerdown", (event) => {
+      if (!event.isPrimary || event.button !== 0) return;
+      plot.focus({ preventScroll: true });
+      plot.setPointerCapture(event.pointerId);
+      inspect(event);
+    });
+    plot.addEventListener("keydown", (event) => {
+      let index;
+      switch (event.key) {
+        case "ArrowLeft": case "ArrowDown": index = Math.max(0, selected - 1); break;
+        case "ArrowRight": case "ArrowUp": index = Math.min(chart.points.length - 1, selected + 1); break;
+        case "Home": index = 0; break;
+        case "End": index = chart.points.length - 1; break;
+        default: return;
+      }
+      event.preventDefault();
+      select(index);
+    });
+    select(chart.points.length - 1);
   }
 
   // "1,940" with a sign only when the value is not zero. Null means "no
@@ -2491,10 +2586,10 @@ load();
 
   function renderCharts(series) {
     const cal = caloriesSvg(series.calories, series.calories_trend);
-    calChart.innerHTML = cal && cal.svg ? cal.svg : EMPTY;
+    renderInteractiveChart(calChart, cal);
     calLegend.hidden = !(cal && cal.hasTrend);
     const wt = weightSvg(series.weight, series.weight_trend);
-    wtChart.innerHTML = wt ? wt.svg : EMPTY;
+    renderInteractiveChart(wtChart, wt);
     wtLegend.hidden = !(wt && wt.hasTrend);
   }
 
