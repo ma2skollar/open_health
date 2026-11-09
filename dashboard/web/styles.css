@@ -156,8 +156,6 @@ body {
   max-width: var(--maxw);
   margin: 0 auto;
   padding: clamp(20px, 3.5vh, 44px) clamp(20px, 3vw, 40px) clamp(64px, 10vh, 120px);
-  background:
-    radial-gradient(1200px 600px at 20% 0%, color-mix(in oklab, var(--accent) 7%, transparent), transparent 70%);
 }
 
 /* ── header (flat instrument bar, hairline underline) ───── */

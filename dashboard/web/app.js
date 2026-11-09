@@ -2414,8 +2414,8 @@ load();
     p.classList.toggle("is-error", !!isError);
   };
 
-  // Only stored dates receive marks or inspection targets. Trend segments stop
-  // at missing days rather than implying an observation inside a gap.
+  // Only stored dates receive marks or inspection targets. Missing trend dates
+  // are linearly interpolated between adjacent runs, never extrapolated.
   function manualTrendSvg(points, at) {
     const runs = [];
     for (const p of points) {
@@ -2423,10 +2423,18 @@ load();
       if (!run || ymdToDay(p.date) - ymdToDay(run.at(-1).date) !== 1) runs.push([p]);
       else run.push(p);
     }
-    return runs.map((run) => {
-      if (run.length > 1) return `<path class="manual-trend" d="${smoothPath(run.map(at))}"></path>`;
+    return runs.map((run, index) => {
+      let bridge = "";
+      if (index > 0) {
+        const [x0, y0] = at(runs[index - 1].at(-1));
+        const [x1, y1] = at(run[0]);
+        // A straight segment gives every missing date the same daily slope;
+        // one missing date lies exactly at the midpoint of its neighbors.
+        bridge = `<path class="manual-trend" d="M${x0} ${y0} L${x1} ${y1}"></path>`;
+      }
+      if (run.length > 1) return bridge + `<path class="manual-trend" d="${smoothPath(run.map(at))}"></path>`;
       const [x, y] = at(run[0]);
-      return `<circle class="manual-trend-dot" cx="${x}" cy="${y}" r="2.5"></circle>`;
+      return bridge + `<circle class="manual-trend-dot" cx="${x}" cy="${y}" r="2.5"></circle>`;
     }).join("");
   }
 

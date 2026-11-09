@@ -44,7 +44,10 @@ CSRF `forbid` list next to `/api/profile`).
 - `created_at`/`updated_at` are set by the server (Unix seconds, `SystemTime`).
   `source` is `"manual"` for API writes.
 - `weight_trend` is a trailing 7-entry mean over the weight series, labelled as a
-  trend, computed only from stored values (no interpolation, no filling).
+  trend, computed only from stored values. The API does not interpolate or fill.
+  The web calorie and weight trendlines visually bridge missing dates with linear
+  interpolation between known trend endpoints, without changing stored values,
+  averages, or inspection targets. Dates outside those endpoints are not filled.
 - `days` defaults to 180 and is clamped to `1..=3650`.
 - The API must not fail when the manual database is empty: return empty arrays.
 

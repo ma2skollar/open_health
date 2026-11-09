@@ -231,7 +231,11 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
   fallback. iOS has no manual store and continues to use its saved profile weight.
   Manual calorie and weight plots now use 220px desktop / 200px mobile heights,
   with nearest-observation hover/tap readouts and arrow/Home/End keyboard inspection.
-  Readouts show date, value, unit, and rolling trend when present. This remains
+  Readouts show date, value, unit, and rolling trend when present. Missing dates
+  between trend points are bridged with linear interpolation: one missing day
+  takes the midpoint, and longer gaps keep a constant daily slope. No trend is
+  extrapolated before or after its known endpoints. Stored observations, inspection
+  targets, 7-entry means, and summary averages remain unchanged. This remains
   web-only because native iOS has no manual-metric surface.
 - **One-page day view**: web shows Sleep, Activity and Heart rate on one scrolling page, every
   chart on one time axis (`dayAxis`) with a shared cursor (`dayCursor`), plus ‹ › / ← → to step
