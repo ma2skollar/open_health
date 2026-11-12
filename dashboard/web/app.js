@@ -2414,52 +2414,81 @@ load();
     p.classList.toggle("is-error", !!isError);
   };
 
-  // Only stored dates receive marks or inspection targets. Missing trend dates
-  // are linearly interpolated between adjacent runs, never extrapolated.
+  // Trend gaps are linearly interpolated. Inferred leading values are display-only;
+  // stored observations and the server's full seven-entry means stay unchanged.
   function manualTrendSvg(points, at) {
-    const runs = [];
-    for (const p of points) {
-      const run = runs.at(-1);
-      if (!run || ymdToDay(p.date) - ymdToDay(run.at(-1).date) !== 1) runs.push([p]);
-      else run.push(p);
+    if (!points.length) return "";
+    if (points.length === 1) {
+      const [x, y] = at(points[0]);
+      return `<circle class="manual-trend-dot" cx="${x}" cy="${y}" r="2.5"></circle>`;
     }
-    return runs.map((run, index) => {
-      let bridge = "";
-      if (index > 0) {
-        const [x0, y0] = at(runs[index - 1].at(-1));
-        const [x1, y1] = at(run[0]);
-        // A straight segment gives every missing date the same daily slope;
-        // one missing date lies exactly at the midpoint of its neighbors.
-        bridge = `<path class="manual-trend" d="M${x0} ${y0} L${x1} ${y1}"></path>`;
+    // A straight segment gives every missing date the same daily slope;
+    // one missing date lies exactly at the midpoint of its neighbors.
+    const path = points.map((p, i) => `${i ? "L" : "M"}${at(p).join(" ")}`).join(" ");
+    return `<path class="manual-trend" d="${path}"></path>`;
+  }
+
+  function calendarPoints(points, trend, dates) {
+    const history = (points || []).filter((p) => p && p.value != null && p.date <= dates.at(-1))
+      .sort((a, b) => a.date.localeCompare(b.date));
+    const values = new Map(history.map((p) => [p.date, p.value]));
+    const anchors = (trend || []).filter((p) => p && p.value != null && p.date <= dates.at(-1))
+      .map((p) => ({ ...p, inferred: false }));
+    // Before a full window exists, use the available entries, not invented zeros.
+    const firstFullDate = anchors[0]?.date;
+    let sum = 0;
+    for (const [index, p] of history.slice(0, 6).entries()) {
+      sum += p.value;
+      if (!firstFullDate || p.date < firstFullDate) {
+        anchors.push({ date: p.date, value: sum / (index + 1), inferred: true });
       }
-      if (run.length > 1) return bridge + `<path class="manual-trend" d="${smoothPath(run.map(at))}"></path>`;
-      const [x, y] = at(run[0]);
-      return bridge + `<circle class="manual-trend-dot" cx="${x}" cy="${y}" r="2.5"></circle>`;
-    }).join("");
+    }
+    anchors.sort((a, b) => a.date.localeCompare(b.date));
+    return dates.map((date) => {
+      const right = anchors.findIndex((p) => p.date >= date);
+      let value = null, inferred = false;
+      if (right >= 0) {
+        const next = anchors[right], prev = anchors[right - 1];
+        if (next.date === date) {
+          value = next.value;
+          inferred = next.inferred;
+        } else if (!prev) {
+          value = next.value;
+          inferred = true;
+        } else {
+          const fraction = (ymdToDay(date) - ymdToDay(prev.date)) / (ymdToDay(next.date) - ymdToDay(prev.date));
+          value = prev.value + fraction * (next.value - prev.value);
+          inferred = prev.inferred || next.inferred;
+        }
+      }
+      return { date, value: values.get(date) ?? null, trend: value, inferred };
+    });
+  }
+
+  function missingMarks(points, xOf, y) {
+    return `<g class="manual-missing">${points.filter((p) => p.value == null).map((p) => {
+      const x = xOf(p);
+      return `<path d="M${x - 2} ${y - 2}l4 4m-4 0l4 -4"></path>`;
+    }).join("")}</g>`;
   }
 
   // Calories as bars plus a rolling-trend line. Empty days keep their place on
-  // the date axis, with no bar and no zero-valued inspection target.
-  function caloriesSvg(points, trend) {
-    const pts = (points || []).filter((p) => p && p.value != null);
-    if (!pts.length) return null;
-    const dates = new Set(pts.map((p) => p.date));
-    const tpts = (trend || []).filter((p) => p && p.value != null && dates.has(p.date));
-    const W = 600, H = 220, base = H - 5;
+  // the date axis, with a missing-entry mark rather than a zero-valued bar.
+  function caloriesSvg(points) {
+    const pts = points.filter((p) => p.value != null);
+    const tpts = points.filter((p) => p.trend != null).map((p) => ({ date: p.date, value: p.trend }));
+    const W = 600, H = 220, base = H - 10;
     const max = Math.max(1, ...pts.map((p) => p.value), ...tpts.map((p) => p.value));
-    const days = pts.map((p) => ymdToDay(p.date));
-    const d0 = Math.min(...days), span = Math.max(...days) - d0 + 1;
-    const bw = W / span;
+    const d0 = ymdToDay(points[0].date), bw = W / points.length;
     const xOf = (p) => (ymdToDay(p.date) - d0 + 0.5) * bw;
-    const yOf = (v) => base - (v / max) * (H - 15);
+    const yOf = (v) => base - (v / max) * (H - 25);
     const bars = pts.map((p) => {
       const bh = Math.max(1, base - yOf(p.value));
       return `<rect x="${(xOf(p) - bw * 0.32).toFixed(2)}" y="${(base - bh).toFixed(2)}" width="${(bw * 0.64).toFixed(2)}" height="${bh.toFixed(2)}" rx="1.5"></rect>`;
     }).join("");
-    const trends = new Map(tpts.map((p) => [p.date, p.value]));
     return {
-      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true"><g class="manual-bars">${bars}</g>${manualTrendSvg(tpts, (p) => [xOf(p), yOf(p.value)])}</svg>`,
-      points: pts.map((p) => ({ ...p, x: xOf(p), y: yOf(p.value), trend: trends.get(p.date), trendY: trends.has(p.date) ? yOf(trends.get(p.date)) : null })),
+      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true"><g class="manual-bars">${bars}</g>${missingMarks(points, xOf, H - 4)}${manualTrendSvg(tpts, (p) => [xOf(p), yOf(p.value)])}</svg>`,
+      points: points.map((p) => ({ ...p, x: xOf(p), y: p.value == null ? null : yOf(p.value), trendY: p.trend == null ? null : yOf(p.trend) })),
       width: W, height: H, label: "Calories", unit: "kcal", decimals: 0,
       hasTrend: tpts.length > 0,
     };
@@ -2467,55 +2496,57 @@ load();
 
   // Weight observations stay separate dots; only the rolling trend has a line.
   // Stretch both axes to the plot bounds so narrow cards do not letterbox.
-  function weightSvg(points, trend) {
-    const pts = (points || []).filter((p) => p && p.value != null);
-    if (!pts.length) return null;
-    const dates = new Set(pts.map((p) => p.date));
-    const tpts = (trend || []).filter((p) => p && p.value != null && dates.has(p.date));
-    const W = 600, H = 220, padX = 8, padT = 10, padB = 12;
+  function weightSvg(points) {
+    const pts = points.filter((p) => p.value != null);
+    const tpts = points.filter((p) => p.trend != null).map((p) => ({ date: p.date, value: p.trend }));
+    const W = 600, H = 220, padT = 10, padB = 12;
     const vals = pts.concat(tpts).map((p) => p.value);
-    const min = Math.min(...vals), max = Math.max(...vals);
+    const min = vals.length ? Math.min(...vals) : 0, max = vals.length ? Math.max(...vals) : 1;
     const rng = Math.max(0.5, max - min);
-    const days = pts.map((p) => ymdToDay(p.date));
-    const d0 = Math.min(...days), span = Math.max(...days) - d0;
-    const xOf = (p) => span ? padX + ((ymdToDay(p.date) - d0) / span) * (W - 2 * padX) : W / 2;
+    const d0 = ymdToDay(points[0].date);
+    const xOf = (p) => (ymdToDay(p.date) - d0 + 0.5) * W / points.length;
     const yOf = (v) => padT + (1 - (v - min + (rng - (max - min)) / 2) / rng) * (H - padT - padB);
     const at = (p) => [xOf(p), yOf(p.value)];
     const dots = pts.map((p) => {
       const [x, y] = at(p);
       return `<path class="manual-dot" d="M${x.toFixed(2)} ${y.toFixed(2)}h0"></path>`;
     }).join("");
-    const trends = new Map(tpts.map((p) => [p.date, p.value]));
     return {
-      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">${manualTrendSvg(tpts, at)}${dots}</svg>`,
-      points: pts.map((p) => ({ ...p, x: xOf(p), y: yOf(p.value), trend: trends.get(p.date), trendY: trends.has(p.date) ? yOf(trends.get(p.date)) : null })),
+      svg: `<svg class="manual-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" aria-hidden="true">${dots}${missingMarks(points, xOf, H - 4)}${manualTrendSvg(tpts, at)}</svg>`,
+      points: points.map((p) => ({ ...p, x: xOf(p), y: p.value == null ? null : yOf(p.value), trendY: p.trend == null ? null : yOf(p.trend) })),
       width: W, height: H, label: "Weight", unit: UNIT, decimals: 2,
       hasTrend: tpts.length > 0,
     };
   }
 
+  let chartInspectors = [];
+  let inspectionTimer;
+  function inspectDay(index) {
+    chartInspectors.forEach((chart) => chart.show(index, true));
+    clearTimeout(inspectionTimer);
+    inspectionTimer = setTimeout(() => chartInspectors.forEach((chart) => chart.hide()), 10000);
+  }
+
   function renderInteractiveChart(container, chart) {
-    if (!chart) {
-      container.innerHTML = EMPTY;
-      return;
-    }
     const readoutId = `${container.id}-readout`, hintId = `${container.id}-hint`;
     container.innerHTML = `<div class="manual-plot" tabindex="0" role="slider" aria-label="${chart.label} by date" aria-orientation="horizontal" aria-valuemin="1" aria-valuemax="${chart.points.length}" aria-describedby="${hintId} ${readoutId}">
-      ${chart.svg}<i class="manual-crosshair" aria-hidden="true"></i><i class="manual-selected-dot" aria-hidden="true"></i><i class="manual-selected-trend" aria-hidden="true" hidden></i>
+      ${chart.svg}<i class="manual-crosshair" aria-hidden="true"></i><i class="manual-selected-dot" aria-hidden="true" hidden></i><i class="manual-selected-trend" aria-hidden="true" hidden></i>
       </div><p class="manual-chart-readout" id="${readoutId}" aria-live="polite" aria-atomic="true"></p>
-      <p class="manual-chart-hint" id="${hintId}">Hover or tap to inspect. Use arrow keys, Home or End when focused.</p>`;
+      <p class="manual-chart-hint" id="${hintId}">× No entry. Hover or tap to inspect both charts. Use arrow keys, Home or End when focused. Inferred trends use available history.</p>`;
     const plot = container.querySelector(".manual-plot");
     const readout = container.querySelector(".manual-chart-readout");
+    const marker = plot.querySelector(".manual-selected-dot");
     const trendMarker = plot.querySelector(".manual-selected-trend");
-    let selected = -1;
+    let selected = chart.points.length - 1;
     const format = (value) => `${value.toLocaleString(undefined, { minimumFractionDigits: chart.decimals, maximumFractionDigits: chart.decimals })} ${chart.unit}`;
-    const select = (index) => {
-      if (index === selected) return;
+    const show = (index, active = false) => {
       selected = index;
       const p = chart.points[index];
-      const text = `${p.date} · ${chart.label}: ${format(p.value)}${p.trend != null ? ` · 7-entry trend: ${format(p.trend)}` : ""}`;
+      const text = `${p.date} · ${chart.label}: ${p.value == null ? "No entry" : format(p.value)}${p.trend != null ? ` · ${p.inferred ? "Inferred trend" : "7-entry trend"}: ${format(p.trend)}` : ""}`;
+      plot.classList.toggle("is-inspecting", active);
       plot.style.setProperty("--manual-point-x", `${p.x / chart.width * 100}%`);
-      plot.style.setProperty("--manual-point-y", `${p.y / chart.height * 100}%`);
+      marker.hidden = p.value == null;
+      if (p.value != null) plot.style.setProperty("--manual-point-y", `${p.y / chart.height * 100}%`);
       trendMarker.hidden = p.trend == null;
       if (p.trend != null) trendMarker.style.top = `${p.trendY / chart.height * 100}%`;
       plot.setAttribute("aria-valuenow", String(index + 1));
@@ -2524,12 +2555,8 @@ load();
     };
     const inspect = (event) => {
       const box = plot.getBoundingClientRect();
-      const x = Math.max(0, Math.min(1, (event.clientX - box.left) / box.width)) * chart.width;
-      let nearest = 0;
-      for (let i = 1; i < chart.points.length; i++) {
-        if (Math.abs(chart.points[i].x - x) < Math.abs(chart.points[nearest].x - x)) nearest = i;
-      }
-      select(nearest);
+      const fraction = Math.max(0, Math.min(1, (event.clientX - box.left) / box.width));
+      inspectDay(Math.min(chart.points.length - 1, Math.floor(fraction * chart.points.length)));
     };
     plot.addEventListener("pointermove", (event) => {
       if (event.pointerType !== "touch" || event.buttons) inspect(event);
@@ -2550,9 +2577,10 @@ load();
         default: return;
       }
       event.preventDefault();
-      select(index);
+      inspectDay(index);
     });
-    select(chart.points.length - 1);
+    show(selected);
+    return { show, hide: () => plot.classList.remove("is-inspecting") };
   }
 
   // "1,940" with a sign only when the value is not zero. Null means "no
@@ -2593,12 +2621,14 @@ load();
   }
 
   function renderCharts(series) {
-    const cal = caloriesSvg(series.calories, series.calories_trend);
-    renderInteractiveChart(calChart, cal);
-    calLegend.hidden = !(cal && cal.hasTrend);
-    const wt = weightSvg(series.weight, series.weight_trend);
-    renderInteractiveChart(wtChart, wt);
-    wtLegend.hidden = !(wt && wt.hasTrend);
+    clearTimeout(inspectionTimer);
+    const today = localToday();
+    const dates = Array.from({ length: 28 }, (_, i) => shiftDays(today, i - 27));
+    const cal = caloriesSvg(calendarPoints(series.calories, series.calories_trend, dates));
+    const wt = weightSvg(calendarPoints(series.weight, series.weight_trend, dates));
+    chartInspectors = [renderInteractiveChart(calChart, cal), renderInteractiveChart(wtChart, wt)];
+    calLegend.hidden = !cal.hasTrend;
+    wtLegend.hidden = !wt.hasTrend;
   }
 
   function renderRecent() {

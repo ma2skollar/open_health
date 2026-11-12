@@ -229,13 +229,17 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
   average of the latest 28 logged weights within 180 calendar days for shared
   summary calculations and model inputs; the saved profile weight remains the
   fallback. iOS has no manual store and continues to use its saved profile weight.
-  Manual calorie and weight plots now use 220px desktop / 200px mobile heights,
-  with nearest-observation hover/tap readouts and arrow/Home/End keyboard inspection.
-  Readouts show date, value, unit, and rolling trend when present. Missing dates
-  between trend points are bridged with linear interpolation: one missing day
-  takes the midpoint, and longer gaps keep a constant daily slope. No trend is
-  extrapolated before or after its known endpoints. Stored observations, inspection
-  targets, 7-entry means, and summary averages remain unchanged. This remains
+  Manual calorie and weight plots use 220px desktop / 200px mobile heights and
+  share a 28-calendar-day axis through today. Every day is inspectable, including
+  missing entries, which show a × mark and “No entry” rather than zero. Hover,
+  touch, and arrow/Home/End keyboard inspection select the same date in both
+  charts; indicators hide after 10 seconds without input. The weight trend draws
+  above measurement dots. Keyboard focus remains visible without card hover borders.
+  Trends use the fetched 180-day history and interpolate missing dates linearly.
+  Before a full seven-entry mean exists, available observations supply an inferred
+  mean; leading dates use the first available trend and are labelled inferred.
+  Trends stop at the last observation, not at an empty current day. Stored values,
+  server seven-entry means, and summary averages remain unchanged. This remains
   web-only because native iOS has no manual-metric surface.
 - **One-page day view**: web shows Sleep, Activity and Heart rate on one scrolling page, every
   chart on one time axis (`dayAxis`) with a shared cursor (`dayCursor`), plus ‹ › / ← → to step
