@@ -13,21 +13,25 @@ CONF_DIR="${CONF_DIR:-/etc/oura}"
 SERVICE_USER="${SERVICE_USER:-oura}"
 BIN_SRC="${BIN_SRC:-./target/release/oura}"
 BACKUP_BIN_SRC="${BACKUP_BIN_SRC:-}"
+DASH_BIN_SRC="${DASH_BIN_SRC:-./target/release/oura-dashboard}"
 DRY_RUN=0
 
 usage() {
     cat <<'EOF'
-Usage: install.sh [--bin PATH] [--backup-bin PATH] [--dry-run]
+Usage: install.sh [--bin PATH] [--dashboard-bin PATH] [--backup-bin PATH] [--dry-run]
 
-  --bin PATH         dashboard binary to install (default ./target/release/oura)
-  --backup-bin PATH  backup tool to install (default: none)
-  --dry-run          print what would happen; change nothing
+  --bin PATH             `oura` CLI binary to install (default ./target/release/oura)
+  --dashboard-bin PATH   no-BLE dashboard server binary to install as
+                         oura-dashboard (default ./target/release/oura-dashboard)
+  --backup-bin PATH       backup tool to install (default: none)
+  --dry-run              print what would happen; change nothing
 EOF
 }
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --bin) BIN_SRC="${2:?--bin needs a path}"; shift 2 ;;
+        --dashboard-bin) DASH_BIN_SRC="${2:?--dashboard-bin needs a path}"; shift 2 ;;
         --backup-bin) BACKUP_BIN_SRC="${2:?--backup-bin needs a path}"; shift 2 ;;
         --dry-run) DRY_RUN=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -95,6 +99,19 @@ if [ "${DRY_RUN}" -eq 0 ] && cmp -s "$BIN_SRC" "$PREFIX/bin/oura"; then
     say "binary unchanged: ${PREFIX}/bin/oura"
 else
     run install -m 0755 -o root -g root "$BIN_SRC" "$PREFIX/bin/oura"
+fi
+
+# The unit file runs /srv/oura/bin/oura-dashboard: the no-BLE dashboard server
+# built with `cargo build --release -p oura-cli --no-default-features --bin
+# oura-dashboard`. Build it first, or pass --dashboard-bin.
+if [ ! -f "$DASH_BIN_SRC" ]; then
+    say "error: dashboard binary not found at ${DASH_BIN_SRC} (build it with --no-default-features first, or pass --dashboard-bin)" >&2
+    exit 1
+fi
+if [ "${DRY_RUN}" -eq 0 ] && cmp -s "$DASH_BIN_SRC" "$PREFIX/bin/oura-dashboard"; then
+    say "dashboard binary unchanged: ${PREFIX}/bin/oura-dashboard"
+else
+    run install -m 0755 -o root -g root "$DASH_BIN_SRC" "$PREFIX/bin/oura-dashboard"
 fi
 
 if [ -n "$BACKUP_BIN_SRC" ]; then

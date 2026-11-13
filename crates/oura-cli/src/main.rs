@@ -7,19 +7,25 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 
+#[cfg(feature = "ble")]
 use oura_link::ble::{self, BleTransport};
+#[cfg(feature = "ble")]
 use oura_link::OuraClient;
 use oura_store::storage::Store;
 
 #[cfg(feature = "torch")]
 mod activity_model;
 mod dashboard;
+#[cfg(feature = "ble")]
 mod game;
 mod icons;
+#[cfg(feature = "ble")]
 mod motion_server;
 mod pyrunner;
 mod secret_file;
+#[cfg(feature = "ble")]
 mod viz;
+
 
 fn parse_tz_offset(value: &str) -> std::result::Result<f64, String> {
     let hours: f64 = value.parse().map_err(|_| "UTC offset must be hours, e.g. 5.5".to_owned())?;
@@ -87,14 +93,18 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     /// List nearby Oura rings.
+    #[cfg(feature = "ble")]
     Scan,
     /// Pair with a factory-reset ring: install a fresh 16-byte auth key and save
     /// it to `--key-file` (or `oura-<serial>.key`). If the key file already
     /// exists, that key is re-installed instead of generating a new one.
+    #[cfg(feature = "ble")]
     Pair,
     /// Connect and print device info (firmware, serial, battery, capabilities).
+    #[cfg(feature = "ble")]
     Info,
     /// Drain history events into the database (incremental).
+    #[cfg(feature = "ble")]
     Sync {
         /// Deprecated no-op: the ring clock is now aligned by default.
         #[arg(long, hide = true)]
@@ -106,8 +116,10 @@ enum Command {
         no_sync_time: bool,
     },
     /// Read the ring's latest cached HR / SpO2 values.
+    #[cfg(feature = "ble")]
     Latest,
     /// Stream live heart rate for a number of seconds (ring must be worn).
+    #[cfg(feature = "ble")]
     LiveHr {
         #[arg(long, default_value_t = 30)]
         seconds: u64,
@@ -123,17 +135,20 @@ enum Command {
     /// `probe` (arm ACM-50 ~30 s, measure data rate + battery, auto-teardown).
     /// `probe` writes a persistent flash session but always tears itself down
     /// (see docs/rdata-capacity-probe.md).
+    #[cfg(feature = "ble")]
     Rdata {
         /// One of: state | stop | clear | probe
         #[arg(default_value = "state")]
         action: String,
     },
     /// Stream live accelerometer (ACM) — wave your hand to see motion.
+    #[cfg(feature = "ble")]
     Accel {
         #[arg(long, default_value_t = 15)]
         seconds: u64,
     },
     /// Real-time 3D motion visualizer (web UI with start/stop + sensitivity).
+    #[cfg(feature = "ble")]
     Viz {
         /// Local HTTP port to serve the visualizer on.
         #[arg(long, default_value_t = 8088)]
@@ -143,6 +158,7 @@ enum Command {
         minutes: u16,
     },
     /// Tilt-controlled asteroid game (web UI) — steer a ship by tilting the ring.
+    #[cfg(feature = "ble")]
     Game {
         /// Local HTTP port to serve the game on.
         #[arg(long, default_value_t = 8089)]
@@ -152,11 +168,13 @@ enum Command {
         minutes: u16,
     },
     /// Ask the ring to run sleep analysis (so it emits hypnogram/summary events).
+    #[cfg(feature = "ble")]
     SleepAnalyze {
         #[arg(long)]
         force: bool,
     },
     /// Show feature status (HR, SpO2…) and optionally enable measurement.
+    #[cfg(feature = "ble")]
     Features {
         /// Enable daytime-HR measurement (mode automatic).
         #[arg(long)]
@@ -229,6 +247,7 @@ enum Command {
     },
     /// Subscribe a feature capability (real_steps | atlas | ambient | raw_data |
     /// research_data) via SetFeatureSubscription, to make the ring emit its events.
+    #[cfg(feature = "ble")]
     Subscribe {
         /// Capability to subscribe.
         #[arg(value_parser = ["real_steps", "atlas", "ambient", "raw_data", "research_data"])]
@@ -239,6 +258,7 @@ enum Command {
     },
     /// Set a feature's operating MODE via SetFeatureMode (e.g. turn on real_steps).
     /// This is the consumer-feature enable path (distinct from `subscribe`).
+    #[cfg(feature = "ble")]
     FeatureMode {
         /// Feature: real_steps | exercise_hr | resting_hr | cva_ppg | ambient,
         /// or a raw id like 0x0b.
@@ -248,6 +268,7 @@ enum Command {
         mode: String,
     },
     /// Read the real on-ring MODE/status of the data features (what's actually on).
+    #[cfg(feature = "ble")]
     FeatureStatus,
     /// Serve a local web health dashboard (sleep, cardio, SpO2, activity, device)
     /// at http://127.0.0.1:PORT. Rust computes from oura.db; torch models run via
@@ -310,6 +331,7 @@ enum Command {
     },
 }
 
+#[cfg(feature = "ble")]
 fn feature_mode_name(mode: u8) -> &'static str {
     match mode {
         0 => "off",
@@ -330,6 +352,7 @@ fn feature_state_name(state: u8) -> &'static str {
     }
 }
 
+#[cfg(feature = "ble")]
 fn discover_key(db: &Path) -> Result<Option<PathBuf>> {
     let candidate = db.with_file_name("oura.key");
     if candidate.is_file() {
@@ -362,6 +385,7 @@ fn discover_key(db: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
+#[cfg(feature = "ble")]
 fn load_key(path: &Option<PathBuf>) -> Result<Option<[u8; 16]>> {
     let Some(path) = path else { return Ok(None) };
     // A missing file is not an error: `pair` writes it, others treat it as "no key".
@@ -378,6 +402,7 @@ fn load_key(path: &Option<PathBuf>) -> Result<Option<[u8; 16]>> {
 }
 
 /// Generate a random 16-byte auth key from the OS CSPRNG.
+#[cfg(feature = "ble")]
 fn generate_key() -> Result<[u8; 16]> {
     let mut key = [0u8; 16];
     getrandom::fill(&mut key)
@@ -386,6 +411,7 @@ fn generate_key() -> Result<[u8; 16]> {
 }
 
 /// Persist a key as hex with owner-only permissions.
+#[cfg(feature = "ble")]
 fn save_key(path: &Path, key: &[u8; 16]) -> Result<()> {
     crate::secret_file::write_private(path, format!("{}\n", hex::encode(key)).as_bytes())
         .with_context(|| format!("writing key file {}", path.display()))
@@ -393,6 +419,7 @@ fn save_key(path: &Path, key: &[u8; 16]) -> Result<()> {
 
 /// Open the readings store for best-effort live persistence, warning (rather than
 /// failing the command) if it can't be opened — but not pretending it succeeded.
+#[cfg(feature = "ble")]
 fn open_store_or_warn(db: &Path) -> Option<Store> {
     match Store::open(db) {
         Ok(s) => Some(s),
@@ -406,6 +433,7 @@ fn open_store_or_warn(db: &Path) -> Option<Store> {
     }
 }
 
+#[cfg(feature = "ble")]
 async fn connect(cli: &Cli) -> Result<OuraClient<BleTransport>> {
     let transport = BleTransport::connect(
         &cli.name,
@@ -417,6 +445,7 @@ async fn connect(cli: &Cli) -> Result<OuraClient<BleTransport>> {
     Ok(OuraClient::new(transport))
 }
 
+#[cfg(feature = "ble")]
 /// Authenticate if a key was supplied; returns whether auth was performed.
 async fn maybe_auth(client: &OuraClient<BleTransport>, key: &Option<[u8; 16]>) -> Result<bool> {
     if let Some(key) = key {
@@ -439,6 +468,7 @@ async fn main() -> Result<()> {
         .init();
 
     let mut cli = Cli::parse();
+    #[cfg(feature = "ble")]
     let uses_ring = matches!(
         cli.command,
         Command::Pair
@@ -453,35 +483,57 @@ async fn main() -> Result<()> {
             | Command::Rdata { .. }
             | Command::FeatureMode { .. }
     );
-    if cli.key_file.is_none() && (uses_ring || matches!(cli.command, Command::Dashboard { .. })) {
-        cli.key_file = discover_key(&cli.db)?;
+    #[cfg(not(feature = "ble"))]
+    let uses_ring = false;
+    if cli.key_file.is_none() && uses_ring {
+        #[cfg(feature = "ble")]
+        {
+            cli.key_file = discover_key(&cli.db)?;
+        }
     }
     // Saved-data commands never need an auth key, even when one is configured.
+    #[allow(unused_variables)]
     let key = if uses_ring {
-        load_key(&cli.key_file)?
+        #[cfg(feature = "ble")]
+        {
+            load_key(&cli.key_file)?
+        }
+        #[cfg(not(feature = "ble"))]
+        { None::<[u8; 16]> }
     } else {
         None
     };
 
     match &cli.command {
+        #[cfg(feature = "ble")]
         Command::Scan => cmd_scan(&cli).await,
+        #[cfg(feature = "ble")]
         Command::Pair => cmd_pair(&cli).await,
+        #[cfg(feature = "ble")]
         Command::Info => cmd_info(&cli, &key).await,
+        #[cfg(feature = "ble")]
         Command::Sync { no_sync_time, .. } => cmd_sync(&cli, &key, !*no_sync_time).await,
+        #[cfg(feature = "ble")]
         Command::Latest => cmd_latest(&cli, &key).await,
+        #[cfg(feature = "ble")]
         Command::LiveHr { seconds, raw } => cmd_live_hr(&cli, &key, *seconds, *raw).await,
+        #[cfg(feature = "ble")]
         Command::Accel { seconds } => cmd_accel(&cli, &key, *seconds).await,
+        #[cfg(feature = "ble")]
         Command::SleepAnalyze { force } => cmd_sleep_analyze(&cli, &key, *force).await,
+        #[cfg(feature = "ble")]
         Command::Viz { port, minutes } => {
             let client = connect(&cli).await?;
             maybe_auth(&client, &key).await?;
             viz::run(client, *port, *minutes).await
         }
+        #[cfg(feature = "ble")]
         Command::Game { port, minutes } => {
             let client = connect(&cli).await?;
             maybe_auth(&client, &key).await?;
             game::run(client, *port, *minutes).await
         }
+        #[cfg(feature = "ble")]
         Command::Rdata { action } => cmd_rdata(&cli, &key, action).await,
         Command::Events => cmd_events(&cli).await,
         Command::ResearchExport {
@@ -497,6 +549,7 @@ async fn main() -> Result<()> {
             println!("Re-decoded {decoded}/{total} stored events.");
             Ok(())
         }
+        #[cfg(feature = "ble")]
         Command::Features {
             enable_hr,
             enable_spo2,
@@ -512,8 +565,11 @@ async fn main() -> Result<()> {
             json,
         } => cmd_sleep_score(&cli, *tz_offset, csv.clone(), *json),
         Command::ReadinessScore { tz_offset, json } => cmd_readiness_score(&cli, *tz_offset, *json),
+        #[cfg(feature = "ble")]
         Command::Subscribe { feature, mode } => cmd_subscribe(&cli, &key, feature, mode).await,
+        #[cfg(feature = "ble")]
         Command::FeatureMode { feature, mode } => cmd_feature_mode(&cli, &key, feature, mode).await,
+        #[cfg(feature = "ble")]
         Command::FeatureStatus => cmd_feature_status(&cli, &key).await,
         Command::Dashboard {
             port,
@@ -547,8 +603,6 @@ async fn main() -> Result<()> {
                 bind.clone(),
                 cli.db.clone(),
                 *tz_offset,
-                cli.name.clone(),
-                cli.key_file.clone(),
                 seed,
                 manual_path,
                 unit,
@@ -641,6 +695,7 @@ fn cmd_import(
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 /// Subscribe a feature capability via SetFeatureSubscription (needs auth).
 async fn cmd_subscribe(cli: &Cli, key: &Option<[u8; 16]>, feature: &str, mode: &str) -> Result<()> {
     use oura_protocol::protocol::{capability, subscription_mode};
@@ -685,6 +740,7 @@ async fn cmd_subscribe(cli: &Cli, key: &Option<[u8; 16]>, feature: &str, mode: &
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 /// Set a feature's operating mode (SetFeatureMode). The consumer-feature enable
 /// path — e.g. `feature-mode real_steps` turns on the on-ring step/gait DSP whose
 /// `real_steps_features` events (0x7e/0x7f) feed the steps_motion_decoder.
@@ -732,6 +788,7 @@ async fn cmd_feature_mode(
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 /// Read the actual on-ring mode/status of the data-producing features.
 async fn cmd_feature_status(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
     let client = connect(cli).await?;
@@ -904,6 +961,7 @@ fn cmd_readiness_score(cli: &Cli, tz_offset: f64, json: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_features(
     cli: &Cli,
     key: &Option<[u8; 16]>,
@@ -951,6 +1009,7 @@ async fn cmd_features(
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_scan(cli: &Cli) -> Result<()> {
     let found = ble::scan(&cli.name, Duration::from_secs(cli.scan_timeout)).await?;
     if found.is_empty() {
@@ -963,6 +1022,7 @@ async fn cmd_scan(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_pair(cli: &Cli) -> Result<()> {
     let client = connect(cli).await?;
     let serial = client.serial().await.unwrap_or_else(|_| "unknown".into());
@@ -1006,6 +1066,7 @@ async fn cmd_pair(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_info(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
     let client = connect(cli).await?;
 
@@ -1044,10 +1105,12 @@ async fn cmd_info(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 fn is_rejected_history_cursor(error: &str) -> bool {
     error.contains("extended history request failed with result code 0xff")
 }
 
+#[cfg(feature = "ble")]
 async fn drain_events_into_store(
     client: &OuraClient<BleTransport>,
     store: &Store,
@@ -1109,6 +1172,7 @@ async fn drain_events_into_store(
     Ok((outcome.events_synced, outcome.next_cursor))
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<()> {
     let key = key
         .as_ref()
@@ -1206,6 +1270,7 @@ async fn cmd_sync(cli: &Cli, key: &Option<[u8; 16]>, sync_time: bool) -> Result<
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 /// A synthetic `time_sync` (0x42) row pairing the newest drained ring timestamp with
 /// the host clock; body and decoded shape match oura-core's phone anchor.
 fn phone_anchor_event(
@@ -1230,6 +1295,7 @@ fn phone_anchor_event(
     })
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_latest(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
@@ -1272,6 +1338,7 @@ async fn cmd_latest(cli: &Cli, key: &Option<[u8; 16]>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_live_hr(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64, raw: bool) -> Result<()> {
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
@@ -1297,6 +1364,7 @@ async fn cmd_live_hr(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64, raw: bool)
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_sleep_analyze(cli: &Cli, key: &Option<[u8; 16]>, force: bool) -> Result<()> {
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
@@ -1309,6 +1377,7 @@ async fn cmd_sleep_analyze(cli: &Cli, key: &Option<[u8; 16]>, force: bool) -> Re
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_accel(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64) -> Result<()> {
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
@@ -1346,6 +1415,7 @@ async fn cmd_accel(cli: &Cli, key: &Option<[u8; 16]>, seconds: u64) -> Result<()
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 async fn cmd_rdata(cli: &Cli, key: &Option<[u8; 16]>, action: &str) -> Result<()> {
     let client = connect(cli).await?;
     maybe_auth(&client, key).await?;
@@ -1382,6 +1452,7 @@ async fn cmd_rdata(cli: &Cli, key: &Option<[u8; 16]>, action: &str) -> Result<()
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 /// RData capacity rate-probe (Phase-2 spike): arm ACM-50, record briefly, then
 /// stop and drain pages to measure the real byte rate and page size. **ALWAYS**
 /// tears down (stop + clear) even on error. Ring should be on the charger and
@@ -1508,6 +1579,7 @@ fn rdata_status_name(s: u8) -> &'static str {
     }
 }
 
+#[cfg(feature = "ble")]
 /// Test 1: run the app's strict start recipe — Clear (require SUCCESS) -> state ->
 /// CONFIGURE with startTime=0 — and report each status. Tears down afterward.
 async fn rdata_recipe(client: &OuraClient<BleTransport>) -> Result<()> {
@@ -1549,6 +1621,7 @@ async fn rdata_recipe(client: &OuraClient<BleTransport>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 /// Combined in-session unlock attempt: confirm RAW_DATA_SAMPLER is advertised,
 /// try enabling it (subscription + feature-mode) on the correct id 0x12, then
 /// Clear -> Configure in the SAME session. If Configure is accepted, do a short
@@ -1632,6 +1705,7 @@ async fn rdata_unlock(client: &OuraClient<BleTransport>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "ble")]
 /// Try several RData `configure` argument variants and report which (if any)
 /// moves the ring out of the idle state (status 3). Each attempt is immediately
 /// torn down. Pure diagnostic for the Phase-2 spike — no long recording.
@@ -1719,6 +1793,7 @@ mod tests {
         assert!(Cli::try_parse_from(["oura", "dashboard", "--tz-offset", "NaN"]).is_err());
     }
 
+    #[cfg(feature = "ble")]
     #[test]
     fn discovery_finds_pairing_key_and_requires_disambiguation() {
         let dir = std::env::temp_dir().join(format!("oura-key-discovery-{}", std::process::id()));
@@ -1733,6 +1808,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[cfg(feature = "ble")]
     #[test]
     fn recognizes_ring5_rejected_history_cursor() {
         assert!(is_rejected_history_cursor(
@@ -1741,6 +1817,7 @@ mod tests {
         assert!(!is_rejected_history_cursor("BLE link lost mid-batch"));
     }
 
+    #[cfg(feature = "ble")]
     #[test]
     fn generate_key_uses_os_csprng() {
         let k1 = generate_key().unwrap();

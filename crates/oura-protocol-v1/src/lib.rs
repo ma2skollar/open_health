@@ -5,6 +5,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod ingest;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

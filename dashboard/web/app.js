@@ -43,7 +43,6 @@ const kfmt = (n) => (n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : 
 
 let CURRENT_PROFILE = null;
 let CURRENT_TZ = 0; // hours from UTC, as the summary reports it
-let LAST_DEVICE_SERIAL = null;
 const browserTzOffset = () => {
   const off = -new Date().getTimezoneOffset() / 60;
   return Number.isFinite(off) ? off : 0;
@@ -325,7 +324,7 @@ function dayCard(d, ymd) {
   const ap = el("button", "day-part");
   ap.type = "button";
   const ds = (d.activity_daily || {})[ymd];
-  const stat = ds ? `${kfmt(ds.steps)} steps · ${Math.round(ds.active_kcal)} kcal` : "no activity totals";
+  const stat = ds ? `${ds.steps == null ? "—" : kfmt(ds.steps)} MET-estimated steps · ${ds.active_kcal == null ? "—" : Math.round(ds.active_kcal)} kcal` : "no activity totals";
   ap.append(el("div", "dp-head",
     `<span class="dp-tag">Activity</span><span class="dp-meta">${stat}</span><span class="dp-chev"></span>`));
   const prof = (d.activity_profile || {})[ymd];
@@ -397,7 +396,7 @@ function renderDay(d) {
     for (const w of clockWarnings) note.append(el("p", null, esc(w)));
     if (unanchored && !clockWarnings.length) {
       note.append(el("p", null, "Part of the ring's history has no time anchor, so it cannot be placed on the calendar yet."));
-      note.append(el("p", "clock-note-fix", "Run <code>oura sync</code> while the ring is still on its current boot to anchor it."));
+      note.append(el("p", "clock-note-fix", "Waiting for a usable clock anchor from the collector. Ambiguous history stays undated."));
     }
     return note;
   };
@@ -406,7 +405,7 @@ function renderDay(d) {
       ? "No dated days yet: the ring's clock hasn't been anchored for this data."
       : clockWarnings.length
         ? "No dated days yet: recorded nights could not be dated unambiguously."
-        : "No days yet. Wear the ring and sync."));
+        : "No dated records yet. Uploaded history needs usable clock anchors before it can appear here."));
     const note = clockNote();
     if (note) box.append(note);
     $("sleep-legend").hidden = true;
@@ -505,7 +504,7 @@ const BIOMARKER_UNIT = {
 const cvaMissing = (d) => {
   const gated = (d.device?.insights || []).find((i) => i.name === "Cardiovascular age")?.status === "gated";
   return gated
-    ? { short: "needs cva_ppg on", long: "Cardiovascular age needs the cva_ppg feature on. Enable it, then sync overnight." }
+    ? { short: "needs cva_ppg data", long: "Cardiovascular age needs recorded cva_ppg data. The server cannot change ring modes." }
     : { short: "needs the CVA model", long: "Cardiovascular age needs the CVA model runner (Python + tools/run_cva_model.py); the ring's PPG data is already there." };
 };
 
@@ -521,7 +520,7 @@ function renderIllness(d) {
   const trafficLight = ill.traffic_light ?? ill.trafficLight;
   const daysWithData = ill.days_with_data ?? ill.daysWithData;
   if (!ill.available) {
-    const why = ill.status === "MISSING_LAST_NIGHT_SLEEP" ? "Last night's sleep is missing — wear the ring overnight and sync."
+    const why = ill.status === "MISSING_LAST_NIGHT_SLEEP" ? "Last night's sleep is missing from uploaded history."
       : ill.status === "MISSING_SLEEP_DATA" ? (fromModel || d.illness
         ? "Too many recent nights are missing (needs ≥ 7 of the last 14)."
         : "Needs at least 7 nights of sleep to learn your baseline.")
@@ -1265,10 +1264,10 @@ function activitySection(d, ymd, axis, cursor) {
   const prof = (d.activity_profile || {})[ymd] || [];
   const strip = el("div", "stat-strip");
   strip.innerHTML =
-    statTile("Steps", ds ? Math.round(ds.steps || 0).toLocaleString() : "—") +
-    statTile("Active energy", ds ? Math.round(ds.active_kcal || 0) + " kcal" : "—") +
-    statTile("Total energy", ds ? Math.round(ds.total_kcal || 0) + " kcal" : "—") +
-    (ds && ds.distance_m != null ? statTile("Distance", (ds.distance_m / 1000).toFixed(1) + " km") : "");
+    statTile("MET-estimated steps", ds?.steps == null ? "—" : Math.round(ds.steps).toLocaleString()) +
+    statTile("Active energy", ds?.active_kcal == null ? "—" : Math.round(ds.active_kcal) + " kcal") +
+    statTile("Total energy", ds?.total_kcal == null ? "—" : Math.round(ds.total_kcal) + " kcal") +
+    statTile("Distance · derived from estimated steps", ds?.distance_m == null ? "—" : (ds.distance_m / 1000).toFixed(1) + " km");
   sec.append(strip);
 
   const svg = movementSvg(prof, axis, 1000, 90);
@@ -1432,7 +1431,7 @@ function renderHeart(j, ymd, axis, cursor, strip, chart, readout) {
   const day = bins.filter((b) => b.ymd === ymd); // the stats cover the day itself
   if (!bins.length) {
     strip.innerHTML = "";
-    chart.replaceChildren(el("p", "hr-empty", "No heart-rate readings for this day yet. Wear the ring and sync."));
+    chart.replaceChildren(el("p", "hr-empty", "No historical heart-rate readings for this day."));
     readout.innerHTML = "&nbsp;";
     cursor.onMove("heart", () => {});
     return;
@@ -1506,7 +1505,7 @@ function openDaysBrowser(d, days) {
     row.type = "button";
     const left = el("div", "dl-left");
     left.append(el("div", "dl-date", dayTitle(ymd)));
-    left.append(el("div", "dl-sub", ds ? `${kfmt(ds.steps)} steps · ${Math.round(ds.active_kcal)} kcal` : (n ? "sleep only" : "—")));
+    left.append(el("div", "dl-sub", ds ? `${ds.steps == null ? "—" : kfmt(ds.steps)} MET-estimated steps · ${ds.active_kcal == null ? "—" : Math.round(ds.active_kcal)} kcal` : (n ? "sleep only" : "—")));
     row.append(left);
     if (n && n.stages && n.stages.length) {
       const hyp = hypnogram(n.stages);
@@ -1529,26 +1528,6 @@ const CAP_ICON = {
 };
 const capIcon = (name) => CAP_ICON[name] || "cpu";
 
-async function doFeature(feature, name, currentOn, row) {
-  if (row.classList.contains("busy")) return;
-  const turnOn = !currentOn;
-  row.classList.add("busy");
-  row.classList.toggle("on", turnOn); // optimistic
-  try {
-    const j = await (await postDash("/api/feature", { feature, mode: turnOn ? "automatic" : "off" })).json();
-    if (j.ok) {
-      toast(`${name} turned ${turnOn ? "on" : "off"}. Wear the ring; data appears on the next sync.`, "ok");
-      load(); // refresh dev.measuring so a second tap toggles from the real state
-    } else {
-      toast(syncHint(j.message), "error");
-      row.classList.toggle("on", currentOn); // revert
-    }
-  } catch (e) {
-    toast("Couldn't reach the local server.", "error");
-    row.classList.toggle("on", currentOn);
-  }
-  row.classList.remove("busy");
-}
 
 // The ring's own battery readings (device.battery_history, [unix, percent]) over the
 // days they span. Stretches where the level rises are it charging, which the readings
@@ -1644,9 +1623,9 @@ function renderDevice(d) {
   }
   stats.append(bstat);
   const fresh = dev.fresh_hours != null ? (dev.fresh_hours < 1 ? "<1" : Math.round(dev.fresh_hours)) : "—";
-  stats.append(stat("Last sync", fresh, " h ago"));
+  stats.append(stat("Last recorded download", fresh, " h ago"));
   stats.append(stat("History", num(dev.days_of_data), " days"));
-  stats.append(stat("Events", (dev.raw_events ?? dev.total_events ?? 0).toLocaleString()));
+  stats.append(stat("Events", num(dev.raw_events ?? dev.total_events).toLocaleString()));
   box.append(stats);
   const battery = batteryChart(dev.battery_history || []);
   if (battery) box.append(battery);
@@ -1701,8 +1680,8 @@ function renderDevice(d) {
   ab.append(el("p", "subhead", "Device"));
   const kv = el("div", "adv-kv");
   const kvItem = (k, v) => `<div><i>${k}</i><b>${v}</b></div>`;
-  const rawTotal = dev.raw_events ?? dev.total_events ?? 0;
-  const decodedTotal = dev.decoded_events ?? dev.total_events ?? 0;
+  const rawTotal = dev.raw_events ?? dev.total_events;
+  const decodedTotal = dev.decoded_events ?? dev.total_events;
   const historyDetail = `${num(dev.days_of_data)} days elapsed` +
     (dev.observed_days != null ? ` · ${dev.observed_days} days observed` : "") +
     (dev.observed_coverage_days != null ? ` (${num(dev.observed_coverage_days)} d active)` : "");
@@ -1716,25 +1695,11 @@ function renderDevice(d) {
     kvItem("Last sync", `${esc(dev.synced || "—")} ${esc(dev.synced_hm || "")}`) +
     kvItem("Sync cursor", dev.next_cursor != null ? dev.next_cursor.toLocaleString() : "—") +
     kvItem("History", historyDetail) +
-    kvItem("Events", `${rawTotal.toLocaleString()} raw · ${decodedTotal.toLocaleString()} decoded`);
+    kvItem("Events", `${num(rawTotal).toLocaleString()} raw · ${num(decodedTotal).toLocaleString()} decoded`);
   ab.append(kv);
 
-  // local auth key portability
-  ab.append(el("p", "subhead", "Ring auth key"));
-  const keyTools = el("div", "key-tools");
-  const exportBtn = el("button", "btn-text key-btn", "Export / QR");
-  exportBtn.type = "button";
-  exportBtn.title = "Show copy, download, and QR options for the local ring auth key.";
-  exportBtn.addEventListener("click", exportRingKey);
-  const importBtn = el("button", "btn-text key-btn", "Import / scan");
-  importBtn.type = "button";
-  importBtn.title = "Paste, upload, or scan a ring auth key.";
-  importBtn.addEventListener("click", openImportKeyDialog);
-  keyTools.append(exportBtn, importBtn);
-  ab.append(keyTools);
-
-  // capability toggles
-  ab.append(el("p", "subhead", "Capabilities · tap to toggle"));
+  // Read-only capability metadata does not establish observed data or analysis.
+  ab.append(el("p", "subhead", "Capabilities · reported modes"));
   const caps = el("div", "caps");
   (dev.measuring || []).forEach((m) => {
     const row = el("div", "cap" + (m.on ? " on" : ""));
@@ -1742,13 +1707,8 @@ function renderDevice(d) {
     ic.style.setProperty("--i", `url(/icons/${capIcon(m.name)}.svg)`);
     const nm = el("span", "cap-name");
     nm.textContent = m.name;
-    const sw = el("span", "switch", "<i></i>");
-    row.append(ic, nm, sw);
-    if (m.feature) {
-      row.classList.add("interactive");
-      row.title = `Tap to turn ${m.on ? "off" : "on"} (connects to the ring)`;
-      row.addEventListener("click", () => doFeature(m.feature, m.name, m.on, row));
-    }
+    const mode = el("span", "ad-muted", m.on ? "mode enabled" : "mode disabled / unknown");
+    row.append(ic, nm, mode);
     caps.append(row);
   });
   ab.append(caps);
@@ -1777,285 +1737,6 @@ function renderDevice(d) {
   box.append(adv);
 }
 
-function ringKeyFilename() {
-  const serial = (LAST_DEVICE_SERIAL || "oura-ring").replace(/[^A-Za-z0-9_.-]+/g, "-");
-  return `${serial}.key`;
-}
-
-async function exportRingKey() {
-  try {
-    const j = await fetchRingKey();
-    if (!j) return;
-    if (!j.ok) {
-      toast(j.message || "No key file is configured. Start the dashboard with --key-file.", "error");
-      return;
-    }
-    openExportKeyDialog(j.key);
-  } catch {
-    toast("Couldn't export the ring auth key.", "error");
-  }
-}
-
-async function fetchRingKey() {
-  const r = await getDash("/api/ring-key");
-  if (!r.ok) {
-    toast("Restart the dashboard server to enable key export.", "error");
-    return null;
-  }
-  return await r.json();
-}
-
-async function copyText(text, ok = "Copied.") {
-  try {
-    await navigator.clipboard.writeText(text);
-    toast(ok, "ok");
-  } catch {
-    toast("Couldn't write to the clipboard.", "error");
-  }
-}
-
-function downloadRingKey(key) {
-  const blob = new Blob([key + "\n"], { type: "text/plain" });
-  const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
-  a.download = ringKeyFilename();
-  document.body.append(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(a.href);
-  toast("Ring auth key downloaded.", "ok");
-}
-
-function openExportKeyDialog(key) {
-  let dlg = $("key-export-dialog");
-  if (!dlg) {
-    dlg = el("dialog", "dialog key-dialog");
-    dlg.id = "key-export-dialog";
-    dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.close(); });
-    document.body.append(dlg);
-  }
-  dlg.innerHTML = `
-    <form method="dialog">
-      <h3>Ring auth key</h3>
-      <p class="dialog-sub">Use this on another computer running open_oura with the same ring.</p>
-      <div class="qr-wrap"><canvas id="key-qr" width="232" height="232" aria-label="Ring auth key QR code"></canvas></div>
-      <input id="key-export-value" class="key-field" readonly value="${esc(key)}" />
-      <div class="dialog-actions key-actions">
-        <button type="button" id="key-copy" class="btn-primary">Copy</button>
-        <button type="button" id="key-download" class="btn-text">Download</button>
-        <button class="btn-text">Close</button>
-      </div>
-    </form>`;
-  dlg.querySelector("#key-copy").addEventListener("click", () => copyText(key, "Ring auth key copied."));
-  dlg.querySelector("#key-download").addEventListener("click", () => downloadRingKey(key));
-  dlg.showModal();
-  drawQr($("key-qr"), key.toUpperCase());
-}
-
-function openImportKeyDialog() {
-  let dlg = $("key-import-dialog");
-  if (!dlg) {
-    dlg = el("dialog", "dialog key-dialog");
-    dlg.id = "key-import-dialog";
-    dlg.addEventListener("click", (e) => { if (e.target === dlg) closeImportKeyDialog(); });
-    document.body.append(dlg);
-  }
-  const canScan = "BarcodeDetector" in window && navigator.mediaDevices && navigator.mediaDevices.getUserMedia;
-  dlg.innerHTML = `
-    <form method="dialog">
-      <h3>Import ring key</h3>
-      <p class="dialog-sub">Paste a 32-character hex key, upload a .key file, or scan the export QR code.</p>
-      <textarea id="key-import-value" class="key-field key-textarea" spellcheck="false" autocomplete="off" placeholder="32 hex characters"></textarea>
-      <video id="key-scan-video" class="key-video" playsinline muted hidden></video>
-      <div class="dialog-actions key-actions">
-        <button type="button" id="key-import-save" class="btn-primary">Import</button>
-        <button type="button" id="key-import-file" class="btn-text">File</button>
-        <button type="button" id="key-import-scan" class="btn-text"${canScan ? "" : " disabled"}>Scan</button>
-        <button type="button" id="key-import-close" class="btn-text">Close</button>
-      </div>
-      <input id="key-import-file-input" class="key-input" type="file" accept=".key,text/plain" />
-    </form>`;
-  dlg.querySelector("#key-import-save").addEventListener("click", () => importRingKeyText($("key-import-value").value));
-  dlg.querySelector("#key-import-file").addEventListener("click", () => $("key-import-file-input").click());
-  dlg.querySelector("#key-import-file-input").addEventListener("change", (e) => importRingKeyFile(e.target));
-  dlg.querySelector("#key-import-scan").addEventListener("click", startKeyScan);
-  dlg.querySelector("#key-import-close").addEventListener("click", closeImportKeyDialog);
-  dlg.showModal();
-}
-
-function closeImportKeyDialog() {
-  stopKeyScan();
-  const dlg = $("key-import-dialog");
-  if (dlg) dlg.close();
-}
-
-let KEY_SCAN_STREAM = null;
-let KEY_SCAN_STOP = false;
-
-async function startKeyScan() {
-  try {
-    const video = $("key-scan-video");
-    const detector = new BarcodeDetector({ formats: ["qr_code"] });
-    KEY_SCAN_STOP = false;
-    KEY_SCAN_STREAM = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } });
-    video.srcObject = KEY_SCAN_STREAM;
-    video.hidden = false;
-    await video.play();
-    const scan = async () => {
-      if (KEY_SCAN_STOP) return;
-      const codes = await detector.detect(video).catch(() => []);
-      const raw = codes[0] && codes[0].rawValue;
-      if (raw) {
-        $("key-import-value").value = raw.trim();
-        stopKeyScan();
-        toast("QR code scanned.", "ok");
-        return;
-      }
-      requestAnimationFrame(scan);
-    };
-    scan();
-  } catch {
-    toast("Camera QR scan is not available in this browser.", "error");
-    stopKeyScan();
-  }
-}
-
-function stopKeyScan() {
-  KEY_SCAN_STOP = true;
-  if (KEY_SCAN_STREAM) KEY_SCAN_STREAM.getTracks().forEach((t) => t.stop());
-  KEY_SCAN_STREAM = null;
-  const video = $("key-scan-video");
-  if (video) {
-    video.pause();
-    video.srcObject = null;
-    video.hidden = true;
-  }
-}
-
-async function importRingKeyFile(input) {
-  const file = input.files && input.files[0];
-  input.value = "";
-  if (!file) return;
-  try {
-    await importRingKeyText(await file.text());
-  } catch {
-    toast("Couldn't read that key file.", "error");
-  }
-}
-
-async function importRingKeyText(text) {
-  const key = (text || "").trim();
-  if (!/^[0-9a-fA-F]{32}$/.test(key)) {
-    toast("Auth key must be exactly 32 hex characters.", "error");
-    return;
-  }
-  try {
-    const j = await (await postDash("/api/ring-key", { key })).json();
-    if (j.ok) {
-      closeImportKeyDialog();
-      toast("Ring auth key imported.", "ok");
-    }
-    else toast(j.message || "Couldn't import the ring auth key.", "error");
-  } catch {
-    toast("Couldn't reach the local dashboard server.", "error");
-  }
-}
-
-// Fixed QR Code version 2-L generator, enough for this 32-char hex key.
-function drawQr(canvas, text) {
-  const n = 25, modules = Array.from({ length: n }, () => Array(n).fill(false));
-  const reserved = Array.from({ length: n }, () => Array(n).fill(false));
-  const set = (x, y, v, r = true) => { if (x >= 0 && y >= 0 && x < n && y < n) { modules[y][x] = v; if (r) reserved[y][x] = true; } };
-  const finder = (x, y) => {
-    for (let dy = -1; dy <= 7; dy++) for (let dx = -1; dx <= 7; dx++) {
-      const xx = x + dx, yy = y + dy;
-      const on = dx >= 0 && dy >= 0 && dx <= 6 && dy <= 6 && (dx === 0 || dy === 0 || dx === 6 || dy === 6 || (dx >= 2 && dx <= 4 && dy >= 2 && dy <= 4));
-      set(xx, yy, on);
-    }
-  };
-  finder(0, 0); finder(n - 7, 0); finder(0, n - 7);
-  for (let i = 8; i < n - 8; i++) { set(i, 6, i % 2 === 0); set(6, i, i % 2 === 0); }
-  for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) set(18 + dx, 18 + dy, Math.max(Math.abs(dx), Math.abs(dy)) !== 1);
-  set(8, n - 8, true);
-  reserveFormatAreas(reserved);
-  const data = qrDataCodewords(text), ecc = qrRs(data, 10), bits = [];
-  data.concat(ecc).forEach((b) => { for (let i = 7; i >= 0; i--) bits.push(((b >>> i) & 1) === 1); });
-  let k = 0, up = true;
-  for (let x = n - 1; x > 0; x -= 2) {
-    if (x === 6) x--;
-    for (let yy = 0; yy < n; yy++) {
-      const y = up ? n - 1 - yy : yy;
-      for (let dx = 0; dx < 2; dx++) {
-        const xx = x - dx;
-        if (reserved[y][xx]) continue;
-        let bit = bits[k++] || false;
-        if ((xx + y) % 2 === 0) bit = !bit;
-        set(xx, y, bit, false);
-      }
-    }
-    up = !up;
-  }
-  placeFormat(modules, reserved, 1, 0);
-  const ctx = canvas.getContext("2d"), scale = Math.floor(canvas.width / (n + 8)), off = Math.floor((canvas.width - n * scale) / 2);
-  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, canvas.width, canvas.height);
-  ctx.fillStyle = "#111";
-  for (let y = 0; y < n; y++) for (let x = 0; x < n; x++) if (modules[y][x]) ctx.fillRect(off + x * scale, off + y * scale, scale, scale);
-}
-
-function reserveFormatAreas(reserved) {
-  const n = reserved.length;
-  for (let i = 0; i <= 5; i++) reserved[i][8] = true;
-  reserved[7][8] = true; reserved[8][8] = true; reserved[8][7] = true;
-  for (let i = 9; i < 15; i++) reserved[8][14 - i] = true;
-  for (let i = 0; i < 8; i++) reserved[8][n - 1 - i] = true;
-  for (let i = 8; i < 15; i++) reserved[n - 1 - (14 - i)][8] = true;
-}
-
-function qrDataCodewords(text) {
-  const alpha = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ $%*+-./:";
-  const bits = [];
-  const push = (v, n) => { for (let i = n - 1; i >= 0; i--) bits.push((v >>> i) & 1); };
-  push(2, 4); push(text.length, 9);
-  for (let i = 0; i < text.length; i += 2) {
-    const a = alpha.indexOf(text[i]), b = alpha.indexOf(text[i + 1]);
-    if (b >= 0) push(a * 45 + b, 11); else push(a, 6);
-  }
-  push(0, Math.min(4, 272 - bits.length));
-  while (bits.length % 8) bits.push(0);
-  const out = [];
-  for (let i = 0; i < bits.length; i += 8) out.push(bits.slice(i, i + 8).reduce((a, b) => (a << 1) | b, 0));
-  for (let p = 0; out.length < 34; p++) out.push(p % 2 ? 0x11 : 0xec);
-  return out;
-}
-
-function qrRs(data, count) {
-  const mul = (x, y) => { let z = 0; for (; y; y >>>= 1) { if (y & 1) z ^= x; x = (x << 1) ^ (x & 0x80 ? 0x11d : 0); } return z & 255; };
-  let gen = [1];
-  for (let i = 0, root = 1; i < count; i++, root = mul(root, 2)) {
-    const next = Array(gen.length + 1).fill(0);
-    gen.forEach((c, j) => { next[j] ^= mul(c, root); next[j + 1] ^= c; });
-    gen = next;
-  }
-  const rem = Array(count).fill(0);
-  data.forEach((b) => {
-    const factor = b ^ rem.shift();
-    rem.push(0);
-    gen.slice(0, count).forEach((c, i) => { rem[i] ^= mul(c, factor); });
-  });
-  return rem;
-}
-
-function placeFormat(modules, reserved, ecl, mask) {
-  let data = (ecl << 3) | mask, rem = data;
-  for (let i = 0; i < 10; i++) rem = (rem << 1) ^ ((rem >>> 9) * 0x537);
-  const bits = ((data << 10) | rem) ^ 0x5412;
-  const set = (x, y, i) => { modules[y][x] = ((bits >>> i) & 1) === 1; reserved[y][x] = true; };
-  for (let i = 0; i <= 5; i++) set(8, i, i);
-  set(8, 7, 6); set(8, 8, 7); set(7, 8, 8);
-  for (let i = 9; i < 15; i++) set(14 - i, 8, i);
-  for (let i = 0; i < 8; i++) set(24 - i, 8, i);
-  for (let i = 8; i < 15; i++) set(8, 24 - (14 - i), i);
-}
 
 function renderActions(d) {
   const dev = d.device || {};
@@ -2072,7 +1753,7 @@ function renderActions(d) {
   } else {
     b.hidden = true;
   }
-  $("foot-meta").textContent = `${dev.nights || 0} nights · ${(dev.total_events || 0).toLocaleString()} events`;
+  $("foot-meta").textContent = `${num(dev.nights)} nights · ${num(dev.total_events).toLocaleString()} events`;
 }
 
 // ── profile dialog ──────────────────────────────────────────
@@ -2135,7 +1816,7 @@ async function saveProfile(e) {
   }
 }
 
-// ── sync ────────────────────────────────────────────────────
+// ── notifications ───────────────────────────────────────────
 function toast(msg, kind = "info") {
   let t = $("toast");
   if (!t) { t = el("div", "toast"); t.id = "toast"; document.body.append(t); }
@@ -2150,117 +1831,164 @@ function toast(msg, kind = "info") {
   toast._t = setTimeout(() => t.classList.remove("show"), kind === "error" ? 8000 : 3800);
 }
 
-// turn a backend sync error into something actionable
-function syncHint(msg) {
-  msg = msg || "";
-  if (/no matching|not found|no device|no ring/i.test(msg))
-    return "Couldn't find your ring. Take it off the charger, keep it nearby, and try again.";
-  if (/key|auth|unauthor/i.test(msg))
-    return "The ring needs its auth key. Start the dashboard with --key-file.";
-  if (/timed out|timeout/i.test(msg))
-    return "Bluetooth timed out. Make sure the ring is awake and close, then retry.";
-  return "Sync failed: " + msg;
-}
 
-async function doSync() {
-  const btn = $("sync-btn");
-  if (btn.classList.contains("syncing")) return;
-  btn.classList.add("syncing");
-  $("sync-label").textContent = "Syncing";
-  btn.title = "Connecting to the ring over Bluetooth…";
-  try {
-    const j = await (await postDash("/api/sync")).json();
-    if (j.ok) {
-      $("sync-label").textContent = "Synced";
-      toast(j.message && !/^synced$/i.test(j.message) ? j.message : "Ring synced.", "ok");
-      await load();
-    } else {
-      $("sync-label").textContent = "Failed";
-      toast(syncHint(j.message), "error");
-    }
-  } catch (e) {
-    $("sync-label").textContent = "Failed";
-    toast("Couldn't reach the local dashboard server.", "error");
+// Collector health is independent of physiological summaries, including on first upload.
+let COLLECTOR_STATUS = null;
+let STATUS_TIMER = null;
+let STATUS_REQUEST = null;
+let STATUS_SIGNATURE = null;
+let STATUS_CHECKED_AT = null;
+let STATUS_FAILED = false;
+let LAST_SUMMARY = null;
+
+const ageLabel = (unixMs) => {
+  if (unixMs == null) return "—";
+  const seconds = (Date.now() - unixMs) / 1000;
+  if (seconds < -60) return "clock is ahead";
+  if (seconds < 60) return "<1 min ago";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} min ago`;
+  return `${Math.floor(seconds / 3600)} h ago`;
+};
+const bytesLabel = (bytes) => bytes == null ? "—" : `${(bytes / 1048576).toFixed(1)} MiB`;
+
+// A2: one distinct human sentence per `ingest.state`. The LXC server has no
+// ring, so no message here ever tells you to run a local sync.
+const INGEST_STATE_COPY = {
+  db_missing: "The ingest database is missing on the server. Point OURA_HUB_DB at the hub database and restart the dashboard service.",
+  db_inaccessible: "The ingest database exists but the server cannot open it. Check the dashboard service's read permission on that file.",
+  no_upload: "The server is up, but no collector batch has arrived yet. Start the collector on the Pi; its first signed batch will appear here.",
+  collector_ready: "A collector is registered, but no raw events are stored yet. Decoding starts on the server once events arrive.",
+  undecoded: "Raw events are stored but none are decoded yet. The server decodes each batch; the summary follows once decoding finishes.",
+  raw_pending: "New raw events are queued; the server is decoding and re-analyzing the affected days now.",
+  analysis_failed: "Analysis failed on the newest revision. The last known-good summary stays visible; the error is shown below.",
+  ready: "Uploaded, decoded and analyzed — the latest summary is current.",
+};
+
+// A3/B6: the honest per-day activity panel. `steps` is null until a real count
+// source exists; `estimated_steps` is MET-derived and labelled as an estimate.
+// Unknown minutes are unobserved, never zero-activity; null sedentary minutes
+// mean no wear evidence at all.
+function renderActivityTracking(d) {
+  const box = $("activity-tracking");
+  box.replaceChildren();
+  const at = d.activity_tracking || {};
+  if (!Array.isArray(at.days) || !at.days.length) {
+    box.append(el("p", "ad-muted", "No dated activity coverage yet. Minutes appear once the collector uploads and the server decodes them."));
+    if (at.steps_blocker) box.append(el("p", "at-blocked", `Steps are unavailable: ${esc(at.steps_blocker)}`));
+    return;
   }
-  btn.classList.remove("syncing");
-  setTimeout(() => { $("sync-label").textContent = "Sync"; btn.title = "Sync the ring over Bluetooth"; }, 3000);
+  const item = (label, value) => `<div><i>${esc(label)}</i><b>${value}</b></div>`;
+  at.days.forEach((day) => {
+    const card = el("div", "at-day");
+    card.append(el("p", "subhead", `${esc(day.date)} · <span class="at-est">steps estimated from MET</span>`));
+    const kv = el("div", "adv-kv");
+    kv.innerHTML = item("Steps", day.steps == null ? "—" : kfmt(day.steps)) +
+      item("Estimated steps (MET)", day.estimated_steps == null ? "—" : Math.round(day.estimated_steps).toLocaleString()) +
+      item("Active minutes", num(day.active_minutes)) +
+      item("Sedentary minutes", day.sedentary_minutes == null ? "no wear evidence" : num(day.sedentary_minutes)) +
+      item("Unknown minutes", `${num(day.unknown_minutes)} (unobserved, not zero)`) +
+      item("Observed minutes", num(day.observed_minutes));
+    card.append(kv);
+    if (day.steps_source === "blocked")
+      card.append(el("p", "at-blocked", `Steps for this day are blocked: ${esc(at.steps_blocker || "no decoded step source")}.`));
+    (Array.isArray(day.hours) ? day.hours : []).forEach((h) => {
+      const sed = h.sedentary_minutes == null ? "no wear evidence" : num(h.sedentary_minutes);
+      card.append(el("p", "at-hour",
+        `<i>${esc(h.label || "—")}</i> <b>${h.estimated_steps == null ? "—" : Math.round(h.estimated_steps).toLocaleString()}</b> est. steps (MET)` +
+        ` · ${num(h.active_minutes)} active · ${sed} sedentary · ${num(h.unknown_minutes)} unknown`));
+    });
+    box.append(card);
+  });
 }
 
-// ── live heart rate ─────────────────────────────────────────
-// POST /api/live-hr streams newline-delimited JSON while the ring is connected:
-// {"status":"live"}, then {"bpm":..,"ibi_ms":..} per beat, then {"done":true} or
-// {"error":".."}. Aborting the request (Stop) ends the session on the server.
-let LIVE_ABORT = null;
-
-function liveHint(msg) {
-  msg = msg || "";
-  if (/no matching|not found|no device|no ring/i.test(msg))
-    return "Couldn't find your ring. Keep it on your finger, close to the Mac, and try again.";
-  if (/key|auth|unauthor/i.test(msg))
-    return "The ring needs its auth key. Start the dashboard with --key-file.";
-  return "Live heart rate failed: " + msg;
-}
-
-function liveSummary(beats) {
-  if (!beats.length) return "No beats captured. Make sure the ring is on your finger.";
-  const avg = Math.round(beats.reduce((a, b) => a + b, 0) / beats.length);
-  return `${beats.length} beats · avg ${avg} · min ${Math.min(...beats)} · max ${Math.max(...beats)} bpm`;
-}
-
-async function toggleLive() {
-  if (LIVE_ABORT) { LIVE_ABORT.abort(); return; }
-  const abort = (LIVE_ABORT = new AbortController());
-  const beats = [];
-  const status = $("live-status");
-  $("live-btn").classList.add("live-on");
-  $("live-label").textContent = "Stop";
-  $("live-bpm").textContent = "—";
-  $("live-spark").innerHTML = "";
-  status.textContent = "Connecting to the ring… keep your hand near the Mac (up to 2 min).";
-  let end = null;
-  try {
-    const r = await fetch("/api/live-hr", { method: "POST", headers: { ...DASH_HEADERS }, signal: abort.signal });
-    if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let buf = "";
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let nl;
-      while ((nl = buf.indexOf("\n")) >= 0) {
-        const line = buf.slice(0, nl);
-        buf = buf.slice(nl + 1);
-        if (!line.trim()) continue;
-        const m = JSON.parse(line);
-        if (m.status === "live") status.textContent = "Live. Beats appear as the ring detects them.";
-        else if (m.bpm != null) {
-          beats.push(m.bpm);
-          $("live-bpm").textContent = m.bpm;
-          $("live-spark").innerHTML = sparkline(beats.slice(-60));
-          status.textContent = liveSummary(beats);
-          const dot = $("live-dot");
-          dot.classList.remove("beat");
-          void dot.offsetWidth; // restart the pulse animation
-          dot.classList.add("beat");
-        } else if (m.error) end = liveHint(m.error);
-        else if (m.done) end = beats.length ? "Done. " + liveSummary(beats) : liveSummary(beats);
-      }
-    }
-  } catch (e) {
-    if (e.name === "AbortError") end = beats.length ? "Stopped. " + liveSummary(beats) : "Stopped.";
-    else end = "Couldn't reach the local dashboard server.";
+function renderCollectorStatus() {
+  const box = $("collector-status");
+  box.replaceChildren();
+  if (!COLLECTOR_STATUS) {
+    box.append(el("p", "error", STATUS_FAILED ? "Collector status unavailable. Server connection failed; no health state can be confirmed." : "Checking collector status…"));
+    return;
   }
-  status.textContent = end || liveSummary(beats);
-  LIVE_ABORT = null;
-  $("live-btn").classList.remove("live-on");
-  $("live-label").textContent = "Start";
+  const s = COLLECTOR_STATUS, ingest = s.ingest || {}, processing = ingest.processing || {};
+  // A2: one distinct sentence per ingest state — DB trouble, first upload,
+  // pending decode, failed analysis and current data never share a message.
+  const state = ingest.state || s.state || "unknown";
+  const note = el("p", "at-state");
+  note.textContent = INGEST_STATE_COPY[state] || `Collector state: ${state}.`;
+  box.append(note);
+  if (STATUS_FAILED) box.append(el("p", "error", `Status is stale: last successful check ${ageLabel(STATUS_CHECKED_AT)}. Server connection failed.`));
+  const kv = el("div", "adv-kv");
+  const item = (label, value) => `<div><i>${esc(label)}</i><b>${esc(value)}</b></div>`;
+  kv.innerHTML = item("Raw events", num(ingest.raw_events).toLocaleString()) +
+    item("Decoded events", num(ingest.decoded_events).toLocaleString()) +
+    item("Processing", `${processing.state || "—"}${processing.stage ? " · " + processing.stage : ""}`) + item("Input revision", num(ingest.revision)) +
+    item("Analyzed revision", num(processing.completed_revision));
+  box.append(kv);
+  if (processing.last_error) {
+    const error = el("p", "error");
+    error.textContent = `Processing error: ${String(processing.last_error).slice(0, 240)}`;
+    box.append(error);
+  }
+  const models = s.models || {};
+  const missing = Object.entries(models).filter(([, model]) => !model.available).map(([name]) => name);
+  box.append(el("p", "ad-muted", missing.length ? `Missing models: ${missing.map(esc).join(", ")}. Model-dependent metrics remain unavailable.` : (Object.keys(models).length ? "All configured models are available." : "No model runners are configured.")));
+  if (!ingest.collectors.length) box.append(el("p", "error", "No collector heartbeat received yet."));
+  ingest.collectors.forEach((collector) => {
+    const h = collector.heartbeat || {}, row = el("div", "collector-health");
+    const stale = Date.now() - collector.received_unix_ms > 5 * 60 * 1000;
+    row.append(el("p", "subhead", `${esc(collector.device_id)} · ${stale ? "stale / offline" : "recent heartbeat"}`));
+    const fields = el("div", "adv-kv");
+    fields.innerHTML = item("Heartbeat", ageLabel(collector.received_unix_ms)) + item("Build", esc(collector.collector_build || "—")) +
+      item("Last BLE attempt", ageLabel(h.ble_attempt_unix_ms)) + item("Last BLE success", ageLabel(h.ble_success_unix_ms)) +
+      item("Last upload receipt", ageLabel(h.upload_receipt_unix_ms)) + item("Queue", `${num(h.queue_count)} events · ${bytesLabel(h.queue_bytes)}`) +
+      item("Oldest queued", ageLabel(h.queue_oldest_unix_ms)) + item("Disk free", bytesLabel(h.disk_free_bytes)) +
+      item("Clock", h.clock_synchronized ? "synchronized" : "not synchronized");
+    row.append(fields);
+    if (h.disk_free_bytes != null && h.disk_free_bytes < 256 * 1048576) row.append(el("p", "error", "Disk pressure: less than 256 MiB free."));
+    if (h.error_codes.length) row.append(el("p", "error", `Collector errors: ${h.error_codes.slice(0, 8).map(esc).join(", ")}`));
+    box.append(row);
+  });
 }
 
-// ── load ────────────────────────────────────────────────────
-// show the error in the headline and stop every panel's loading shimmer, so the
-// page reads as "errored" rather than stuck mid-load.
+async function pollCollectorStatus() {
+  if (document.hidden || STATUS_REQUEST) return;
+  clearTimeout(STATUS_TIMER);
+  const controller = new AbortController();
+  STATUS_REQUEST = controller;
+  const deadline = setTimeout(() => controller.abort(), 12000);
+  try {
+    const response = await fetch("/api/status", { signal: controller.signal, cache: "no-store" });
+    if (!response.ok) throw new Error("Status unavailable");
+    const s = await response.json();
+    const signature = JSON.stringify([s.state, s.ingest.revision, s.ingest.raw_events, s.ingest.decoded_events, s.ingest.processing.state, s.ingest.processing.completed_revision, s.models]);
+    const changed = STATUS_SIGNATURE != null && signature !== STATUS_SIGNATURE;
+    COLLECTOR_STATUS = s;
+    STATUS_SIGNATURE = signature;
+    STATUS_CHECKED_AT = Date.now();
+    STATUS_FAILED = false;
+    renderCollectorStatus();
+    if (changed) load();
+  } catch (_) {
+    if (!document.hidden) {
+      STATUS_FAILED = true;
+      renderCollectorStatus();
+    }
+  } finally {
+    clearTimeout(deadline);
+    STATUS_REQUEST = null;
+    if (!document.hidden) STATUS_TIMER = setTimeout(pollCollectorStatus, 5000);
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  clearTimeout(STATUS_TIMER);
+  if (document.hidden) STATUS_REQUEST?.abort();
+  else {
+    renderCollectorStatus();
+    if (!STATUS_REQUEST) pollCollectorStatus();
+  }
+});
+
+// A failed summary must not hide collector health or the independent manual store.
 function showLoadError(msg) {
   document.querySelectorAll(".skeleton").forEach((el) => {
     if (el.id === "digest") return; // handled below — keep it for the message
@@ -2272,25 +2000,54 @@ function showLoadError(msg) {
   dg.textContent = msg;
 }
 
-let LOAD_SEQ = 0;
-async function load() {
-  // guard against overlapping loads (sync/profile-save during an in-flight build):
-  // a slower earlier response must not overwrite a newer one.
-  const seq = ++LOAD_SEQ;
+let SUMMARY_REQUEST = null;
+let SUMMARY_AGAIN = false;
+function load() {
+  if (SUMMARY_REQUEST) {
+    SUMMARY_AGAIN = true;
+    return SUMMARY_REQUEST;
+  }
+  SUMMARY_REQUEST = loadSummary().finally(() => {
+    SUMMARY_REQUEST = null;
+    if (SUMMARY_AGAIN) {
+      SUMMARY_AGAIN = false;
+      if (!document.hidden) load();
+    }
+  });
+  return SUMMARY_REQUEST;
+}
+
+async function loadSummary() {
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), 120000);
   let d;
   try {
-    d = await (await fetch(`/api/summary?tz=${browserTzOffset()}`)).json();
-  } catch (e) {
-    if (seq === LOAD_SEQ) showLoadError("Could not reach the local server.");
+    const response = await fetch(`/api/summary?tz=${browserTzOffset()}`, { signal: controller.signal });
+    d = await response.json();
+    if (!response.ok && !d.error) throw new Error("Summary unavailable");
+  } catch (_) {
+    renderActivityTracking({}); // A2: the activity panel reads truthfully without a summary
+    showLoadError("Summary unavailable. Collector health is checked separately; saved manual entries remain available.");
     return;
+  } finally {
+    clearTimeout(deadline);
   }
-  if (seq !== LOAD_SEQ) return; // a newer load() superseded this response — drop it
   if (d.error) {
-    showLoadError(d.error);
+    if (!LAST_SUMMARY) {
+      renderTiles({});
+      renderDay({});
+      renderSleepDebt({});
+      renderIllness({});
+      renderCardio({});
+      renderSpo2({});
+      renderDevice({});
+      renderActivityTracking({});
+    }
+    showLoadError(d.status?.message || "No physiological summary available yet. Check collector and processing status.");
     return;
   }
+  LAST_SUMMARY = d;
   CURRENT_TZ = d.tz || 0;
-  LAST_DEVICE_SERIAL = d.device && d.device.serial;
   $("digest").classList.remove("skeleton", "skeleton-text");
   $("digest").classList.add("reveal");
   $("digest").innerHTML = (d.digest || "").replace(/([+-]?\d[\d.]*\s?(?:%|bpm|ms|m\/s))/g, '<span class="metric">$1</span>');
@@ -2298,6 +2055,7 @@ async function load() {
   renderTiles(d);
   HR_QUARTER_LOAD = null;
   renderDay(d);
+  renderActivityTracking(d);
   renderSleepDebt(d);
   renderIllness(d);
   renderCardio(d);
@@ -2309,12 +2067,11 @@ async function load() {
   });
 }
 
-$("sync-btn").addEventListener("click", doSync);
-$("live-btn").addEventListener("click", toggleLive);
 $("profile-btn").addEventListener("click", openProfile);
 $("profile-form").addEventListener("submit", saveProfile);
 $("profile-cancel").addEventListener("click", () => $("profile-dialog").close());
 load();
+pollCollectorStatus();
 
 // ── research export: raw CSVs for a window, built by oura-summary::research_export ──
 (function researchExport() {

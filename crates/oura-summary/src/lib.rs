@@ -17,6 +17,7 @@ pub mod research_export;
 pub mod ring_time;
 pub mod sleep_score;
 pub mod symptoms;
+pub mod time;
 
 /// An unanchored ring-clock epoch at least this long is worth a warning.
 const UNANCHORED_WARN_H: f64 = 12.0;
@@ -2733,6 +2734,12 @@ pub fn build_summary(
     let mut prof_cnt: std::collections::BTreeMap<String, [u32; 96]> = Default::default();
     let mut daily: std::collections::BTreeMap<String, (f64, f64)> = Default::default();
     let mut met_min: std::collections::BTreeMap<i64, f64> = Default::default();
+    // MET-derived minute evidence keyed by UTC minute-start epoch seconds, the
+    // honest source for activity/sedentary/unknown minute splits. A minute with
+    // no activity_information payload is unknown, not sedentary: off-finger or
+    // unobserved time must not fabricate zero activity. Value None = bin seen
+    // with a state byte but no MET array; Some(v) = observed MET.
+    let mut met_by_min: std::collections::BTreeMap<i64, Option<f64>> = Default::default();
     let weight = demo.weight_kg;
     // Resting daily expenditure via ecore's Schofield BMR (by age band + sex), instead
     // of the old flat `weight × 24` approximation. Added to active kcal for total kcal.
@@ -2778,6 +2785,15 @@ pub fn build_summary(
                     e.1 += step_rate;
                     *met_min.entry((local / 60.0).floor() as i64).or_insert(0.0) +=
                         (mv - 1.0).max(0.0);
+                    // Same minute bin in UTC-epoch terms for the honest splits.
+                    // `local` here is unix + fixed offset; the DST-correct local
+                    // minute start would need the zone. Bins below key on floor
+                    // of (unix at this MET sample), same instant either way.
+                    let bin = (unix / 60.0).floor() as i64;
+                    let ent = met_by_min.entry(bin).or_insert(None);
+                    if ent.is_none() {
+                        *ent = Some(mv);
+                    }
                 }
             }
         }
@@ -2844,6 +2860,15 @@ pub fn build_summary(
         })
         .collect::<serde_json::Map<_, _>>()
         .into();
+
+    // ── activity_tracking: honest per-day minute splits + MET-estimated steps ──
+    // `met_by_min` has the observed MET value for every dated activity_information
+    // minute (Some) or a hole where the state byte carried no MET array (None).
+    // Days are local dates in the display zone; hourly bins carry UTC epoch
+    // bounds so DST-shortened/lengthened days keep their real wall-clock hours.
+    let display_tz = crate::time::display_timezone();
+    let activity_tracking = build_activity_tracking(&met_by_min, display_tz.ok());
+
 
     let hrv_by_night: Vec<Option<f64>> = nights.iter().map(|n| mean(&n.rmssd)).collect();
     let rhr_by_night: Vec<Option<f64>> = nights
@@ -3118,6 +3143,9 @@ pub fn build_summary(
         "activity": activity,
         "activity_profile": activity_profile,
         "activity_daily": activity_daily,
+        // Honest per-day minute splits + MET-estimated steps. `steps` is always
+        // null: true counts need 0x51/0x52 decoders (blocked) — see steps_blocker.
+        "activity_tracking": activity_tracking,
         "vitals": {
             "hrv": trend(&hrv_stat),
             "rhr": trend(&rhr_stat),
@@ -3129,6 +3157,120 @@ pub fn build_summary(
             })),
         },
     }))
+}
+
+/// The `activity_tracking` block: per-local-date activity/coverage truth.
+///
+/// Minute bins (`met_by_min`, UTC-epoch minute starts to observed MET, `None` =
+/// a hole with no MET array) come from dated activity_information events only.
+/// With no `OURA_TIMEZONE`, per-date DST cannot be resolved honestly, so the
+/// whole block degrades to an empty `days` list with the blocker string rather
+/// than fabricating UTC dates.
+pub fn build_activity_tracking(
+    met_by_min: &std::collections::BTreeMap<i64, Option<f64>>,
+    display_tz: Option<chrono_tz::Tz>,
+) -> Value {
+    const STEPS_BLOCKER: &str = "0x51/0x52 counts undecoded upstream; real_steps 0x0b feature off by default and unverified on the target ring";
+    // Same MET to step-rate heuristic as the activity_daily aggregation:
+    // 150/min at MET 7+, 105/min at MET 2.5+, rounded to 100.
+    let step_rate = |mv: f64| if mv >= 7.0 { 150.0 } else if mv >= 2.5 { 105.0 } else { 0.0 };
+    let estimate_steps = |mins: &[f64]| -> f64 {
+        let raw: f64 = mins.iter().copied().map(step_rate).sum();
+        (raw / 100.0).round() * 100.0
+    };
+    let Some(tz) = display_tz else {
+        return json!({
+            "days": [],
+            "source": "summary",
+            "steps_blocker": STEPS_BLOCKER,
+        });
+    };
+    use chrono::{Datelike, TimeZone};
+    // Group minute bins by local date. A day with zero `Some` bins has no valid
+    // wear evidence: sedentary_minutes stays null (honest) and every observed
+    // minute counts unknown, not zero-activity.
+    let mut by_day: std::collections::BTreeMap<chrono::NaiveDate, Vec<(i64, Option<f64>)>> =
+        Default::default();
+    for (&bin, mv) in met_by_min {
+        // Map UTC epoch seconds to local date. Only `Single` results carry a
+        // trustworthy calendar day; anything else stays undated (never
+        // fabricated UTC).
+        if let chrono::LocalResult::Single(dt) = tz.timestamp_opt(bin * 60, 0) {
+            by_day.entry(dt.date_naive()).or_default().push((bin, *mv));
+        }
+    }
+    let mut days: Vec<Value> = Vec::new();
+    for (date, mins) in by_day {
+        let observed_minutes: u32 = mins.len() as u32;
+        let some_mv: Vec<f64> = mins.iter().filter_map(|(_, mv)| *mv).collect();
+        let observed_with_met: u32 = some_mv.len() as u32;
+        // A minute is active at MET 2.5+ (the same walking threshold as the
+        // step heuristic), sedentary below it, unknown only when unobserved.
+        let active_minutes: u32 = some_mv.iter().filter(|&&mv| mv >= 2.5).count() as u32;
+        let sedentary_minutes: u32 = observed_with_met - active_minutes;
+        let unknown_minutes: u32 = observed_minutes - observed_with_met;
+        let no_wear_evidence = observed_with_met == 0;
+        let estimated_steps = estimate_steps(&some_mv);
+        // Hourly bins over the day span in UTC, labels in the display zone.
+        // The span is [first local midnight, next local midnight): on 23/25 h
+        // DST days the hour count shrinks/grows with the real wall clock and
+        // no duration is duplicated or lost.
+        let mut hours: Vec<Value> = Vec::new();
+        let day_start = tz
+            .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+            .earliest();
+        let day_end = {
+            let next = date + chrono::Duration::days(1);
+            tz.with_ymd_and_hms(next.year(), next.month(), next.day(), 0, 0, 0)
+                .earliest()
+        };
+        if let (Some(s), Some(e)) = (day_start, day_end) {
+            let mut h = s;
+            while h < e {
+                let h_next = h + chrono::Duration::hours(1);
+                let hb_start = h.timestamp();
+                let hb_end = h_next.timestamp();
+                let hbins: Vec<&(i64, Option<f64>)> = mins
+                    .iter()
+                    .filter(|(b, _)| b * 60 >= hb_start && b * 60 < hb_end)
+                    .collect();
+                let hsome: Vec<f64> = hbins.iter().filter_map(|(_, mv)| *mv).collect();
+                let hobs: u32 = hbins.len() as u32;
+                let hactive: u32 = hsome.iter().filter(|&&mv| mv >= 2.5).count() as u32;
+                let hsed: u32 = hsome.len() as u32 - hactive;
+                let hunk: u32 = hobs - hsome.len() as u32;
+                hours.push(json!({
+                    "start_unix": hb_start,
+                    "end_unix": hb_end,
+                    "label": h.format("%H:%M").to_string(),
+                    "steps": null,
+                    "estimated_steps": if hsome.is_empty() { 0.0 } else { estimate_steps(&hsome) },
+                    "steps_source": if hsome.is_empty() { "blocked" } else { "met_estimate" },
+                    "observed_minutes": hobs,
+                    "active_minutes": hactive,
+                    "sedentary_minutes": if hsome.is_empty() { Value::Null } else { json!(hsed) },
+                    "unknown_minutes": hunk,
+                }));
+                h = h_next;
+            }
+        }
+        days.push(json!({
+            "date": date.format("%Y-%m-%d").to_string(),
+            "steps": null,
+            "estimated_steps": if no_wear_evidence { 0.0 } else { estimated_steps },
+            "steps_source": if no_wear_evidence { "blocked" } else { "met_estimate" },
+            "observed_minutes": observed_minutes,
+            "active_minutes": active_minutes,
+            "sedentary_minutes": if no_wear_evidence { Value::Null } else { json!(sedentary_minutes) },
+            "unknown_minutes": unknown_minutes,
+            "hours": hours,
+        }));
+    }
+    json!({
+        "days": days,
+        "source": "summary",
+        "steps_blocker": STEPS_BLOCKER,
+    })
 }
 
 #[cfg(test)]

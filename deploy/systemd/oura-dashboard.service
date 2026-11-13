@@ -10,14 +10,15 @@ User=oura
 Group=oura
 WorkingDirectory=/srv/oura
 EnvironmentFile=-/etc/oura/oura.env
-# OURA_BIND in /etc/oura/oura.env decides what the dashboard listens on; the
-# binary reads that variable itself, so no flag is passed here. Unset or empty,
-# the binary's default applies: loopback only. Set it to this host's LAN address
-# to serve other machines, which is only safe behind a firewall or a VPN — see
-# docs/DEPLOY_LXC.md.
-# OURA_PUBLIC_ORIGIN is also read directly by the binary. Set it to the exact
-# external HTTPS origin when using a LAN/VPN reverse proxy; see option C there.
-ExecStart=/srv/oura/bin/oura --db ${OURA_RING_DB} dashboard --port ${OURA_PORT} --tz-offset ${OURA_TZ_OFFSET} --manual-db ${OURA_MANUAL_DB}
+# The oura-dashboard binary reads its whole config from the environment file:
+# OURA_RING_DB, OURA_MANUAL_DB, OURA_BIND, OURA_PORT, OURA_TZ_OFFSET and
+# OURA_PUBLIC_ORIGIN. No flags are passed here, so the env file is the single
+# place to change behavior.
+#
+# OURA_HUB_DB, OURA_HUB_KEYS and OURA_HUB_BIND are consumed by the separate
+# hub service (crates/oura-hub), not by this one: the dashboard only reads the
+# hub's SQLite file through OURA_HUB_DB and never accepts uploads itself.
+ExecStart=/srv/oura/bin/oura-dashboard
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=20

@@ -13,7 +13,7 @@ PORT="${PORT:-8091}"
 HOST=localhost
 RUN=$(mktemp -d /tmp/oura-smoke.XXXXXX)
 ROOT="$(pwd)"
-BIN="$ROOT/target/release/oura"
+BIN="$ROOT/target/release/oura-dashboard"
 
 
 echo "== runtime deps (dashboard-only; BLE would need a D-Bus session) =="
@@ -37,7 +37,8 @@ for needle in "agent-backend.thomas.md" "ftp.ebi.ac.uk" "pgscatalog.org"; do
 done
 
 echo "== start dashboard (no DB, no ring key, no models) =="
-( cd "$RUN" && exec "$BIN" --db "$RUN/oura.db" dashboard --port "$PORT" --manual-db "$RUN/manual.db" >"$RUN/srv.log" 2>&1 ) &
+# The no-BLE server binary: config from env, never CLI flags.
+( cd "$RUN" && exec env OURA_RING_DB="$RUN/oura.db" OURA_MANUAL_DB="$RUN/manual.db" OURA_PORT="$PORT" "$BIN" >"$RUN/srv.log" 2>&1 ) &
 PID=$!
 trap 'kill "$PID" 2>/dev/null || true' EXIT
 sleep 3
@@ -61,6 +62,16 @@ check_code "/"             200
 check_body "/app.js"      "api/summary"
 check_body "/styles.css"  "body"
 check_body "/api/summary" "No ring data yet"
+
+echo "== /api/status: hub ingest state wrapped read-only, never a 500 =="
+got=$(curl -s "http://$HOST:$PORT/api/status")
+echo "GET /api/status -> ${got:0:200}"
+for key in '"state":"ok"' '"ingest":{' '"models":{' '"summary":{"stale"'; do
+  printf '%s' "$got" | grep -qF "$key" && echo "  ok: $key" || fail "status payload missing $key"
+done
+# No hub DB exists here: that is a state inside the payload, not an error.
+printf '%s' "$got" | grep -qF '"state":"db_missing"' && echo "  ok: ingest db_missing state" \
+  || fail "expected ingest.state db_missing without a hub DB"
 
 echo "== removed surface must be gone (ADR 0006) =="
 check_code "/dna"             404

@@ -20,10 +20,6 @@
       </div>
       <div class="actions">
         <span id="batt" class="batt" title="Ring battery"></span>
-        <button id="sync-btn" class="action" title="Sync the ring over Bluetooth" aria-label="Sync ring">
-          <span class="ic" style="--i:url(/icons/arrows-clockwise.svg)"></span>
-          <span id="sync-label">Sync</span>
-        </button>
         <button id="theme-btn" class="action icon-only" title="Toggle light or dark theme" aria-label="Toggle theme">
           <span class="ic" style="--i:url(/icons/moon.svg)"></span>
         </button>
@@ -95,6 +91,11 @@
           </div>
         </section>
 
+        <section class="panel" id="activity-panel" aria-labelledby="activity-title">
+          <div class="panel-head"><h2 id="activity-title"><span class="ic" style="--i:url(/icons/act-walking.svg)"></span>Activity &amp; coverage</h2></div>
+          <div id="activity-tracking"><p class="error">Activity data not available yet.</p></div>
+        </section>
+
         <section class="tiles" id="tiles" aria-label="Key vitals">
           <article class="tile skeleton"></article>
           <article class="tile skeleton"></article>
@@ -116,22 +117,6 @@
       </div>
 
       <aside class="dashboard-side">
-        <section class="panel" id="live-panel">
-          <div class="panel-head">
-            <h2><span class="ic" style="--i:url(/icons/heartbeat.svg)"></span>Live heart rate</h2>
-            <button id="live-btn" class="action" title="Stream your heart rate from the ring for a minute">
-              <span id="live-label">Start</span>
-            </button>
-          </div>
-          <div class="live">
-            <div class="live-now">
-              <i id="live-dot" class="live-dot" aria-hidden="true"></i>
-              <span id="live-bpm" class="live-bpm">—</span><span class="unit">bpm</span>
-            </div>
-            <div id="live-spark" class="spark"></div>
-            <p id="live-status" class="live-status" aria-live="polite">Wear the ring, keep your hand near the Mac, then press Start.</p>
-          </div>
-        </section>
 
         <section class="panel" id="sleep-debt-panel">
           <div class="panel-head"><h2><span class="ic" style="--i:url(/icons/moon.svg)"></span>Sleep debt</h2></div>
@@ -145,6 +130,7 @@
 
         <section class="panel" id="device-panel">
           <div class="panel-head"><h2><span class="ic" style="--i:url(/icons/cpu.svg)"></span>Device &amp; data health</h2></div>
+          <div id="collector-status" aria-live="polite"><p class="error">Checking collector status…</p></div>
           <div id="device" class="device"><div class="skeleton skeleton-block"></div></div>
         </section>
 
@@ -223,7 +209,7 @@
     </dialog>
 
     <footer class="foot">
-      <span>Everything here is computed on this machine. Nothing left the device.</span>
+      <span>Ring data is uploaded from your collector to your own server. Analysis stays on that server; this dashboard uses no third-party services.</span>
       <span id="foot-meta"></span>
     </footer>
   </div>

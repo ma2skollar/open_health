@@ -1,6 +1,6 @@
 [package]
 name = "oura-hub"
-description = "Authenticated collector ingestion and immutable ring generations"
+description = "Authenticated raw-batch ingress and durable analysis pipeline"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,9 +13,13 @@ path = "src/main.rs"
 [dependencies]
 oura-protocol-v1 = { path = "../oura-protocol-v1" }
 oura-summary = { path = "../oura-summary" }
+anyhow = "1"
+hex = "0.4"
+libc = "0.2"
+oura-store = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
+oura-protocol = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
 axum = { version = "0.8", features = ["ws"] }
 bytes = "1"
-clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 futures-util = "0.3"
 http-body-util = "0.1"

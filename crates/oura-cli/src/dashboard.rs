@@ -15,7 +15,7 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use oura_manual::{ManualEntry, ManualStore, MetricKind, UpsertOutcome};
@@ -23,36 +23,12 @@ use oura_summary::{
     bedtime_overrides_path, feature_modes_path, profile_path, write_bedtime_override, ModelInputs,
     ModelOutputs, ModelRunner,
 };
-// Re-exported so `dashboard::Demographics` (main.rs) and the profile/feature
-// handlers keep working after the summary logic moved into `oura-summary`.
-pub use oura_summary::{read_profile, write_feature_mode, write_profile, Demographics};
+pub use oura_summary::{read_profile, write_profile, Demographics};
 
 const INDEX_HTML: &str = include_str!("../../../dashboard/web/index.html");
 const STYLES_CSS: &str = include_str!("../../../dashboard/web/styles.css");
 const APP_JS: &str = include_str!("../../../dashboard/web/app.js");
 
-fn read_ring_key(path: Option<&Path>) -> Result<String> {
-    let path = path.ok_or_else(|| anyhow!("dashboard was started without --key-file"))?;
-    let key = std::fs::read_to_string(path)
-        .with_context(|| format!("reading key file {}", path.display()))?;
-    validate_ring_key(&key)
-}
-
-fn write_ring_key(path: Option<&Path>, key: &str) -> Result<String> {
-    let path = path.ok_or_else(|| anyhow!("dashboard was started without --key-file"))?;
-    let key = validate_ring_key(key)?;
-    crate::secret_file::write_private(path, format!("{key}\n").as_bytes())
-        .with_context(|| format!("writing key file {}", path.display()))?;
-    Ok(key)
-}
-
-fn validate_ring_key(key: &str) -> Result<String> {
-    let key = key.trim();
-    if key.len() != 32 || !key.as_bytes().iter().all(u8::is_ascii_hexdigit) {
-        return Err(anyhow!("auth key must be exactly 16 bytes of hex"));
-    }
-    Ok(key.to_ascii_lowercase())
-}
 
 // ── python model orchestration (shared with `oura sessions` via `pyrunner`) ────
 fn repo_root() -> Option<PathBuf> {
@@ -402,7 +378,6 @@ fn cached_summary(
     tz: f64,
     manual: Option<&Mutex<ManualStore>>,
 ) -> Result<Arc<Value>> {
-    let _ = oura_store::storage::Store::migrate_if_writable(db);
     let profile = effective_profile(db, manual, local_today_days(tz))?;
     let token = summary_token(db, &profile.demo);
     if let Some(c) = summary_cache().lock().unwrap().as_ref() {
@@ -436,13 +411,132 @@ fn cached_summary(
     Ok(value)
 }
 
+// ── ingest wiring (hub DB) ───────────────────────────────────────────────────
+
+/// The hub's SQLite path: `OURA_HUB_DB`, else the dashboard's own DB path. The
+/// hub may run on a different host; a missing file is a state, never an error.
+pub fn hub_db(db: &Path) -> PathBuf {
+    std::env::var_os("OURA_HUB_DB")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| db.to_path_buf())
+}
+
+/// Flat hub `ingest::status` wrapped under `ingest`, with the dashboard's own
+/// `state` and `models` beside it. Never touches the summary or its cache and
+/// never 500s: `ingest::status` already reports a missing/inaccessible DB as a
+/// state.
+fn status_payload(hub_db: &Path) -> Value {
+    let ingest = oura_hub::ingest::status(hub_db);
+    // `summary.stale`: the last-good summary predates the newest decoded data.
+    // No summary at all counts as stale, so the UI can say so honestly.
+    let summary_ms = ingest["summary_unix_ms"].as_i64();
+    let completed = ingest["processing"]["completed_revision"].as_i64();
+    let stale = match (summary_ms, completed) {
+        (None, _) => true,
+        (Some(_), None) => true,
+        (Some(_), Some(c)) => ingest["decoded_revision"]
+            .as_i64()
+            .is_some_and(|decoded| decoded > c),
+    };
+    json!({
+        // `state` here is the dashboard service's own reachability marker; the
+        // ingest vocabulary lives at `ingest.state` and drives the UI copy.
+        "state": "ok",
+        "summary": { "stale": stale },
+        "models": models_status(),
+        "ingest": ingest,
+    })
+}
+
+/// Which torch model runners exist and whether their `.pt` files are present.
+/// Availability is existence only — no accuracy or version claim.
+fn models_status() -> Value {
+    let dir = models_dir();
+    let mut models = serde_json::Map::new();
+    for (name, script) in [
+        ("sleep", "tools/run_sleep_model.py"),
+        ("cva", "tools/run_cva_model.py"),
+        ("activity", "tools/run_activity_model.py"),
+        ("illness", "tools/run_illness_model.py"),
+    ] {
+        // A runner script absent from the checkout means that metric has no
+        // path at all; report only runners that exist.
+        if !repo_root().is_some_and(|r| r.join(script).is_file()) {
+            continue;
+        }
+        let available = MODEL_FILES
+            .iter()
+            .filter(|(runner, _)| *runner == name)
+            .all(|(_, file)| dir.join(file).is_file());
+        models.insert(name.into(), json!({ "available": available }));
+    }
+    Value::Object(models)
+}
+
+/// One `.pt` per runner, as shipped by the runners themselves (`MODEL_NAME`).
+const MODEL_FILES: &[(&str, &str)] = &[
+    ("sleep", "sleepstaging_2_6_0.pt"),
+    ("cva", "cva_2_1_0.pt"),
+    ("activity", "automatic_activity_detection_3_1_11.pt"),
+    ("illness", "illness_detection_0_5_1.pt"),
+];
+
+/// Background analysis worker: drain pending ingest jobs through the real
+/// Python runners every ~30s. `process_pending` owns claim/backoff/failure
+/// recording; a build error returns `Err` and is logged, never swallowed and
+/// never fatal to the server. Model-file mtime changes also bust the summary
+/// cache, so a swapped model is picked up on the next request.
+
+/// The models directory: `OURA_MODELS_DIR`, else `notes/models` under the
+/// repo root. No root and no override means no models — availability false.
+fn models_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("OURA_MODELS_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    repo_root().map(|r| r.join("notes/models")).unwrap_or_default()
+}
+
+async fn analysis_worker(db: PathBuf, tz: f64) {
+    let hub_db = hub_db(&db);
+    let mut last_models: Option<Vec<Option<SystemTime>>> = None;
+    loop {
+        let job_db = db.clone();
+        let job_hub = hub_db.clone();
+        let ran = tokio::task::spawn_blocking(move || {
+            let demo = read_profile(&job_db);
+            oura_hub::ingest::process_pending(&job_hub, |db| {
+                build_summary(db, tz, &demo)
+            })
+        })
+        .await;
+        match ran {
+            Ok(Ok(true)) => {
+                // a durable job was attempted; the next page load must see it
+                summary_cache().lock().unwrap().take();
+            }
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => tracing::warn!("ingest analysis failed: {e}"),
+            Err(e) => tracing::warn!("ingest analysis worker panicked: {e}"),
+        }
+        // model-file changes invalidate the summary cache (B2: installing or
+        // changing a model must invalidate the relevant cache)
+        let token: Vec<Option<SystemTime>> = MODEL_FILES
+            .iter()
+            .map(|(_, file)| mtime(&models_dir().join(file)))
+            .collect();
+        if last_models.replace(token.clone()).is_some_and(|old| old != token) {
+            summary_cache().lock().unwrap().take();
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
+    }
+}
+
 pub async fn serve(
     port: u16,
     bind: String,
     db: PathBuf,
     tz: f64,
-    name: String,
-    key_file: Option<PathBuf>,
     seed: Demographics,
     manual_db: PathBuf,
     weight_unit: WeightUnit,
@@ -485,13 +579,17 @@ pub async fn serve(
         _ => bind.clone(),
     };
     println!("open_oura dashboard running — open http://{shown}:{port} in your browser");
+    // Background analysis worker: drains pending ingest jobs (~30s cadence)
+    // through the real Python runners. Started after the listener binds so a
+    // busy model run never delays the first page.
+    tokio::spawn(analysis_worker(db.clone(), tz));
     loop {
         let (sock, _) = listener.accept().await?;
-        let (db, name, key_file) = (db.clone(), name.clone(), key_file.clone());
+        let db = db.clone();
         let manual = manual.clone();
         let public = public.clone();
         tokio::spawn(async move {
-            let _ = handle(sock, port, db, tz, name, key_file, manual, weight_unit, public).await;
+            let _ = handle(sock, port, db, tz, manual, weight_unit, public).await;
         });
     }
 }
@@ -1505,8 +1603,6 @@ async fn handle(
     port: u16,
     db: PathBuf,
     tz: f64,
-    name: String,
-    key_file: Option<PathBuf>,
     manual: Option<Arc<Mutex<ManualStore>>>,
     weight_unit: WeightUnit,
     public: Option<Arc<PublicOrigin>>,
@@ -1554,19 +1650,12 @@ async fn handle(
 
     // CSRF guard for mutating/action endpoints: a same-origin fetch can set this
     // header; an <img>/<form> or cross-origin fetch cannot (CORS preflight we never approve).
-    // GET /api/ring-key is guarded too — it discloses the ring auth key, so only the
-    // dashboard's own same-origin page (which sets the header) may read it.
     let csrf_ok = same_origin_write_ok(&req, public.as_deref());
     let forbid = matches!(
         (method, path),
         ("POST", "/api/profile")
             | ("POST", "/api/research-marker")
             | ("POST", "/api/bedtime")
-            | ("POST", "/api/sync")
-            | ("POST", "/api/live-hr")
-            | ("POST", "/api/feature")
-            | ("POST", "/api/ring-key")
-            | ("GET", "/api/ring-key")
             | ("POST", "/api/manual/entries")
             | ("DELETE", "/api/manual/entries")
     ) && !csrf_ok;
@@ -1574,25 +1663,6 @@ async fn handle(
         return write_resp(&mut sock, "403 Forbidden", "text/plain", b"forbidden").await;
     }
 
-    // A dashboard can own only one BLE operation at a time.
-    static BLE_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-    let _ble_guard = if method == "POST"
-        && matches!(path, "/api/sync" | "/api/live-hr" | "/api/feature")
-    {
-        match BLE_GATE.try_lock() {
-            Ok(guard) => Some(guard),
-            Err(_) => {
-                let busy = json!({"ok": false, "error": "Ring is busy; wait for the current operation to finish.", "message": "Ring is busy; wait for the current operation to finish."});
-                if path == "/api/live-hr" {
-                    // The live client consumes newline-delimited records.
-                    return write_resp(&mut sock, "200 OK", "application/x-ndjson", format!("{busy}\n").as_bytes()).await;
-                }
-                return json_resp(&mut sock, &busy).await;
-            }
-        }
-    } else {
-        None
-    };
     let effective_tz = if tz == 0.0 {
         query_param(query, "tz")
             .and_then(|v| v.parse::<f64>().ok())
@@ -1628,6 +1698,13 @@ async fn handle(
                 &asset("app.js", APP_JS),
             )
             .await
+        }
+        ("GET", "/api/status") => {
+            // Independent of summary success: flat hub status wrapped under
+            // `ingest`, plus the dashboard's own state/models. Read-only; a
+            // missing or unreadable hub DB is a state inside the payload.
+            let body = status_payload(&hub_db(&db));
+            json_resp(&mut sock, &body).await
         }
         ("GET", "/api/summary") => {
             // building the summary shells out to torch models → off the async
@@ -1799,48 +1876,6 @@ async fn handle(
                 }
             }
         }
-        ("GET", "/api/ring-key") => match read_ring_key(key_file.as_deref()) {
-            Ok(key) => json_resp(&mut sock, &json!({ "ok": true, "key": key })).await,
-            Err(e) => json_resp(&mut sock, &json!({ "ok": false, "message": e.to_string() })).await,
-        },
-        ("POST", "/api/ring-key") => {
-            let req =
-                serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
-            match write_ring_key(key_file.as_deref(), req["key"].as_str().unwrap_or("")) {
-                Ok(_) => json_resp(&mut sock, &json!({ "ok": true })).await,
-                Err(e) => {
-                    json_resp(&mut sock, &json!({ "ok": false, "message": e.to_string() })).await
-                }
-            }
-        }
-        ("POST", "/api/sync") => {
-            let res =
-                tokio::task::spawn_blocking(move || run_sync(&db, &name, key_file.as_deref()))
-                    .await
-                    .map_err(|e| anyhow!(e))?;
-            let v = match res {
-                Ok(msg) => json!({ "ok": true, "message": msg }),
-                Err(e) => json!({ "ok": false, "message": e.to_string() }),
-            };
-            json_resp(&mut sock, &v).await
-        }
-        ("POST", "/api/live-hr") => live_hr(&mut sock, &db, &name, key_file.as_deref()).await,
-        ("POST", "/api/feature") => {
-            let req =
-                serde_json::from_str::<Value>(body.trim_end_matches('\0')).unwrap_or(Value::Null);
-            let feature = req["feature"].as_str().unwrap_or("").to_string();
-            let mode = req["mode"].as_str().unwrap_or("").to_string();
-            let res = tokio::task::spawn_blocking(move || {
-                run_feature(&db, &name, key_file.as_deref(), &feature, &mode)
-            })
-            .await
-            .map_err(|e| anyhow!(e))?;
-            let v = match res {
-                Ok(msg) => json!({ "ok": true, "message": msg }),
-                Err(e) => json!({ "ok": false, "message": e.to_string() }),
-            };
-            json_resp(&mut sock, &v).await
-        }
         ("GET", "/api/manual/entries") => {
             let Some(store) = manual.as_ref() else {
                 return manual_unavailable(&mut sock).await;
@@ -1964,259 +1999,6 @@ async fn handle(
     }
 }
 
-/// Drain the ring by invoking our own binary's `sync` subcommand (reuses all the
-/// BLE + cursor logic). Returns the last stdout line on success.
-///
-/// BLE scanning on macOS is flaky: the ring advertises only periodically (and not at
-/// all for a few seconds after a disconnect), so a single short scan often misses a
-/// ring that is right there. We use a longer scan window and retry the transient
-/// "no matching ring" miss a couple of times before giving up.
-fn run_sync(db: &Path, name: &str, key_file: Option<&Path>) -> Result<String> {
-    let exe = std::env::current_exe().context("locating oura binary")?;
-    let mut last = String::from("sync failed");
-    for attempt in 0..3 {
-        let mut c = Command::new(&exe);
-        c.arg("--db")
-            .arg(db)
-            .arg("--name")
-            .arg(name)
-            .arg("--scan-timeout")
-            .arg("40"); // global flag; wider than the 25 s default
-        if let Some(k) = key_file {
-            c.arg("--key-file").arg(k);
-        }
-        c.arg("sync");
-        let out = c.output().context("running `oura sync`")?;
-        if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            return Ok(stdout.lines().last().unwrap_or("synced").trim().to_string());
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        last = stderr
-            .lines()
-            .last()
-            .unwrap_or("sync failed")
-            .trim()
-            .to_string();
-        // only a scan miss is worth retrying; a real error (auth, etc.) is not
-        let transient = {
-            let l = last.to_lowercase();
-            l.contains("no matching")
-                || l.contains("not found")
-                || l.contains("no device")
-                || l.contains("timed out")
-                || l.contains("timeout")
-        };
-        if !transient || attempt == 2 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-    Err(anyhow!("{last}"))
-}
-
-/// How long one dashboard live heart-rate session streams (the page can stop it early).
-const LIVE_HR_SECONDS: u64 = 60;
-
-/// Stream live heart rate as newline-delimited JSON while our own `live-hr`
-/// subcommand runs (BLE stays in the CLI, as for sync). Lines: `{"status":"live"}`
-/// once connected, `{"bpm":..,"ibi_ms":..}` per beat, then `{"done":true}` or
-/// `{"error":".."}`; the body ends with the connection. If the page stops early the
-/// child is killed, and the ring leaves live mode on its own within ~20 s.
-async fn live_hr(
-    sock: &mut TcpStream,
-    db: &Path,
-    name: &str,
-    key_file: Option<&Path>,
-) -> Result<()> {
-    sock.write_all(
-        b"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-    )
-    .await?;
-    let (mut rd, mut wr) = sock.split();
-    let Some(key_file) = key_file else {
-        let msg = "live heart rate needs the ring's auth key: start the dashboard with --key-file";
-        return send_line(&mut wr, &json!({ "error": msg })).await;
-    };
-    let exe = std::env::current_exe().context("locating oura binary")?;
-    let mut child = tokio::process::Command::new(&exe)
-        .arg("--db")
-        .arg(db)
-        .arg("--name")
-        .arg(name)
-        .arg("--scan-timeout")
-        .arg("120") // a worn ring advertises only in sparse bursts
-        .arg("--key-file")
-        .arg(key_file)
-        .arg("live-hr")
-        .arg("--seconds")
-        .arg(LIVE_HR_SECONDS.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("running `oura live-hr`")?;
-    let stderr = child.stderr.take().context("child stderr")?;
-    let stderr_task = tokio::spawn(read_stderr_tail(stderr));
-    let mut lines = tokio::io::BufReader::new(child.stdout.take().context("child stdout")?).lines();
-    let mut probe = [0u8; 1];
-    let session = tokio::time::timeout(std::time::Duration::from_secs(210), async {
-        loop {
-            tokio::select! {
-                line = lines.next_line() => {
-                    let Some(line) = line? else { break };
-                    let msg = if line.starts_with("Streaming live heart rate") {
-                        json!({ "status": "live" })
-                    } else if let Some((bpm, ibi_ms)) = parse_beat_line(&line) {
-                        json!({ "bpm": bpm, "ibi_ms": ibi_ms })
-                    } else { continue };
-                    send_line(&mut wr, &msg).await?;
-                }
-                n = rd.read(&mut probe) => if matches!(n, Ok(0) | Err(_)) {
-                    return Err(anyhow!("client disconnected"));
-                },
-            }
-        }
-        Ok::<_, anyhow::Error>(child.wait().await?.success())
-    })
-    .await;
-    let ok = match session {
-        Ok(Ok(ok)) => ok,
-        _ => {
-            // Retain the BLE gate until the process is killed and reaped.
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            stderr_task.abort();
-            return send_line(
-                &mut wr,
-                &json!({"error": "Live heart rate stopped or timed out."}),
-            )
-            .await;
-        }
-    };
-    let stderr = stderr_task.await.unwrap_or_default();
-    let last = if ok {
-        json!({ "done": true })
-    } else {
-        let msg = stderr
-            .lines()
-            .rfind(|l| !l.trim().is_empty())
-            .unwrap_or("live heart rate failed");
-        json!({ "error": msg.trim() })
-    };
-    send_line(&mut wr, &last).await
-}
-
-async fn read_stderr_tail(mut reader: impl tokio::io::AsyncRead + Unpin) -> String {
-    let mut tail = Vec::new();
-    let mut buf = [0u8; 4096];
-    while let Ok(n) = reader.read(&mut buf).await {
-        if n == 0 {
-            break;
-        }
-        tail.extend_from_slice(&buf[..n]);
-        if tail.len() > 8192 {
-            tail.drain(..tail.len() - 8192);
-        }
-    }
-    String::from_utf8_lossy(&tail).into_owned()
-}
-
-async fn send_line(wr: &mut (impl AsyncWriteExt + Unpin), v: &Value) -> Result<()> {
-    wr.write_all(format!("{v}\n").as_bytes()).await?;
-    Ok(())
-}
-
-/// Parse one `oura live-hr` beat line, e.g. `  81 bpm (IBI 733 ms)`.
-fn parse_beat_line(line: &str) -> Option<(u16, u16)> {
-    let (bpm, ibi) = line.trim().strip_suffix(" ms)")?.split_once(" bpm (IBI ")?;
-    Some((bpm.parse().ok()?, ibi.parse().ok()?))
-}
-
-/// Toggle an on-ring feature via our `feature-mode` subcommand (BLE, auth-gated).
-/// `feature` is whitelisted; `mode` is off|automatic. Writing a feature mode REQUIRES
-/// the auth key, so we fail early (with a clear message) if the dashboard was launched
-/// without `--key-file`. Scan misses retry; the ring's "already in that mode" rejection
-/// (result `0x20`) is reported as a no-op success rather than an error.
-fn run_feature(
-    db: &Path,
-    name: &str,
-    key_file: Option<&Path>,
-    feature: &str,
-    mode: &str,
-) -> Result<String> {
-    const FEATS: &[&str] = &[
-        "daytime_hr",
-        "spo2",
-        "exercise_hr",
-        "real_steps",
-        "cva_ppg",
-        "ambient",
-        "resting_hr",
-    ];
-    if !FEATS.contains(&feature) {
-        return Err(anyhow!("unknown feature"));
-    }
-    if mode != "off" && mode != "automatic" {
-        return Err(anyhow!("invalid mode"));
-    }
-    let key_file = key_file.ok_or_else(|| {
-        anyhow!("can't change ring features: the dashboard was started without --key-file (auth key needed to write feature modes)")
-    })?;
-    let exe = std::env::current_exe().context("locating oura binary")?;
-    let on = if mode == "off" { "off" } else { "on" };
-    let mut last = String::from("toggle failed");
-    for attempt in 0..3 {
-        let mut c = Command::new(&exe);
-        c.arg("--db")
-            .arg(db)
-            .arg("--name")
-            .arg(name)
-            .arg("--scan-timeout")
-            .arg("40")
-            .arg("--key-file")
-            .arg(key_file)
-            .arg("feature-mode")
-            .arg(feature)
-            .arg("--mode")
-            .arg(mode);
-        let out = c.output().context("running `oura feature-mode`")?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        // 0 = off, 1 = automatic — keep feature_modes.json in step with the toggle so
-        // the dashboard shows the new state on the next reload, not only after a sync.
-        let mode_int = if mode == "off" { 0 } else { 1 };
-        if stdout.contains("SUCCESS") {
-            write_feature_mode(db, feature, mode_int);
-            return Ok(format!("{feature} turned {on}"));
-        }
-        if stdout.contains("result 0x20") {
-            // ring refuses to set a mode it's already in → it's already in that state
-            write_feature_mode(db, feature, mode_int);
-            return Ok(format!("{feature} is already {on} (no change needed)"));
-        }
-        last = stdout
-            .lines()
-            .chain(stderr.lines())
-            .rfind(|l| !l.trim().is_empty())
-            .unwrap_or("toggle failed")
-            .trim()
-            .to_string();
-        let transient = {
-            let l = last.to_lowercase();
-            l.contains("no matching")
-                || l.contains("not found")
-                || l.contains("no device")
-                || l.contains("timed out")
-                || l.contains("timeout")
-        };
-        if !transient || attempt == 2 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_secs(2));
-    }
-    Err(anyhow!("{last}"))
-}
 
 #[cfg(test)]
 mod tests {
@@ -2299,18 +2081,6 @@ mod tests {
     }
 
 
-    #[tokio::test]
-    async fn live_stderr_is_drained_without_unbounded_retention() {
-        let (mut writer, reader) = tokio::io::duplex(1024);
-        let task = tokio::spawn(async move {
-            writer.write_all(&vec![b'x'; 200000]).await.unwrap();
-            writer.write_all(b"\nlast error\n").await.unwrap();
-        });
-        let tail = tokio::time::timeout(std::time::Duration::from_secs(2), read_stderr_tail(reader)).await.unwrap();
-        task.await.unwrap();
-        assert_eq!(tail.len(), 8192);
-        assert!(tail.ends_with("last error\n"));
-    }
 
     #[test]
     fn stalled_runner_is_killed_and_reaped() {
@@ -2330,13 +2100,70 @@ mod tests {
         assert_eq!(value["input"], "window");
         assert_eq!(value["data"].as_str().unwrap().len(), 200000);
     }
+
     #[test]
-    fn parses_live_hr_beat_lines() {
-        assert_eq!(parse_beat_line("  81 bpm (IBI 733 ms)"), Some((81, 733)));
-        assert_eq!(
-            parse_beat_line("No beats captured. Make sure the ring is worn."),
-            None
-        );
+    fn status_payload_reports_missing_hub_db_as_state_not_error() {
+        // No OURA_HUB_DB and a nonexistent path: a state, never a 500.
+        let dir = std::env::temp_dir().join(format!("oura-status-{}", std::process::id()));
+        let missing = dir.join("nope.db");
+        let v = status_payload(&missing);
+        assert_eq!(v["ingest"]["state"], "db_missing");
+        assert_eq!(v["state"], "ok");
+        assert!(v["summary"]["stale"].as_bool().unwrap());
+        assert!(v["models"].is_object());
+    }
+
+    #[test]
+    fn process_pending_on_missing_db_is_a_noop_without_running_build() {
+        let dir = std::env::temp_dir().join(format!("oura-worker-{}", std::process::id()));
+        let missing = dir.join("nope.db");
+        // The build closure must never run when there is no DB to claim from.
+        let ran = oura_hub::ingest::process_pending(&missing, |_| panic!("build must not run"));
+        assert_eq!(ran.unwrap(), false);
+    }
+}
+
+#[cfg(test)]
+mod removed_route_tests {
+    use super::*;
+
+    /// The removed local-BLE routes (live sync, feature mutation, ring-key
+    /// export) must 404 on a live server, not be resurrected by a same-origin
+    /// header. A real TCP round-trip proves the catch-all answers them.
+    #[tokio::test]
+    async fn removed_local_ble_routes_404_even_same_origin() {
+        let listener = tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let db = std::env::temp_dir().join(format!("oura-removed-route-{}.db", std::process::id()));
+        let manual_db = db.with_file_name("manual-removed.db");
+        let server = tokio::spawn(async move {
+            if let Ok((sock, _)) = listener.accept().await {
+                let _ = handle(sock, addr.port(), db, 0.0, None, WeightUnit::Kg, None).await;
+            }
+        });
+        for (method, path) in [
+            ("POST", "/api/sync"),
+            ("POST", "/api/live-hr"),
+            ("POST", "/api/feature"),
+            ("GET", "/api/ring-key"),
+            ("POST", "/api/ring-key"),
+        ] {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let req = format!(
+                "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://{addr}\r\n\r\n"
+            );
+            client.write_all(req.as_bytes()).await.unwrap();
+            let mut buf: Vec<u8> = Vec::new();
+            client.read_to_end(&mut buf).await.unwrap_or(0);
+            let text = String::from_utf8_lossy(&buf);
+            assert!(
+                text.starts_with("HTTP/1.1 404"),
+                "{method} {path} must 404, got: {}",
+                text.lines().next().unwrap_or_default()
+            );
+        }
+        let _ = manual_db;
+        server.abort();
     }
 }
 

@@ -1700,6 +1700,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "libc",
+ "oura-hub",
  "oura-import",
  "oura-link",
  "oura-manual",
@@ -1789,13 +1790,17 @@ dependencies = [
 name = "oura-hub"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "axum",
  "bytes",
- "clap",
  "fs2",
  "futures-util",
+ "hex",
  "http-body-util",
+ "libc",
+ "oura-protocol",
  "oura-protocol-v1",
+ "oura-store",
  "oura-summary",
  "rusqlite",
  "serde",
@@ -1858,8 +1863,11 @@ dependencies = [
 name = "oura-protocol-v1"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "hmac",
  "serde",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1877,6 +1885,8 @@ name = "oura-summary"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "chrono-tz",
  "oura-analysis",
  "oura-protocol",
  "oura-store",

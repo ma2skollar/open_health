@@ -50,10 +50,14 @@ fi
 msg_ok "Fetched Source"
 
 # ── Build ─────────────────────────────────────────────────────────────────────
-msg_info "Building oura-cli and oura-backup (this takes several minutes)"
+msg_info "Building oura-cli, oura-dashboard (no-BLE) and oura-backup (this takes several minutes)"
 cd "$SRC_DIR" || exit 1
+# Two invocations: features are per-invocation, not per-binary. The dashboard
+# server is built without the default `ble` feature so it links no btleplug,
+# BlueZ or D-Bus — an LXC with no Bluetooth adapter runs the same dashboard.
 $STD cargo build --release -p oura-cli -p oura-backup
-msg_ok "Built oura-cli and oura-backup"
+$STD cargo build --release -p oura-cli --no-default-features --bin oura-dashboard
+msg_ok "Built oura-cli, oura-dashboard and oura-backup"
 
 # ── Install ───────────────────────────────────────────────────────────────────
 msg_info "Installing Dashboard"
@@ -62,7 +66,7 @@ chmod +x ./deploy/install.sh ./deploy/health.sh 2>/dev/null || true
 # install.sh writes the units, then enables the dashboard; that start cannot
 # succeed while oura.env still holds __PLACEHOLDER__ paths, so its exit code is
 # not the signal here — the units are.
-bash ./deploy/install.sh --bin ./target/release/oura --backup-bin ./target/release/oura-backup || true
+bash ./deploy/install.sh --bin ./target/release/oura --dashboard-bin ./target/release/oura-dashboard --backup-bin ./target/release/oura-backup || true
 if [[ ! -f /etc/systemd/system/oura-dashboard.service ]]; then
   msg_error "install.sh did not install the systemd units"
   exit 1

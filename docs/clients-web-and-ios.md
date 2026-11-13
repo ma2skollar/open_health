@@ -241,6 +241,15 @@ has no `illness`) and the ring-clock warnings (`clock.warnings`). Still iOS-only
   Trends stop at the last observation, not at an empty current day. Stored values,
   server seven-entry means, and summary averages remain unchanged. This remains
   web-only because native iOS has no manual-metric surface.
+- **Collector management & device health** (Pi-readiness surface): the *Device & data
+  health* panel (`collector-status`/`device-panel` in `app.js`) renders `GET /api/status`'s
+  nested `ingest` state — raw/decoded revision, processing stage, stale summary, missing
+  models — with distinct empty states for "server up, no collector batch yet" vs. raw
+  data pending decode vs. analysis failure. **Deliberately web-only**: the Raspberry Pi
+  collector talks to the LXC backend over `POST /ingest/v1/batches` (HMAC-signed batches;
+  `crates/oura-protocol-v1/src/ingest.rs`), and its operational UI (sync/upload progress,
+  heartbeat age, buffer pressure) lives on the server dashboard, not in iOS, which has
+  no ingest backend to monitor. Web-only by design per `docs/PI-READINESS-TASKS.md` B6.
 - **One-page day view**: web shows Sleep, Activity and Heart rate on one scrolling page, every
   chart on one time axis (`dayAxis`) with a shared cursor (`dayCursor`), plus ‹ › / ← → to step
   through days with data; iOS `DayReportView` keeps tabs and reaches days via `AllDaysView`.

@@ -10,6 +10,8 @@ repository.workspace = true
 oura-protocol = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
 oura-store = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
 oura-analysis = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
+chrono = "0.4"
+chrono-tz = "0.10"
 serde_json = "1"
 anyhow = "1"
 rusqlite = "0.31"

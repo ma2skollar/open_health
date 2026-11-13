@@ -10,13 +10,20 @@ repository.workspace = true
 name = "oura"
 path = "src/main.rs"
 
+# Server-only binary: no BLE backend (btleplug/BlueZ/D-Bus) is linked, so an
+# LXC can run the dashboard with no Bluetooth adapter. The `oura` CLI keeps
+# the full BLE feature set.
+[[bin]]
+name = "oura-dashboard"
+path = "src/bin/dashboard_main.rs"
 [dependencies]
 oura-protocol = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
-oura-link = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
+oura-link = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781", optional = true }
 oura-store = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d3304c4084f0e1e703f3d84606bf10b781" }
 oura-summary = { path = "../oura-summary" }
 oura-manual = { path = "../oura-manual" }
 oura-import = { path = "../oura-import" }
+oura-hub = { path = "../oura-hub" }
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 tokio = { version = "1", features = ["full"] }
@@ -40,3 +47,9 @@ tch = { version = "=0.22.0", optional = true } # pinned to libtorch 2.9.0 (repo 
 #   export PATH="$PWD/.venv/bin:$PATH" LIBTORCH_USE_PYTORCH=1
 #   cargo run --features torch -- sessions --tz-offset 1
 torch = ["dep:tch"]
+
+# Local BLE backend (btleplug → BlueZ/D-Bus). Default-on so the `oura` CLI
+# keeps every existing ring command; `oura-dashboard` is built with
+# `--no-default-features` in packaging so no BLE backend is linked at all.
+ble = ["dep:oura-link"]
+default = ["ble"]

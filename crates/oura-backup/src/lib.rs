@@ -7,15 +7,24 @@
 //!
 //! A restore verifies before it replaces anything: it checks the manifest shape,
 //! every file's size and hash, and `PRAGMA integrity_check` on each copied
-//! database. Files are renamed into place, and a failure leaves the destination
-//! untouched. Nothing here ever deletes a backup.
+//! database. Restore requires all database users to be stopped; it refuses WAL,
+//! SHM and rollback-journal sidecars and stages every file before replacement.
+//! A multi-file rename is not crash-atomic: leave services stopped on failure.
 //!
-//! The manual database holds data that ring ingestion can never recreate, so
-//! restore it first — see `docs/OPERATIONS.md` for the ordering.
+//! Only SQLite database files belong here. Signing keys remain in an external
+//! permission-protected secret registry, recovered separately before ingestion
+//! resumes. Never put that registry, environment files or keys in this backup.
+//! Restoring the ring database installs a 600-second fail-closed replay holdoff.
+//! Early release requires explicit confirmation that old signing keys were
+//! revoked and replaced. Manual data is independent and is never a ring snapshot.
 
 #![forbid(unsafe_code)]
 
 use std::fs;
+use std::collections::HashSet;
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -29,6 +38,15 @@ pub const FORMAT_VERSION: u32 = 1;
 /// Manifest file name inside a backup directory.
 pub const MANIFEST: &str = "manifest.json";
 
+/// Fail-closed replay holdoff written into a restored ingest database.
+///
+/// Restore puts back pre-attack nonces, so fresh uploads are refused for this
+/// many seconds unless the hub is explicitly told otherwise. The hub checks
+/// `ingest_recovery(id=1).holdoff_until_unix`.
+pub const HOLDOFF_SECONDS: i64 = 600;
+
+/// Restore writes this table into a database that has ingest tables.
+pub const HOLDOFF_TABLE: &str = "ingest_recovery";
 /// Result alias for every fallible operation in this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -67,6 +85,14 @@ pub enum Error {
     },
     #[error("{path} already exists; pass --force to replace it")]
     DestinationExists { path: PathBuf },
+    #[error("{path} is not a SQLite database: {detail}")]
+    NotSqlite { path: PathBuf, detail: String },
+    #[error("active WAL detected, stop the server first: {path}")]
+    ActiveWal { path: PathBuf },
+    #[error("{path} is a symlink; restore refuses to write through it")]
+    Symlink { path: PathBuf },
+    #[error("replay holdoff could not be installed: {0}")]
+    Holdoff(String),
     #[error("no database was found to back up at {0}")]
     NoSources(PathBuf),
     #[error("{path} is not a backup directory: {detail}")]
@@ -74,7 +100,6 @@ pub enum Error {
     #[error("{0}")]
     Invalid(String),
 }
-
 /// One database inside a backup directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileEntry {
@@ -182,11 +207,44 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
+
+fn private_dir(path: &Path) -> Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    builder.mode(0o700);
+    builder.create(path).map_err(|e| io_err(path, e))?;
+    if fs::symlink_metadata(path).map_err(|e| io_err(path, e))?.file_type().is_symlink() {
+        return Err(Error::Invalid("backup/restore directory must not be a symlink".into()));
+    }
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|e| io_err(path, e))?;
+    Ok(())
+}
+
+fn private_file(path: &Path) -> Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path).map_err(|e| io_err(path, e))
+}
+
+fn validate_names<'a>(names: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut seen = HashSet::new();
+    for name in names {
+        if !matches!(name, "manual.db" | "oura.db") || !seen.insert(name) {
+            return Err(Error::Invalid("only unique manual.db and oura.db entries are allowed; recover secrets separately".into()));
+        }
+    }
+    Ok(())
+}
 /// Copy `src` into `dst` using the SQLite online backup API.
 ///
 /// A live database with a writer and an uncommitted WAL is captured
 /// consistently; a plain `fs::copy` of such a file would not be.
 fn copy_database(src: &Path, dst: &Path) -> Result<()> {
+    drop(private_file(dst)?);
     let source = Connection::open_with_flags(src, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(|e| sqlite_err(src, e))?;
     let mut target = Connection::open(dst).map_err(|e| sqlite_err(dst, e))?;
@@ -261,6 +319,7 @@ fn safe_label(label: &str) -> String {
 /// carries the creation time, so a second run in the same second is the only way
 /// to collide, and that fails loudly instead of merging.
 pub fn create(dest_root: &Path, sources: &[Source], label: &str) -> Result<PathBuf> {
+    validate_names(sources.iter().map(|source| source.name.as_str()))?;
     let existing: Vec<&Source> = sources.iter().filter(|s| s.path.is_file()).collect();
     if existing.is_empty() {
         let where_ = sources
@@ -271,13 +330,18 @@ pub fn create(dest_root: &Path, sources: &[Source], label: &str) -> Result<PathB
     }
 
     let created_unix = now_unix();
+    if existing.len() != sources.len() {
+        return Err(Error::Invalid("a requested database is missing; refusing an incomplete backup".into()));
+    }
     let dir = dest_root.join(format!("{}-{}", format_utc(created_unix), safe_label(label)));
     if dir.exists() {
         return Err(Error::DestinationExists { path: dir });
     }
     fs::create_dir_all(&dir).map_err(|e| io_err(&dir, e))?;
 
-    let mut files = Vec::new();
+    private_dir(dest_root)?;
+    private_dir(&dir)?;
+    let mut files: Vec<FileEntry> = Vec::new();
     for source in existing {
         let target = dir.join(&source.name);
         copy_database(&source.path, &target)?;
@@ -310,7 +374,9 @@ pub fn create(dest_root: &Path, sources: &[Source], label: &str) -> Result<PathB
     };
     let path = dir.join(MANIFEST);
     let json = serde_json::to_vec_pretty(&manifest).map_err(|e| Error::Invalid(e.to_string()))?;
-    fs::write(&path, json).map_err(|e| io_err(&path, e))?;
+    let mut file = private_file(&path)?;
+    file.write_all(&json).map_err(|e| io_err(&path, e))?;
+    file.sync_all().map_err(|e| io_err(&path, e))?;
 
     Ok(dir)
 }
@@ -338,6 +404,10 @@ pub fn read_manifest(dir: &Path) -> Result<Manifest> {
             found: manifest.format_version,
             supported: FORMAT_VERSION,
         });
+    }
+    validate_names(manifest.files.iter().map(|entry| entry.name.as_str()))?;
+    if manifest.files.is_empty() || manifest.format_version == 0 {
+        return Err(Error::Invalid("manifest has no databases or an invalid format".into()));
     }
     Ok(manifest)
 }
@@ -420,18 +490,42 @@ pub fn list(dest_root: &Path) -> Result<Vec<BackupEntry>> {
 
 /// Verify a backup, then replace the destination files with its contents.
 ///
-/// Without `force`, an existing destination file is refused. Each file is written
-/// to a temporary name in the destination directory and renamed into place, so a
-/// crash cannot leave a half-written database and a rejected restore leaves the
-/// previous file untouched.
+/// Without `force`, an existing destination file is refused. All preflight
+/// checks run before anything is written: the manifest names stay inside this
+/// crate's two known names, every source must have a live SQLite header
+/// (a truncated or non-SQLite file is refused, not trusted), and destination
+/// sidecars from a running server (`-wal`, `-shm`, `-journal`) abort the whole
+/// restore with "active WAL detected, stop the server first". Each file is
+/// copied to a temporary name in the destination directory and renamed into
+/// place, so a crash cannot leave a half-written database and a rejected
+/// restore leaves the previous file untouched. A restored ingest database
+/// also gets a fail-closed [`HOLDOFF_TABLE`] row before it can serve traffic.
 pub fn restore(dir: &Path, dest_dir: &Path, force: bool) -> Result<RestoreReport> {
     let report = verify(dir)?;
     let manifest = read_manifest(dir)?;
 
     for entry in &manifest.files {
+        // Path traversal guard: manifest names are already whitelisted by
+        // `validate_names`; refuse anything that still carries separators.
+        if entry.name.contains("..") || entry.name.contains('/') {
+            return Err(Error::Invalid("manifest names must be plain file names".into()));
+        }
+    }
+
+    for entry in &manifest.files {
+        let from = dir.join(&entry.name);
+        // A source that passes size, checksum and integrity must still start
+        // with a real SQLite header before it may replace a database.
+        check_sqlite_header(&from)?;
         let target = dest_dir.join(&entry.name);
         if target.exists() && !force {
             return Err(Error::DestinationExists { path: target });
+        }
+        if let Some(side) = active_wal_sidecar(&target) {
+            return Err(Error::ActiveWal { path: side });
+        }
+        if symlink(&target) || symlink(&dest_dir.join(format!(".{}.restoring", entry.name))) {
+            return Err(Error::Symlink { path: target });
         }
     }
 
@@ -443,18 +537,121 @@ pub fn restore(dir: &Path, dest_dir: &Path, force: bool) -> Result<RestoreReport
         let target = dest_dir.join(&entry.name);
         let temp = dest_dir.join(format!(".{}.restoring", entry.name));
         fs::copy(&from, &temp).map_err(|e| io_err(&temp, e))?;
-        // Rename is atomic within a directory: a reader sees the old file or the
-        // new one, never a partial write.
+        private_perms(&temp)?;
+        // Rename is atomic within a directory: a reader sees the old file or
+        // the new one, never a partial write.
         fs::rename(&temp, &target).map_err(|e| {
             let _ = fs::remove_file(&temp);
             io_err(&target, e)
         })?;
+        private_perms(&target)?;
+        if has_ingest_tables(&target)? {
+            install_holdoff(&target)?;
+        }
         restored.push(format!("{}: restored {} bytes", entry.name, entry.bytes));
     }
+    fsync_dir(dest_dir)?;
 
     debug_assert!(report.ok);
     Ok(RestoreReport {
         restored,
         created_unix: manifest.created_unix,
     })
+}
+
+/// The first 16 bytes of every SQLite database file, whatever its page size.
+const SQLITE_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// True when `path` is a symlink. Never follows it.
+fn symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// A destination sidecar that only a running writer leaves behind.
+fn active_wal_sidecar(target: &Path) -> Option<PathBuf> {
+    ["wal", "shm", "journal"]
+        .iter()
+        .map(|kind| PathBuf::from(format!("{}-{kind}", target.display())))
+        .find(|side| side.exists())
+}
+
+/// A real SQLite header at the start of the file, or an error naming it.
+fn check_sqlite_header(path: &Path) -> Result<()> {
+    let mut file = fs::File::open(path).map_err(|e| io_err(path, e))?;
+    let mut head = [0_u8; 16];
+    match file.read_exact(&mut head) {
+        Ok(()) => {}
+        Err(e) => return Err(Error::NotSqlite { path: path.to_path_buf(), detail: e.to_string() }),
+    }
+    if &head != SQLITE_HEADER {
+        return Err(Error::NotSqlite {
+            path: path.to_path_buf(),
+            detail: "missing SQLite format 3 header".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Owner-only permissions on a restored file, on platforms that have them.
+fn private_perms(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(path, perms).map_err(|e| io_err(path, e))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Flush the directory entry so a restored file survives a power cut.
+fn fsync_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let file = fs::File::open(path).map_err(|e| io_err(path, e))?;
+        file.sync_all().map_err(|e| io_err(path, e))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// True when a database carries the hub's ingest tables.
+fn has_ingest_tables(path: &Path) -> Result<bool> {
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| sqlite_err(path, e))?;
+    let found: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'ingest_nonces'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|e| sqlite_err(path, e))?;
+    Ok(found > 0)
+}
+
+/// Write the fail-closed replay holdoff row into a restored ingest database.
+///
+/// Upserting id=1 keeps one row across repeated restores; the hub reads
+/// `holdoff_until_unix` and refuses ingestion until the window passes.
+fn install_holdoff(path: &Path) -> Result<()> {
+    let conn = Connection::open(path).map_err(|e| sqlite_err(path, e))?;
+    conn.execute_batch(&format!(
+        "CREATE TABLE IF NOT EXISTS {HOLDOFF_TABLE} (
+             id INTEGER PRIMARY KEY CHECK(id = 1),
+             holdoff_until_unix INTEGER NOT NULL
+         );
+         INSERT INTO {HOLDOFF_TABLE}(id, holdoff_until_unix)
+             VALUES(1, {unix})
+             ON CONFLICT(id) DO UPDATE SET holdoff_until_unix = excluded.holdoff_until_unix;
+         PRAGMA wal_checkpoint(TRUNCATE);",
+        unix = now_unix() + HOLDOFF_SECONDS,
+    ))
+    .map_err(|e| Error::Holdoff(format!("{} on {}: {e}", HOLDOFF_TABLE, path.display())))?;
+    conn.close()
+        .map_err(|(_, e)| Error::Holdoff(format!("{} on {}: {e}", HOLDOFF_TABLE, path.display())))?;
+    Ok(())
 }

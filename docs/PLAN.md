@@ -72,6 +72,15 @@ verification.
 **Blocked** on Phase 7. Parallel run against the existing dashboard, security
 and restore review, explicit user approval before cutover or retirement.
 
+## Current Pi-readiness implementation backlog (2026-11-13)
+
+The audit follow-through is tracked in [PI-READINESS-TASKS.md](PI-READINESS-TASKS.md).
+It defines A1–A4 and B1–B7 with dependencies, acceptance evidence, risks and
+protected UI boundaries. Those tasks are queued, not completed by this planning request.
+C1–C3 are reserved for the user. D1–D3 are assigned to a separate Pi build agent
+workspace; pairing, reset, feature changes and infrastructure deployment remain gated.
+These audit labels are distinct from the historical D1–D8 handoff IDs below.
+
 ## Ownership (parallel work separation)
 
 | Area | Owner module(s) |
