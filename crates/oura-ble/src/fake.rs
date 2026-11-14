@@ -272,8 +272,8 @@ impl RingTransport for FakeRing {
         let events = match &state.history {
             Some(events) => events.iter().filter(|event| event.ring_timestamp >= cursor).cloned().collect(),
             None => vec![
-                HistoryEvent { tag: 0x43, ring_timestamp: cursor.saturating_add(1), body: b"demo-event-1".to_vec() },
-                HistoryEvent { tag: 0x43, ring_timestamp: cursor.saturating_add(2), body: b"demo-event-2".to_vec() },
+                HistoryEvent { tag: 0x43, ring_timestamp: cursor.saturating_add(1), body: b"demo-event-1".to_vec(), transport: None },
+                HistoryEvent { tag: 0x43, ring_timestamp: cursor.saturating_add(2), body: b"demo-event-2".to_vec(), transport: None },
             ],
         };
         let next_cursor = events.iter().map(|event| event.ring_timestamp.saturating_add(1)).max().unwrap_or(cursor).max(cursor);
@@ -394,7 +394,7 @@ mod tests {
         let (mut ring, handle) = FakeRing::new();
         ring.connect().await.unwrap();
         let batch = HistoryBatch {
-            events: vec![HistoryEvent { tag: 0x80, ring_timestamp: 12, body: vec![0, 255] }],
+            events: vec![HistoryEvent { tag: 0x80, ring_timestamp: 12, body: vec![0, 255], transport: None }],
             next_cursor: 13,
             complete: false,
         };

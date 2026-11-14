@@ -8,7 +8,7 @@ repository.workspace = true
 
 [features]
 default = []
-ble = ["dep:oura-link", "oura-link/ble", "dep:oura-protocol", "dep:tracing"]
+ble = ["dep:oura-link", "oura-link/ble", "dep:oura-protocol", "dep:tracing", "dep:dbus"]
 
 [dependencies]
 async-trait = "0.1"
@@ -21,6 +21,8 @@ oura-protocol = { git = "https://github.com/Th0rgal/open_oura", rev = "4f7957d33
 # Upstream request tracing includes authentication frames. Disable debug/trace
 # callsites at compile time, including when a caller installs a verbose subscriber.
 tracing = { version = "0.1", features = ["max_level_info", "release_max_level_info"], optional = true }
+# Build the Linux D-Bus client into the collector; no target sysroot is needed.
+dbus = { version = "0.9", features = ["vendored"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

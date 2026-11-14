@@ -1,0 +1,24 @@
+# No secrets belong in this file. Replace every CHANGE_ME placeholder.
+# Use registered, non-demo identifiers agreed with the ingest backend operator.
+device_id = "CHANGE_ME_DEVICE_ID"
+ring_name = "CHANGE_ME_RING_NAME"
+ring_key_file = "/etc/oura-collector/keys/ring.key"
+state_dir = "/var/lib/oura-collector"
+ingest_url = "https://change-me-host.invalid/ingest/v1/batches"
+key_id = "CHANGE_ME_KEY_ID"
+signing_key_file = "/etc/oura-collector/keys/signing.key"
+# Optional PEM trust anchor for your private LAN CA; verification remains enabled.
+# ca_certificate_file = "/etc/oura-collector/ingest-ca.pem"
+
+# Total physical SQLite DB + WAL + SHM budget; never evict unacknowledged data.
+max_storage_bytes = 1073741824
+min_free_bytes = 268435456
+# Transport limits apply before connecting. No truncated batch advances a cursor.
+history_max_events = 256
+history_max_bytes = 131072
+history_max_pages = 16
+collection_interval_secs = 300
+heartbeat_interval_secs = 900
+operation_timeout_secs = 30
+retry_min_secs = 5
+retry_max_secs = 900

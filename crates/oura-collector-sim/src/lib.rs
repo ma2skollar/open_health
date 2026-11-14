@@ -1,217 +1,110 @@
-//! Deterministic scenarios using the production collector and real D5 ingestion.
-//! Every scenario owns a private temporary demo namespace; no production paths
-//! are accepted by the simulator API or command-line program.
-mod hub;
+//! Synthetic credentials and temp stores only. No backend, Bluetooth or network.
+pub mod hub;
+use std::{sync::Arc, time::Duration};
+use oura_ble::{FakeRing, HistoryBatch, ScriptOutcome};
+use oura_collector::{Collector, CollectorError, Config, FakeClock, Clock, Outbox, delivery::sign_attempt};
+use hub::SyntheticSink;
 
-use hub::SimHub;
-use oura_ble::{FakeRing, FakeRingHandle, HistoryBatch, HistoryEvent, OperationTimeouts, ScriptOutcome};
-use oura_collector::{Clock, CollectorError, Config, Coordinator, FakeClock, LocalCommand, RingStore, SnapshotQueue};
-use std::sync::Arc;
-use std::time::Duration;
-use tempfile::TempDir;
+pub const SCENARIOS: &[&str] = &["history-only", "outage-restart", "uncertain-ack", "conflicting-receipt", "partial-drain", "disk-pressure", "nonce-rotation", "clock-gate", "key-permissions"];
 
-pub const SCENARIOS: &[&str] = &[
-    "normal-sync", "absent-backoff", "offline-recovery", "duplicate-delivery",
-    "stale-generation", "new-epoch", "incomplete-history", "live-stop",
-    "live-timeout", "live-disconnect", "live-shutdown", "busy-cancelled",
-    "expired-reconnect",
-];
-const START: i64 = 1_794_052_800; // fixed UTC instant, not wall-clock dependent
-
-type SimCollector = Coordinator<FakeRing>;
-
-struct Fixture {
-    config: Config,
-    clock: Arc<FakeClock>,
-    ring: FakeRingHandle,
-    collector: SimCollector,
-    hub: SimHub,
-    _sandbox: TempDir,
+pub fn synthetic_config(root: &std::path::Path) -> Config {
+    Config { device_id: "synthetic-device".into(), ring_name: "SYNTHETIC".into(), ring_key_file: root.join("unused-ring-key"), state_dir: root.join("state"), ingest_url: "https://localhost/ingest/v1/batches".into(), key_id: "synthetic-key".into(), signing_key_file: root.join("synthetic-signing-key"), ca_certificate_file: None, max_storage_bytes: 16 * 1024 * 1024, min_free_bytes: 0, history_max_events: 256, history_max_bytes: 128 * 1024, history_max_pages: 16, collection_interval_secs: 300, heartbeat_interval_secs: 900, operation_timeout_secs: 1, retry_min_secs: 5, retry_max_secs: 60 }
 }
-
-impl Fixture {
-    fn new() -> Result<Self, CollectorError> {
-        let sandbox = tempfile::Builder::new().prefix("oura-d6-demo-").tempdir()?;
-        let mut config = Config::demo(sandbox.path());
-        config.wake_start = "00:00".into();
-        config.wake_end = "23:59".into();
-        config.timezone = "UTC".into();
-        config.retry_min_secs = 2;
-        config.retry_max_secs = 16;
-        config.min_free_bytes = 0;
-        let clock = Arc::new(FakeClock::new(START));
-        let (transport, ring) = FakeRing::with_timeouts(OperationTimeouts {
-            operation: Duration::from_secs(60),
-            ..OperationTimeouts::default()
-        });
-        let collector = Coordinator::new(config.clone(), transport, clock.clone())?;
-        let hub = SimHub::new(&sandbox.path().join("simulated-hub"))?;
-        Ok(Self { _sandbox: sandbox, config, clock, ring, collector, hub })
-    }
-
-    async fn sync(&mut self) -> Result<(), CollectorError> {
-        self.collector.execute(LocalCommand::SyncNow).await?;
-        Ok(())
-    }
-
-    async fn deliver(&mut self) -> Result<usize, CollectorError> {
-        self.collector.queue_mut().deliver_due(&mut self.hub, self.clock.now_unix()).await
-    }
-
-    fn advance_retry(&self) {
-        self.clock.advance(Duration::from_secs(self.config.retry_max_secs + 1));
-    }
+fn credential(config: &Config) -> Result<(), CollectorError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(&config.signing_key_file, [0x5au8; 32])?;
+    std::fs::set_permissions(&config.signing_key_file, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
-
-/// Run a named scenario and return its complete deterministic evidence log.
-/// Assertions intentionally fail the process when a contract regresses.
 pub async fn run_scenario(name: &str) -> Result<String, CollectorError> {
-    if !SCENARIOS.contains(&name) {
-        return Err(CollectorError::Config(format!("unknown scenario: {name}")));
+    if !SCENARIOS.contains(&name) { return Err(CollectorError::Config); }
+    let sandbox = tempfile::tempdir()?;
+    let mut config = synthetic_config(sandbox.path());
+    credential(&config)?;
+    if name == "disk-pressure" { config.min_free_bytes = u64::MAX; }
+    let clock = Arc::new(FakeClock::new(1_700_000_000_000));
+    let (ring, trace) = FakeRing::new();
+    if name == "partial-drain" {
+        let event = serde_json::from_value(serde_json::json!({"tag":238,"ring_timestamp":12,"body":[0,255]}))?;
+        trace.push("drain_history", ScriptOutcome::PartialHistory(HistoryBatch { events: vec![event], next_cursor: 13, complete: false })).unwrap();
     }
-    let mut log = format!("identity: demo\nscenario: {name}\nclock: {START}\n");
+    let sink = SyntheticSink::default();
+    if name == "disk-pressure" {
+        assert!(matches!(Outbox::open(&config), Err(CollectorError::LowDisk)));
+        assert!(trace.calls().is_empty());
+        return Ok(format!("synthetic: {name} passed\n"));
+    }
+    let mut collector = Collector::new(config.clone(), ring, sink.clone(), clock.clone())?;
+    collector.collect_once().await?;
+    let cursor = collector.outbox.cursor()?;
+    let epoch = collector.outbox.epoch()?;
+    let pending = collector.outbox.next_pending(clock.now_unix_ms())?.unwrap();
+    let body = pending.body.clone();
     match name {
-        "normal-sync" => {
-            let mut f = Fixture::new()?;
-            f.sync().await?;
-            let count = f.collector.store().event_count()?;
-            assert_eq!(count, 2);
-            assert_eq!(f.collector.queue().pending().len(), 1);
-            assert_eq!(f.collector.queue().pending()[0].metadata.identity, oura_protocol_v1::Identity::Demo);
-            assert_eq!(f.deliver().await?, 1);
-            assert!(f.collector.queue().pending().is_empty());
-            let ack = &f.hub.acknowledgements[0];
-            assert!(ack.accepted);
-            assert!(!ack.duplicate);
-            log.push_str(&format!("history: {count} events committed\nsnapshot: generation {} identity demo\nupload: accepted generation {}\noutbox: 0 pending\n", ack.generation, ack.active_generation));
+        "outage-restart" | "uncertain-ack" => {
+            if name == "outage-restart" { sink.0.lock().unwrap().offline = true; }
+            else { sink.0.lock().unwrap().lose_next_ack = true; }
+            assert!(collector.upload_once().await.is_err());
+            assert_eq!(collector.outbox.stats()?.batches, 1);
+            drop(collector);
+            clock.advance(Duration::from_secs(120));
+            sink.0.lock().unwrap().offline = false;
+            let (ring, _) = FakeRing::new();
+            collector = Collector::new(config.clone(), ring, sink.clone(), clock.clone())?;
+            assert_eq!(collector.outbox.cursor()?, cursor);
+            assert_eq!(collector.outbox.epoch()?, epoch);
+            let retry = collector.outbox.next_pending(clock.now_unix_ms())?.unwrap();
+            assert_eq!(retry.body, body);
+            assert_eq!(retry.attempts, 1);
+            assert!(collector.upload_once().await?);
+            assert_eq!(sink.0.lock().unwrap().receipts.len(), 1);
+            assert_eq!(sink.0.lock().unwrap().rows.len(), pending.batch.events.len());
         }
-        "absent-backoff" => {
-            let mut f = Fixture::new()?;
-            f.ring.push("connect", ScriptOutcome::Absent).unwrap();
-            assert!(f.collector.tick().await.is_err());
-            let first_calls = f.ring.calls().len();
-            assert!(f.collector.tick().await?.is_none());
-            assert_eq!(f.ring.calls().len(), first_calls);
-            f.advance_retry();
-            assert!(f.collector.tick().await?.is_some());
-            assert_eq!(f.collector.store().event_count()?, 2);
-            log.push_str("ring: absent\nscheduler: next run persisted; no scan before backoff\nclock: advanced without wall-clock sleep\nring: recovered; history committed\n");
+        "conflicting-receipt" => {
+            sink.0.lock().unwrap().conflicting_ack = true;
+            assert!(collector.upload_once().await.is_err());
+            assert_eq!(collector.outbox.stats()?.batches, 1);
+            assert_eq!(collector.outbox.receipt_count()?, 0);
         }
-        "offline-recovery" => {
-            let mut f = Fixture::new()?;
-            f.hub.online = false;
-            f.sync().await?;
-            let _ = f.deliver().await;
-            assert_eq!(f.collector.queue().pending().len(), 1);
-            f.advance_retry();
-            f.sync().await?;
-            let _ = f.deliver().await;
-            assert_eq!(f.collector.queue().pending().len(), 2);
-            for _ in 0..=f.config.max_attempts {
-                f.advance_retry();
-                let _ = f.deliver().await;
-                assert_eq!(f.collector.queue().pending().len(), 2);
-            }
-            let mut restarted = SnapshotQueue::open(&f.config)?;
-            assert_eq!(restarted.pending().len(), 2);
-            f.hub.online = true;
-            f.advance_retry();
-            let delivered = restarted.deliver_due(&mut f.hub, f.clock.now_unix()).await
-                .map_err(|error| CollectorError::Delivery(format!("{error}; hub_rejections={:?}", f.hub.rejections)))?;
-            assert_eq!(delivered, 2);
-            assert!(restarted.pending().is_empty());
-            log.push_str("server: offline beyond reconnect-attempt limit\noutbox: 2 snapshots durably buffered\nreboot: queue recovered\nserver: online\nupload: both snapshots accepted\noutbox: 0 pending; nothing discarded\n");
+        "partial-drain" => {
+            assert_eq!(cursor, 13);
+            drop(collector);
+            let reopened = Outbox::open(&config)?;
+            assert_eq!(reopened.cursor()?, 13);
+            assert_eq!(reopened.next_pending(clock.now_unix_ms())?.unwrap().body, body);
+            return Ok(format!("synthetic: {name} passed\n"));
         }
-        "duplicate-delivery" => {
-            let mut f = Fixture::new()?;
-            f.sync().await?;
-            f.hub.lose_next_ack = true;
-            let _ = f.deliver().await;
-            assert_eq!(f.collector.queue().pending().len(), 1);
-            f.advance_retry();
-            assert_eq!(f.deliver().await?, 1);
-            assert_eq!(f.hub.acknowledgements.len(), 2);
-            assert!(f.hub.acknowledgements[1].duplicate);
-            log.push_str("upload: durably accepted; response lost\nretry: identical generation\nhub: duplicate acknowledged; active data unchanged\noutbox: 0 pending\n");
+        "nonce-rotation" => {
+            let first = sign_attempt(&config, &pending, clock.as_ref(), [1; 16])?;
+            let second = sign_attempt(&config, &pending, clock.as_ref(), [2; 16])?;
+            assert_ne!(first.fields.nonce, second.fields.nonce);
+            assert_ne!(first.signature, second.signature);
+            assert_eq!(first.fields.body_sha256, second.fields.body_sha256);
+            std::fs::write(&config.signing_key_file, [0x33; 32])?;
+            let rotated = sign_attempt(&config, &pending, clock.as_ref(), [2; 16])?;
+            assert_ne!(rotated.signature, second.signature);
         }
-        "stale-generation" => {
-            let mut f = Fixture::new()?;
-            f.sync().await?;
-            f.sync().await?;
-            let entries = f.collector.queue().pending();
-            let old = entries[0].clone();
-            let newer = entries[1].clone();
-            let ack = f.hub.ingest(newer.metadata.clone(), &newer.path)?;
-            assert_eq!(ack.active_generation, newer.metadata.generation);
-            let error = f.hub.ingest(old.metadata, &old.path).unwrap_err();
-            assert!(error.to_string().contains("stale_generation"));
-            assert_eq!(f.collector.queue().pending().len(), 2);
-            log.push_str("hub: newer generation activated\nolder upload: stale_generation rejected\nactive generation: unchanged\noutbox: rejected snapshot retained for operator review\n");
+        "clock-gate" => {
+            clock.set_synchronized(false);
+            assert!(matches!(collector.upload_once().await, Err(CollectorError::Clock)));
+            assert_eq!(collector.outbox.stats()?.batches, 1);
         }
-        "new-epoch" => {
-            let mut f = Fixture::new()?;
-            f.sync().await?;
-            assert_eq!(f.deliver().await?, 1);
-            let old_path = f.hub.hub.active_path(&f.config.collector_id).map_err(|e| CollectorError::Delivery(e.to_string()))?.unwrap();
-            let mut reprovisioned = f.config.clone();
-            reprovisioned.epoch = "reprovisioned-demo-epoch".into();
-            let mut queue = SnapshotQueue::open(&reprovisioned)?;
-            let metadata = queue.create_snapshot(f.collector.store(), f.clock.now_unix())?;
-            assert_eq!(metadata.generation, 1);
-            let entry = &queue.pending()[0];
-            let ack = f.hub.ingest(entry.metadata.clone(), &entry.path)?;
-            assert!(ack.accepted);
-            assert_eq!(ack.message, "pending_review");
-            queue.create_snapshot(f.collector.store(), f.clock.now_unix())?;
-            let newest = queue.create_snapshot(f.collector.store(), f.clock.now_unix())?;
-            assert_eq!(queue.deliver_due(&mut f.hub, f.clock.now_unix()).await?, 3);
-            assert!(queue.pending().is_empty());
-            assert!(f.hub.acknowledgements.last().unwrap().generation > ack.active_generation);
-            assert_eq!(f.hub.hub.active_path(&f.config.collector_id).map_err(|e| CollectorError::Delivery(e.to_string()))?.unwrap(), old_path);
-            let promoted = f.hub.hub.accept_epoch(&f.config.collector_id, &reprovisioned.epoch).map_err(|e| CollectorError::Delivery(e.to_string()))?;
-            assert!(promoted.accepted);
-            assert_eq!(promoted.active_generation, newest.generation);
-            assert_ne!(f.hub.hub.active_path(&f.config.collector_id).map_err(|e| CollectorError::Delivery(e.to_string()))?.unwrap(), old_path);
-            log.push_str("collector: new epoch; generation restarted at 1\nhub: pending_review; old active generation retained\noperator: explicit continuity promotion\n");
+        "key-permissions" => {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&config.signing_key_file, std::fs::Permissions::from_mode(0o644))?;
+            assert!(matches!(sign_attempt(&config, &pending, clock.as_ref(), [1; 16]), Err(CollectorError::Permissions)));
         }
-        "incomplete-history" => {
-            let mut f = Fixture::new()?;
-            f.ring.push("drain_history", ScriptOutcome::PartialHistory(HistoryBatch {
-                events: vec![HistoryEvent { tag: 1, ring_timestamp: 1, body: vec![1] }],
-                next_cursor: 1, complete: false,
-            })).unwrap();
-            let result = f.collector.execute(LocalCommand::SyncNow).await;
-            assert_eq!(f.collector.store().event_count()?, 1);
-            assert_eq!(f.collector.store().cursor()?, 0);
-            assert!(!f.collector.queue().pending().is_empty());
-            drop(result); // partial progress is reported, never rolled back or presented as complete
-            f.sync().await?;
-            assert!(f.collector.store().event_count()? >= 2);
-            log.push_str("history: incomplete batch\npartial progress: committed with durable snapshot; cursor unchanged\nrecovery: safely replayed from last complete cursor\n");
+        "history-only" => {
+            assert_eq!(trace.calls(), vec!["connect", "device_info", "battery", "drain_history", "disconnect"]);
+            assert!(collector.upload_once().await?);
+            let first_id = pending.batch.events.last().unwrap().source_row_id;
+            collector.collect_once().await?;
+            let next = collector.outbox.next_pending(clock.now_unix_ms())?.unwrap();
+            assert!(next.batch.events[0].source_row_id > first_id);
+            assert_eq!(collector.outbox.epoch()?, epoch);
+            assert!(next.batch.events.iter().all(|e| e.clock_anchor.is_none()));
         }
-        other => {
-            log.push_str(&runtime_scenario(other).await?);
-        }
+        _ => unreachable!(),
     }
-    log.push_str("result: PASS\n");
-    Ok(log)
+    Ok(format!("synthetic: {name} passed\n"))
 }
-
-/// Reset a freshly owned demo namespace. No external root or production path
-/// can enter this API; Config also validates ownership before deleting files.
-pub fn reset_demo() -> Result<String, CollectorError> {
-    let sandbox = tempfile::Builder::new().prefix("oura-d6-demo-reset-").tempdir()?;
-    let config = Config::demo(sandbox.path());
-    config.prepare_state()?;
-    let store = RingStore::open(&config.database_path)?;
-    drop(store);
-    config.reset_demo()?;
-    assert!(!config.database_path.exists());
-    Ok("identity: demo\nreset: private simulator sandbox only\nproduction paths: not accepted\nresult: PASS\n".into())
-}
-
-async fn runtime_scenario(name: &str) -> Result<String, CollectorError> {
-    crate::runtime::run(name).await
-}
-
-mod runtime;

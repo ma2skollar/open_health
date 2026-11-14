@@ -1,69 +1,62 @@
-#[cfg(feature = "ble")]
+use oura_collector::{CollectorError, Config};
+
+const USAGE: &str = "Usage: oura-collector --help | --version | validate CONFIG.toml | run CONFIG.toml\n\nvalidate reads configuration only. run explicitly starts history-only collection.\nNo provisioning, pairing, feature mutation, reset or live-HR commands exist.";
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    use oura_ble::{BleOptions, BleRing, OperationTimeouts};
-    use oura_collector::{control::run_control, delivery::HttpUploadSink, CollectorError, Config, Coordinator, SystemClock};
-    use oura_protocol_v1::Identity;
-    use std::sync::Arc;
-    use tokio_util::sync::CancellationToken;
-
-    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
-    if arguments.len() != 1 {
-        return Err("usage: oura-collector CONFIG.toml".into());
+async fn main() -> std::process::ExitCode {
+    match execute().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => { eprintln!("{}", error.code()); std::process::ExitCode::FAILURE }
     }
-    let config = Config::load(std::path::Path::new(&arguments[0]))?;
-    if config.identity != Identity::Production {
-        return Err("real collector requires production identity; use oura-collector-sim for demo".into());
-    }
-    let options = BleOptions {
-        ring_name: config.ring_name.clone(),
-        timeouts: OperationTimeouts::default(),
-        ..BleOptions::default()
-    };
-    let ring = BleRing::from_key_file(options, &config.key_file)
-        .map_err(|error| CollectorError::Config(error.to_string()))?;
-    let sink = HttpUploadSink::new(&config)?;
-    let clock = Arc::new(SystemClock);
-    let coordinator = Coordinator::new(config.clone(), ring, clock.clone())?;
-    let (handle, mut actor) = coordinator.spawn_with_delivery(sink);
-    let shutdown = CancellationToken::new();
-    let control = tokio::spawn(run_control(config, clock, handle.clone(), shutdown.clone()));
-    println!("identity: production");
-    let actor_result = tokio::select! {
-        signal = shutdown_signal() => {
-            shutdown.cancel();
-            let stopped = handle.shutdown().await;
-            let joined = actor.await?;
-            signal?;
-            stopped?;
-            joined
-        }
-        result = &mut actor => {
-            shutdown.cancel();
-            result?
-        }
-    };
-    shutdown.cancel();
-    control.await??;
-    actor_result?;
-    Ok(())
 }
+async fn execute() -> Result<(), CollectorError> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    match args.as_slice() {
+        [arg] if arg == "--help" || arg == "-h" => { println!("{USAGE}"); Ok(()) }
+        [arg] if arg == "--version" => { println!("oura-collector {}", oura_collector::COLLECTOR_BUILD); Ok(()) }
+        [command, path] if command == "validate" => {
+            Config::load(std::path::Path::new(path))?;
+            println!("config_valid");
+            Ok(())
+        }
+        [command, path] if command == "run" => run(Config::load(std::path::Path::new(path))?).await,
+        _ => { eprintln!("{USAGE}"); Err(CollectorError::Config) }
+    }
+}
+#[cfg(not(feature = "ble"))]
+async fn run(_: Config) -> Result<(), CollectorError> { Err(CollectorError::Config) }
 
 #[cfg(feature = "ble")]
-async fn shutdown_signal() -> std::io::Result<()> {
+async fn run(config: Config) -> Result<(), CollectorError> {
+    use std::{sync::Arc, time::Duration};
+    use oura_ble::{BleOptions, BleRing};
+    use oura_collector::{Collector, SystemClock, delivery::HttpUploadSink};
+    let mut options = BleOptions::default();
+    options.ring_name = config.ring_name.clone();
+    options.history_max_events = config.history_max_events;
+    options.history_max_bytes = config.history_max_bytes;
+    options.history_max_pages = config.history_max_pages;
+    options.timeouts.connect = Duration::from_secs(config.operation_timeout_secs);
+    options.timeouts.operation = Duration::from_secs(config.operation_timeout_secs);
+    options.timeouts.history = Duration::from_secs(config.operation_timeout_secs);
+    let ring = BleRing::from_key_file(options, &config.ring_key_file).map_err(|_| CollectorError::Key)?;
+    let clock = Arc::new(SystemClock);
+    let sink = HttpUploadSink::new(&config, clock.clone())?;
+    let mut collector = Collector::new(config, ring, sink, clock)?;
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     #[cfg(unix)]
-    {
-        let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    loop {
+        #[cfg(unix)]
+        let stopping = async { tokio::select! { _ = tokio::signal::ctrl_c() => (), _ = terminate.recv() => () } };
+        #[cfg(not(unix))]
+        let stopping = async { let _ = tokio::signal::ctrl_c().await; };
         tokio::select! {
-            result = tokio::signal::ctrl_c() => result,
-            _ = terminate.recv() => Ok(()),
+            _ = stopping => break,
+            result = async { interval.tick().await; collector.tick().await } => result?,
         }
     }
-    #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await
-}
-
-#[cfg(not(feature = "ble"))]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    Err("real collector requires --features ble; use oura-collector-sim for Bluetooth-free scenarios".into())
+    collector.disconnect().await;
+    Ok(())
 }

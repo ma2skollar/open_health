@@ -1,0 +1,49 @@
+[Unit]
+Description=Open Health history-only raw ring collector
+Documentation=file:/usr/share/doc/oura-collector/pi-collector.md
+Wants=network-online.target time-sync.target
+After=network-online.target bluetooth.service dbus.service time-sync.target
+Requires=bluetooth.service dbus.service
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=oura-collector
+Group=oura-collector
+SupplementaryGroups=bluetooth
+ExecStart=/usr/local/bin/oura-collector run /etc/oura-collector/collector.toml
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=45
+UMask=0077
+StateDirectory=oura-collector
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/oura-collector
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+ReadWritePaths=/var/lib/oura-collector
+# Do not set ProtectClock: the read-only adjtimex synchronization check needs it.
+StandardOutput=journal
+StandardError=journal
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=20
+
+[Install]
+WantedBy=multi-user.target

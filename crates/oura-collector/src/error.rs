@@ -1,27 +1,63 @@
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+/// Display and Debug contain only safe codes, never paths, payloads or credentials.
+#[derive(Error)]
 pub enum CollectorError {
-    #[error("collector I/O failed: {0}")]
+    #[error("io_failed")]
     Io(#[from] std::io::Error),
-    #[error("collector SQLite operation failed: {0}")]
+    #[error("sqlite_failed")]
     Sqlite(#[from] rusqlite::Error),
-    #[error("collector state JSON failed: {0}")]
+    #[error("json_failed")]
     Json(#[from] serde_json::Error),
-    #[error("invalid collector configuration: {0}")]
-    Config(String),
-    #[error("ring operation failed: {0}")]
-    Ring(#[from] oura_ble::RingError),
-    #[error("outbox is full; pending snapshots retained")]
-    OutboxFull,
-    #[error("disk reserve reached; pending snapshots retained")]
-    LowDisk,
-    #[error("snapshot delivery failed: {0}")]
-    Delivery(String),
-    #[error("control protocol failed: {0}")]
-    Protocol(String),
-    #[error("collector is busy")]
+    #[error("config_invalid")]
+    Config,
+    #[error("key_permissions")]
+    Permissions,
+    #[error("key_invalid")]
+    Key,
+    #[error("state_busy")]
     Busy,
-    #[error("collector command was cancelled")]
-    Cancelled,
+    #[error("state_invalid")]
+    State,
+    #[error("outbox_pressure")]
+    OutboxFull,
+    #[error("disk_reserve")]
+    LowDisk,
+    #[error("clock_unsynchronized")]
+    Clock,
+    #[error("upload_failed")]
+    Delivery,
+    #[error("ack_invalid")]
+    Ack,
+    #[error("contract_invalid")]
+    Contract,
+    #[error("cursor_regression")]
+    CursorRegression,
+    #[error("history_limit")]
+    HistoryLimit,
+    #[error("ring_failed")]
+    Ring(#[from] oura_ble::RingError),
+    #[error("operation_timeout")]
+    Timeout,
+}
+
+impl CollectorError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Io(_) => "io_failed", Self::Sqlite(_) => "sqlite_failed", Self::Json(_) => "json_failed",
+            Self::Config => "config_invalid", Self::Permissions => "key_permissions", Self::Key => "key_invalid",
+            Self::Busy => "state_busy", Self::State => "state_invalid", Self::OutboxFull => "outbox_pressure",
+            Self::LowDisk => "disk_reserve", Self::Clock => "clock_unsynchronized", Self::Delivery => "upload_failed",
+            Self::Ack => "ack_invalid", Self::Contract => "contract_invalid", Self::CursorRegression => "cursor_regression",
+            Self::Ring(oura_ble::RingError::HistoryLimit) => "history_limit",
+            Self::Ring(oura_ble::RingError::CursorRegression) => "cursor_regression",
+            Self::HistoryLimit => "history_limit", Self::Ring(_) => "ring_failed", Self::Timeout => "operation_timeout",
+        }
+    }
+}
+
+impl std::fmt::Debug for CollectorError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.code())
+    }
 }

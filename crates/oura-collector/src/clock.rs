@@ -1,61 +1,42 @@
-//! Wall-clock boundary shared by real collection and deterministic scenarios.
+use std::{sync::{Arc, atomic::{AtomicBool, AtomicI64, Ordering}}, time::{Duration, SystemTime, UNIX_EPOCH}};
 
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-
-use async_trait::async_trait;
-
-#[async_trait]
 pub trait Clock: Send + Sync {
-    fn now_unix(&self) -> i64;
-    async fn sleep(&self, duration: Duration);
+    fn now_unix_ms(&self) -> i64;
+    fn synchronized(&self) -> bool;
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Default)]
 pub struct SystemClock;
-
-#[async_trait]
 impl Clock for SystemClock {
-    fn now_unix(&self) -> i64 {
-        match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(duration) => i64::try_from(duration.as_secs()).unwrap_or(i64::MAX),
-            Err(error) => -i64::try_from(error.duration().as_secs()).unwrap_or(i64::MAX),
-        }
+    fn now_unix_ms(&self) -> i64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).ok()
+            .and_then(|d| i64::try_from(d.as_millis()).ok()).unwrap_or(-1)
     }
-
-    async fn sleep(&self, duration: Duration) { tokio::time::sleep(duration).await; }
+    fn synchronized(&self) -> bool { os_synchronized() }
 }
 
-#[derive(Clone, Debug)]
+#[cfg(target_os = "linux")]
+fn os_synchronized() -> bool {
+    // modes=0 only queries the kernel clock. It does not change OS time.
+    let mut state: libc::timex = unsafe { std::mem::zeroed() };
+    let result = unsafe { libc::adjtimex(&mut state) };
+    result >= 0 && result != libc::TIME_ERROR && state.status & libc::STA_UNSYNC == 0
+}
+#[cfg(not(target_os = "linux"))]
+fn os_synchronized() -> bool { false }
+
+/// Explicit synthetic clock; never selected by production configuration or CLI.
+#[derive(Clone)]
 pub struct FakeClock {
-    instant: Arc<Mutex<(i64, u32)>>,
+    now: Arc<AtomicI64>,
+    synced: Arc<AtomicBool>,
 }
-
 impl FakeClock {
-    pub fn new(unix: i64) -> Self { Self { instant: Arc::new(Mutex::new((unix, 0))) } }
-
-    /// Advance without wall time, retaining subsecond sleep precision.
-    pub fn advance(&self, duration: Duration) {
-        let mut instant = self.instant.lock().unwrap_or_else(|error| error.into_inner());
-        let nanos = instant.1 as u64 + duration.subsec_nanos() as u64;
-        instant.0 = instant.0.saturating_add(i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
-            .saturating_add((nanos / 1_000_000_000) as i64);
-        instant.1 = (nanos % 1_000_000_000) as u32;
-    }
-
-    pub fn set(&self, unix: i64) {
-        *self.instant.lock().unwrap_or_else(|error| error.into_inner()) = (unix, 0);
-    }
+    pub fn new(unix_ms: i64) -> Self { Self { now: Arc::new(AtomicI64::new(unix_ms)), synced: Arc::new(AtomicBool::new(true)) } }
+    pub fn advance(&self, duration: Duration) { self.now.fetch_add(duration.as_millis() as i64, Ordering::SeqCst); }
+    pub fn set_synchronized(&self, value: bool) { self.synced.store(value, Ordering::SeqCst); }
 }
-
-#[async_trait]
 impl Clock for FakeClock {
-    fn now_unix(&self) -> i64 {
-        self.instant.lock().unwrap_or_else(|error| error.into_inner()).0
-    }
-
-    async fn sleep(&self, duration: Duration) {
-        self.advance(duration);
-        tokio::task::yield_now().await;
-    }
+    fn now_unix_ms(&self) -> i64 { self.now.load(Ordering::SeqCst) }
+    fn synchronized(&self) -> bool { self.synced.load(Ordering::SeqCst) }
 }

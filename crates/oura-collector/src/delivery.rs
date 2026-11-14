@@ -1,125 +1,104 @@
-//! Authenticated raw-SQLite upload. No multipart or ring secrets cross this boundary.
-
-use std::path::Path;
-use std::time::Duration;
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use futures_util::stream;
-use oura_protocol_v1::{UploadAck, UploadMetadata, PROTOCOL_VERSION};
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE};
-use tokio::io::AsyncReadExt;
+use oura_protocol_v1::ingest::{self, Ack, SigningFields};
+use rand::RngCore;
 
-use crate::config::check_secret_file;
-use crate::{CollectorError, Config};
+use crate::{clock::Clock, config::load_signing_key, storage::PendingBatch, CollectorError, Config};
+
+const ACK_LIMIT: usize = 16 * 1024;
 
 #[async_trait]
 pub trait UploadSink: Send {
-    async fn upload(&mut self, metadata: &UploadMetadata, path: &Path) -> Result<UploadAck, CollectorError>;
+    async fn upload(&mut self, batch: &PendingBatch) -> Result<Ack, CollectorError>;
 }
 
-// Intentionally not Debug: request defaults contain the bearer credential.
+/// Fresh signing material is made only for transmission. It is never stored in
+/// the outbox. This type deliberately has no Debug implementation.
+pub struct SignedAttempt {
+    pub fields: SigningFields,
+    pub signature: String,
+}
+
+pub fn sign_attempt(config: &Config, pending: &PendingBatch, clock: &dyn Clock, nonce: [u8; 16]) -> Result<SignedAttempt, CollectorError> {
+    let now = clock.now_unix_ms();
+    if !clock.synchronized() || now < 0 { return Err(CollectorError::Clock); }
+    let key = load_signing_key(&config.signing_key_file)?;
+    let fields = SigningFields { key_id: config.key_id.clone(), device_id: pending.batch.device_id.clone(),
+        timestamp: now / 1000, nonce: hex::encode(nonce), body_sha256: ingest::body_hash(&pending.body) };
+    let signature = fields.sign(key.as_ref()).map_err(|_| CollectorError::Contract)?;
+    Ok(SignedAttempt { fields, signature })
+}
+
 pub struct HttpUploadSink {
     client: reqwest::Client,
     endpoint: reqwest::Url,
+    config: Config,
+    clock: Arc<dyn Clock>,
 }
 
 impl HttpUploadSink {
-    pub fn new(config: &Config) -> Result<Self, CollectorError> { Self::build(config, None) }
-
-    /// Add an operator CA while retaining certificate and hostname verification.
-    pub fn with_ca_certificate(config: &Config, pem: &[u8]) -> Result<Self, CollectorError> {
-        let certificate = reqwest::Certificate::from_pem(pem)
-            .map_err(|_| CollectorError::Config("invalid hub CA certificate".into()))?;
-        Self::build(config, Some(certificate))
-    }
-
-    fn build(config: &Config, certificate: Option<reqwest::Certificate>) -> Result<Self, CollectorError> {
+    pub fn new(config: &Config, clock: Arc<dyn Clock>) -> Result<Self, CollectorError> {
         config.validate()?;
-        check_secret_file(&config.token_file)?;
-        let token = std::fs::read_to_string(&config.token_file)?;
-        let token = token.trim();
-        if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
-            return Err(CollectorError::Config("collector token must contain printable non-whitespace ASCII".into()));
-        }
-        let mut authorization = HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| CollectorError::Config("invalid collector credential".into()))?;
-        authorization.set_sensitive(true);
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, authorization);
         let mut builder = reqwest::Client::builder()
-            .default_headers(headers)
             .connect_timeout(Duration::from_secs(10))
             .read_timeout(Duration::from_secs(30))
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
-            // Collector credentials must not be handed to an ambient proxy.
-            .no_proxy()
+            .no_proxy().no_gzip().no_brotli().no_deflate().no_zstd()
             .min_tls_version(reqwest::tls::Version::TLS_1_2);
-        if let Some(certificate) = certificate { builder = builder.add_root_certificate(certificate); }
-        let client = builder.build().map_err(|_| CollectorError::Delivery("HTTP client initialization failed".into()))?;
-        let mut endpoint = reqwest::Url::parse(&config.hub_url)
-            .map_err(|_| CollectorError::Config("invalid hub URL".into()))?;
-        endpoint.set_path("/api/v1/collector/snapshot");
-        Ok(Self { client, endpoint })
+        if let Some(path) = &config.ca_certificate_file {
+            let pem = read_ca(path)?;
+            let cert = reqwest::Certificate::from_pem(&pem).map_err(|_| CollectorError::Config)?;
+            builder = builder.add_root_certificate(cert);
+        }
+        let client = builder.build().map_err(|_| CollectorError::Delivery)?;
+        let endpoint = reqwest::Url::parse(&config.ingest_url).map_err(|_| CollectorError::Config)?;
+        Ok(Self { client, endpoint, config: config.clone(), clock })
     }
+}
+
+fn read_ca(path: &PathBuf) -> Result<Vec<u8>, CollectorError> {
+    use std::io::Read;
+    crate::config::no_symlinks(path)?;
+    let file = std::fs::File::open(path)?;
+    if !file.metadata()?.is_file() || file.metadata()?.len() > 1024 * 1024 { return Err(CollectorError::Config); }
+    let mut bytes = Vec::new();
+    file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > 1024 * 1024 { return Err(CollectorError::Config); }
+    Ok(bytes)
 }
 
 #[async_trait]
 impl UploadSink for HttpUploadSink {
-    async fn upload(&mut self, metadata: &UploadMetadata, path: &Path) -> Result<UploadAck, CollectorError> {
-        if metadata.protocol_version != PROTOCOL_VERSION {
-            return Err(CollectorError::Protocol("unsupported outgoing upload protocol".into()));
-        }
-        let encoded = serde_json::to_string(metadata)?;
-        if encoded.len() > 16 * 1024 {
-            return Err(CollectorError::Protocol("upload metadata exceeds header limit".into()));
-        }
-        let metadata_header = HeaderValue::from_str(&encoded)
-            .map_err(|_| CollectorError::Protocol("upload metadata is not HTTP-header-safe".into()))?;
-        let file = tokio::fs::File::open(path).await?;
-        if file.metadata().await?.len() != metadata.size_bytes {
-            return Err(CollectorError::Protocol("snapshot size changed before upload".into()));
-        }
-        let body = stream::try_unfold((file, metadata.size_bytes), |(mut file, remaining)| async move {
-            if remaining == 0 { return Ok::<_, std::io::Error>(None); }
-            let mut buffer = vec![0u8; remaining.min(64 * 1024) as usize];
-            let count = file.read(&mut buffer).await?;
-            if count == 0 {
-                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "snapshot truncated during upload"));
-            }
-            buffer.truncate(count);
-            Ok(Some((buffer, (file, remaining - count as u64))))
-        });
+    async fn upload(&mut self, pending: &PendingBatch) -> Result<Ack, CollectorError> {
+        let mut nonce = [0u8; 16];
+        rand::rngs::OsRng.try_fill_bytes(&mut nonce).map_err(|_| CollectorError::Delivery)?;
+        // Re-read the active key file for every attempt, including retries.
+        let signed = sign_attempt(&self.config, pending, self.clock.as_ref(), nonce)?;
+        let fields = signed.fields;
         let mut response = self.client.post(self.endpoint.clone())
-            .header(CONTENT_TYPE, "application/vnd.sqlite3")
-            .header(CONTENT_LENGTH, metadata.size_bytes)
-            .header("X-Oura-Metadata", metadata_header)
-            .body(reqwest::Body::wrap_stream(body))
-            .send().await.map_err(|_| CollectorError::Delivery("snapshot request failed".into()))?;
-        if !response.status().is_success() {
-            // Never include response bodies, request headers or URL credentials in errors.
-            let message = format!("snapshot rejected with HTTP {}", response.status().as_u16());
-            return Err(if response.status().is_client_error() && !matches!(response.status().as_u16(), 408 | 429) {
-                CollectorError::Protocol(message)
-            } else { CollectorError::Delivery(message) });
+            .header(reqwest::header::CONTENT_TYPE, ingest::CONTENT_TYPE)
+            .header(reqwest::header::ACCEPT, ingest::CONTENT_TYPE)
+            .header(ingest::HEADER_KEY_ID, fields.key_id)
+            .header(ingest::HEADER_DEVICE_ID, fields.device_id)
+            .header(ingest::HEADER_TIMESTAMP, fields.timestamp.to_string())
+            .header(ingest::HEADER_NONCE, fields.nonce)
+            .header(ingest::HEADER_BODY_SHA256, fields.body_sha256)
+            .header(ingest::HEADER_SIGNATURE, signed.signature)
+            .body(pending.body.clone()).send().await.map_err(|_| CollectorError::Delivery)?;
+        if !response.status().is_success() || response.headers().contains_key(reqwest::header::CONTENT_ENCODING)
+            || response.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) != Some(ingest::CONTENT_TYPE)
+            || response.content_length().is_some_and(|n| n > ACK_LIMIT as u64) {
+            return Err(CollectorError::Delivery);
         }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| CollectorError::Delivery("snapshot acknowledgement read failed".into()))? {
-            if bytes.len().saturating_add(chunk.len()) > 16 * 1024 {
-                return Err(CollectorError::Protocol("snapshot acknowledgement exceeds limit".into()));
-            }
+        let mut bytes = Vec::with_capacity(1024);
+        while let Some(chunk) = response.chunk().await.map_err(|_| CollectorError::Delivery)? {
+            if chunk.len() > ACK_LIMIT.saturating_sub(bytes.len()) { return Err(CollectorError::Ack); }
             bytes.extend_from_slice(&chunk);
         }
-        let ack: UploadAck = serde_json::from_slice(&bytes)
-            .map_err(|_| CollectorError::Protocol("invalid snapshot acknowledgement".into()))?;
-        // Pending-review acceptance is durable but deliberately does not activate
-        // the new epoch; active-generation numbers belong to a different epoch.
-        if ack.protocol_version != PROTOCOL_VERSION || !ack.accepted
-            || ack.generation != metadata.generation
-            || (ack.active_generation < metadata.generation && ack.message != "pending_review") {
-            return Err(CollectorError::Protocol("snapshot acknowledgement does not confirm acceptance".into()));
-        }
+        let ack: Ack = serde_json::from_slice(&bytes).map_err(|_| CollectorError::Ack)?;
+        ack.validate(&pending.batch, &pending.body).map_err(|_| CollectorError::Ack)?;
         Ok(ack)
     }
 }
-

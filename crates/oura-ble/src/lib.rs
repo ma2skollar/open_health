@@ -6,10 +6,13 @@
 //! No constructor installs a key, pairs, resets, updates firmware, clears ring
 //! data, enters flight mode, or changes the ring clock.
 //!
-//! Cursors and `ring_timestamp` retain upstream's raw decisecond units, not Unix
-//! seconds. A cursor is the next timestamp to fetch. Persist every returned
-//! batch before advancing its cursor, including a batch with `complete == false`.
-//! An incomplete batch means reconnect/resume, not an empty successful sync.
+//! Cursors and `ring_timestamp` are raw ring deciseconds, not Unix seconds. A
+//! cursor is the next decisecond to fetch. Persist every returned batch before
+//! advancing its cursor, including a batch with `complete == false`. An
+//! incomplete batch means reconnect/resume, not an empty successful sync.
+//! `ring_timestamp` is never unique: several events may share one decisecond.
+//! [`HistoryEvent::transport`] keeps the exact wire record and its counter as
+//! transmitted; `ring_timestamp` is only the scheduling decisecond derived from it.
 
 use std::future::Future;
 use std::time::Duration;
@@ -22,6 +25,8 @@ mod fake;
 mod key;
 #[cfg(feature = "ble")]
 mod real;
+#[cfg(feature = "ble")]
+mod history;
 
 pub use fake::{FakeRing, FakeRingHandle, ScriptOutcome, UnknownOperation};
 pub use key::{AuthKey, AuthKeyError};
@@ -40,6 +45,25 @@ pub struct HistoryEvent {
     pub tag: u32,
     pub ring_timestamp: u64,
     pub body: Vec<u8>,
+    /// Exact wire provenance. `BleRing` always sets it; fakes may omit it.
+    #[serde(default)]
+    pub transport: Option<HistoryTransport>,
+}
+
+/// Original transport bytes of one history record, never re-encoded.
+///
+/// `encoding` is `legacy_event_packet` (`raw` = `tag|len|u32le counter|body`,
+/// `counter_unit` = `decisecond`) or `ext_event_record` (`raw` =
+/// `control|tag|len|varint counter|body` from an extended envelope,
+/// `counter_unit` = `millisecond_absolute` or `millisecond_delta`).
+/// `counter_value` is the counter exactly as transmitted; deltas are relative
+/// to the previous record of the same envelope.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryTransport {
+    pub encoding: String,
+    pub raw: Vec<u8>,
+    pub counter_value: u64,
+    pub counter_unit: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +98,15 @@ pub enum RingError {
     Timeout { operation: &'static str },
     #[error("history incomplete without a usable checkpoint")]
     PartialHistory,
+    /// A bounded drain could not reach any safe checkpoint within the
+    /// configured event/byte/page limits. Nothing was consumed.
+    #[error("history limit reached before a usable checkpoint")]
+    HistoryLimit,
+    /// The ring counter moved backwards (or implausibly far forward), or the
+    /// ring rejected the persisted cursor. Requires an explicit operator
+    /// recovery decision; never reset the cursor automatically.
+    #[error("ring counter discontinuity; explicit cursor recovery required")]
+    CursorRegression,
     #[error("ring disconnected")]
     Disconnected,
 }

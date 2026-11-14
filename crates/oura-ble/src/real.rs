@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -10,7 +10,7 @@ use oura_link::OuraClient;
 use oura_protocol::protocol::{feature, feature_mode};
 use tokio::task::JoinHandle;
 
-use crate::{bounded, AuthKey, AuthKeyError, DeviceInfo, HistoryBatch, HistoryEvent, HrSample, Operation, OperationTimeouts, RingError, RingTransport};
+use crate::{bounded, AuthKey, AuthKeyError, DeviceInfo, HistoryBatch, HrSample, Operation, OperationTimeouts, RingError, RingTransport};
 
 /// Hard local ceiling even if operator-supplied timeout settings are larger.
 const MAX_LIVE_HR_DURATION: Duration = Duration::from_secs(300);
@@ -21,6 +21,9 @@ pub struct BleOptions {
     pub address: Option<String>,
     pub scan_timeout: Duration,
     pub timeouts: OperationTimeouts,
+    pub history_max_events: usize,
+    pub history_max_bytes: usize,
+    pub history_max_pages: usize,
 }
 
 impl Default for BleOptions {
@@ -30,6 +33,9 @@ impl Default for BleOptions {
             address: None,
             scan_timeout: Duration::from_secs(10),
             timeouts: OperationTimeouts::default(),
+            history_max_events: 256,
+            history_max_bytes: 131072,
+            history_max_pages: 16,
         }
     }
 }
@@ -39,7 +45,7 @@ impl Default for BleOptions {
 /// Construct with `BleRing::from_key_file(options, path)` on Unix, or load an
 /// `AuthKey` once and move it into `BleRing::new(options, key)`. Construction
 /// does not touch Bluetooth. `connect` performs a bounded scan, connection,
-/// authentication with the existing key, and upstream app-stream registration.
+/// authentication with the existing key. No app-stream subscriptions are installed.
 /// It never creates a bond, installs a key, resets, clears data, starts RData,
 /// updates firmware, enters flight mode, or synchronizes the ring clock.
 ///
@@ -121,7 +127,6 @@ async fn connect(options: &BleOptions, key: &AuthKey) -> Result<Arc<OuraClient<B
         let client = Arc::new(OuraClient::new(transport));
         let mut guard = ConnectCleanup { client: client.clone(), timeout: options.timeouts.teardown, armed: true };
         client.authenticate(key.bytes()).await.map_err(map_error)?;
-        client.setup_app_stream().await.map_err(map_error)?;
         guard.armed = false;
         Ok(client)
     }).await
@@ -136,51 +141,9 @@ async fn device_info<T: Transport>(client: &OuraClient<T>, timeout: Duration) ->
     }).await
 }
 
-struct DrainBuffer {
-    events: Vec<HistoryEvent>,
-    committed_len: usize,
-    next_cursor: u64,
-}
-
+#[cfg(test)]
 async fn drain_history<T: Transport>(client: &OuraClient<T>, cursor: u64, timeout: Duration) -> Result<HistoryBatch, RingError> {
-    // Upstream addresses the ring with u32 deciseconds. Never truncate a caller's
-    // checkpoint and accidentally fetch an unrelated range.
-    let upstream_cursor = u32::try_from(cursor).map_err(|_| RingError::Failed)?;
-    let buffer = Mutex::new(DrainBuffer { events: Vec::new(), committed_len: 0, next_cursor: cursor });
-    let result = bounded(Operation::DrainHistory, timeout, async {
-        client.drain_events(
-            upstream_cursor,
-            |event| {
-                let mut buffer = buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                buffer.events.push(HistoryEvent {
-                    tag: u32::from(event.tag),
-                    ring_timestamp: u64::from(event.timestamp),
-                    body: event.body.clone(),
-                });
-                true
-            },
-            |progress| {
-                let mut buffer = buffer.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                buffer.committed_len = buffer.events.len();
-                buffer.next_cursor = u64::from(progress.next_cursor);
-                true
-            },
-        ).await.map_err(map_error)
-    }).await;
-    let mut buffer = buffer.into_inner().unwrap_or_else(std::sync::PoisonError::into_inner);
-    buffer.events.truncate(buffer.committed_len);
-    match result {
-        Ok(outcome) => Ok(HistoryBatch { events: buffer.events, next_cursor: u64::from(outcome.next_cursor), complete: true }),
-        // The shared contract has no error+progress envelope. Return checkpointed
-        // events as an incomplete batch instead of losing them on a later error
-        // or timeout. With no progress, preserve the original typed error.
-        Err(_) if buffer.committed_len > 0 || buffer.next_cursor > cursor => Ok(HistoryBatch {
-            events: buffer.events,
-            next_cursor: buffer.next_cursor,
-            complete: false,
-        }),
-        Err(error) => Err(error),
-    }
+    crate::history::drain(client.transport(), cursor, timeout, crate::history::Limits { events: 256, bytes: 131072, pages: 16 }).await
 }
 
 async fn restore_live<T: Transport>(client: &OuraClient<T>, timeout: Duration) -> Result<(), RingError> {
@@ -298,7 +261,8 @@ impl RingTransport for BleRing {
     }
 
     async fn drain_history(&mut self, cursor: u64) -> Result<HistoryBatch, RingError> {
-        drain_history(self.client()?, cursor, self.options.timeouts.history).await
+        crate::history::drain(self.client()?.transport(), cursor, self.options.timeouts.history,
+            crate::history::Limits { events: self.options.history_max_events, bytes: self.options.history_max_bytes, pages: self.options.history_max_pages }).await
     }
 
     async fn feature_mode(&mut self) -> Result<u32, RingError> {
@@ -343,6 +307,7 @@ impl RingTransport for BleRing {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::collections::HashMap;
     use std::future::pending;
     use tokio::sync::broadcast;
@@ -477,20 +442,22 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn real_history_timeout_preserves_only_completed_batches() {
         let mut wire = Wire::new();
-        let protocol = oura_protocol::protocol::req_ext_get_event(0, 4096, 0);
+        let protocol = oura_protocol::protocol::req_ext_get_event(0, 255, 0);
         wire.responses.insert(oura_protocol::protocol::req_data_flush(), vec![vec![0x29, 1, 0]]);
-        wire.responses.insert(protocol, vec![vec![0x43, 8, 1, 0, 0, 0, b't', b'e', b's', b't', 0x2f, 10, 0x42, 1, 0, 0, 0, 100, 0, 0, 0, 0]]);
+        wire.responses.insert(protocol, vec![vec![0x43, 8, 1, 0, 0, 0, b't', b'e', b's', b't', 0x2f, 10, 0x42, 1, 0, 0, 0, 0, 0, 0, 0, 0]]);
         let client = OuraClient::new(wire).with_quiet(Duration::from_millis(1));
         let batch = drain_history(&client, 0, Duration::from_millis(2)).await.unwrap();
         assert!(!batch.complete);
         assert_eq!(batch.next_cursor, 2);
-        assert_eq!(batch.events, vec![HistoryEvent { tag: 0x43, ring_timestamp: 1, body: b"test".to_vec() }]);
+        assert_eq!(batch.events[0].body, b"test");
+        assert_eq!(batch.events[0].ring_timestamp, 1);
+        assert_eq!(batch.events[0].transport.as_ref().unwrap().raw, vec![0x43, 8, 1, 0, 0, 0, b't', b'e', b's', b't']);
     }
 
     #[tokio::test(start_paused = true)]
     async fn real_history_no_progress_returns_typed_timeout() {
         let client = OuraClient::new(Wire::new()).with_quiet(Duration::from_secs(1));
         assert_eq!(drain_history(&client, 0, Duration::from_millis(1)).await, Err(RingError::Timeout { operation: "drain_history" }));
-        assert_eq!(drain_history(&client, u64::MAX, Duration::from_millis(1)).await, Err(RingError::Failed));
+        assert_eq!(drain_history(&client, u64::MAX, Duration::from_millis(1)).await, Err(RingError::CursorRegression));
     }
 }
